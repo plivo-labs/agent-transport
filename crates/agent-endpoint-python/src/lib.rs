@@ -1,0 +1,357 @@
+use pyo3::prelude::*;
+use pyo3::exceptions::PyRuntimeError;
+
+use agent_endpoint::{
+    AudioFrame as RustAudioFrame, BeepDetectorConfig as RustBeepConfig,
+    CallSession as RustCallSession, Codec as RustCodec,
+    EndpointConfig as RustEndpointConfig, SipEndpoint as RustSipEndpoint,
+};
+
+/// Python-visible AudioFrame matching LiveKit's format.
+#[pyclass]
+#[derive(Clone)]
+struct AudioFrame {
+    #[pyo3(get)]
+    data: Vec<i16>,
+    #[pyo3(get)]
+    sample_rate: u32,
+    #[pyo3(get)]
+    num_channels: u32,
+    #[pyo3(get)]
+    samples_per_channel: u32,
+}
+
+#[pymethods]
+impl AudioFrame {
+    #[new]
+    fn new(data: Vec<i16>, sample_rate: u32, num_channels: u32) -> Self {
+        let samples_per_channel = if num_channels > 0 {
+            data.len() as u32 / num_channels
+        } else {
+            0
+        };
+        Self {
+            data,
+            sample_rate,
+            num_channels,
+            samples_per_channel,
+        }
+    }
+
+    /// Create a silent frame.
+    #[staticmethod]
+    fn silence(sample_rate: u32, num_channels: u32, duration_ms: u32) -> Self {
+        let f = RustAudioFrame::silence(sample_rate, num_channels, duration_ms);
+        Self::from_rust(f)
+    }
+
+    /// Duration in milliseconds.
+    fn duration_ms(&self) -> u32 {
+        if self.sample_rate == 0 {
+            return 0;
+        }
+        self.samples_per_channel * 1000 / self.sample_rate
+    }
+
+    /// Get raw bytes (little-endian int16).
+    fn as_bytes(&self) -> Vec<u8> {
+        self.data.iter().flat_map(|s| s.to_le_bytes()).collect()
+    }
+
+    /// Create from raw bytes.
+    #[staticmethod]
+    fn from_bytes(data: Vec<u8>, sample_rate: u32, num_channels: u32) -> Self {
+        let f = RustAudioFrame::from_bytes(&data, sample_rate, num_channels);
+        Self::from_rust(f)
+    }
+}
+
+impl AudioFrame {
+    fn from_rust(f: RustAudioFrame) -> Self {
+        Self {
+            data: f.data,
+            sample_rate: f.sample_rate,
+            num_channels: f.num_channels,
+            samples_per_channel: f.samples_per_channel,
+        }
+    }
+
+    fn to_rust(&self) -> RustAudioFrame {
+        RustAudioFrame::new(self.data.clone(), self.sample_rate, self.num_channels)
+    }
+}
+
+/// Python-visible CallSession.
+#[pyclass]
+#[derive(Clone)]
+struct CallSession {
+    #[pyo3(get)]
+    call_id: i32,
+    #[pyo3(get)]
+    call_uuid: Option<String>,
+    #[pyo3(get)]
+    direction: String,
+    #[pyo3(get)]
+    state: String,
+    #[pyo3(get)]
+    remote_uri: String,
+    #[pyo3(get)]
+    local_uri: String,
+}
+
+impl From<RustCallSession> for CallSession {
+    fn from(s: RustCallSession) -> Self {
+        Self {
+            call_id: s.call_id,
+            call_uuid: s.call_uuid,
+            direction: format!("{:?}", s.direction),
+            state: format!("{:?}", s.state),
+            remote_uri: s.remote_uri,
+            local_uri: s.local_uri,
+        }
+    }
+}
+
+/// The main Plivo SIP endpoint.
+#[pyclass]
+struct PlivoEndpoint {
+    inner: RustSipEndpoint,
+}
+
+#[pymethods]
+impl PlivoEndpoint {
+    #[new]
+    #[pyo3(signature = (sip_server="sip.plivo.com", stun_server="stun.plivo.com:3478", codecs=None, log_level=3))]
+    fn new(
+        sip_server: &str,
+        stun_server: &str,
+        codecs: Option<Vec<String>>,
+        log_level: u32,
+    ) -> PyResult<Self> {
+        let codec_list = codecs
+            .unwrap_or_else(|| vec!["opus".into(), "pcmu".into()])
+            .iter()
+            .filter_map(|c| match c.to_lowercase().as_str() {
+                "opus" => Some(RustCodec::Opus),
+                "pcmu" => Some(RustCodec::PCMU),
+                "pcma" => Some(RustCodec::PCMA),
+                "g722" => Some(RustCodec::G722),
+                _ => None,
+            })
+            .collect();
+
+        let config = RustEndpointConfig {
+            sip_server: sip_server.into(),
+            stun_server: stun_server.into(),
+            codecs: codec_list,
+            log_level,
+            ..Default::default()
+        };
+
+        let inner = RustSipEndpoint::new(config)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        Ok(Self { inner })
+    }
+
+    /// Register with the SIP server.
+    fn register(&self, username: &str, password: &str) -> PyResult<()> {
+        self.inner
+            .register(username, password)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Unregister.
+    fn unregister(&self) -> PyResult<()> {
+        self.inner
+            .unregister()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Check registration status.
+    fn is_registered(&self) -> bool {
+        self.inner.is_registered()
+    }
+
+    /// Make an outbound call. Returns call_id.
+    fn call(&self, dest_uri: &str) -> PyResult<i32> {
+        self.inner
+            .call(dest_uri, None)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Answer an incoming call.
+    #[pyo3(signature = (call_id, code=200))]
+    fn answer(&self, call_id: i32, code: u16) -> PyResult<()> {
+        self.inner
+            .answer(call_id, code)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Reject an incoming call.
+    #[pyo3(signature = (call_id, code=486))]
+    fn reject(&self, call_id: i32, code: u16) -> PyResult<()> {
+        self.inner
+            .reject(call_id, code)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Hang up an active call.
+    fn hangup(&self, call_id: i32) -> PyResult<()> {
+        self.inner
+            .hangup(call_id)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Send DTMF digits.
+    fn send_dtmf(&self, call_id: i32, digits: &str) -> PyResult<()> {
+        self.inner
+            .send_dtmf(call_id, digits)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Blind transfer via SIP REFER.
+    fn transfer(&self, call_id: i32, dest_uri: &str) -> PyResult<()> {
+        self.inner
+            .transfer(call_id, dest_uri)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Attended transfer (connect two calls).
+    fn transfer_attended(&self, call_id: i32, target_call_id: i32) -> PyResult<()> {
+        self.inner
+            .transfer_attended(call_id, target_call_id)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Mute outgoing audio.
+    fn mute(&self, call_id: i32) -> PyResult<()> {
+        self.inner
+            .mute(call_id)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Unmute outgoing audio.
+    fn unmute(&self, call_id: i32) -> PyResult<()> {
+        self.inner
+            .unmute(call_id)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Send an audio frame.
+    fn send_audio(&self, call_id: i32, frame: &AudioFrame) -> PyResult<()> {
+        self.inner
+            .send_audio(call_id, &frame.to_rust())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Receive an audio frame (non-blocking, returns None if no frame ready).
+    fn recv_audio(&self, call_id: i32) -> PyResult<Option<AudioFrame>> {
+        self.inner
+            .recv_audio(call_id)
+            .map(|opt| opt.map(AudioFrame::from_rust))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Start recording a call to a WAV file.
+    fn start_recording(&self, call_id: i32, path: &str) -> PyResult<()> {
+        self.inner
+            .start_recording(call_id, path)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Stop recording a call.
+    fn stop_recording(&self, call_id: i32) -> PyResult<()> {
+        self.inner
+            .stop_recording(call_id)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Start async beep detection on a call. Fires BeepDetected or BeepTimeout event.
+    #[pyo3(signature = (call_id, timeout_ms=30000, min_duration_ms=80, max_duration_ms=5000))]
+    fn detect_beep(
+        &self,
+        call_id: i32,
+        timeout_ms: u32,
+        min_duration_ms: u32,
+        max_duration_ms: u32,
+    ) -> PyResult<()> {
+        let config = RustBeepConfig {
+            sample_rate: 16000,
+            timeout_ms,
+            min_duration_ms,
+            max_duration_ms,
+            ..Default::default()
+        };
+        self.inner
+            .detect_beep(call_id, config)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Cancel beep detection on a call.
+    fn cancel_beep_detection(&self, call_id: i32) -> PyResult<()> {
+        self.inner
+            .cancel_beep_detection(call_id)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Mark the current playback segment as complete.
+    fn flush(&self, call_id: i32) -> PyResult<()> {
+        self.inner
+            .flush(call_id)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Clear all queued outgoing audio immediately (barge-in / interruption).
+    fn clear_buffer(&self, call_id: i32) -> PyResult<()> {
+        self.inner
+            .clear_buffer(call_id)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Block until all queued audio finishes playing. Returns True if completed, False if timeout.
+    #[pyo3(signature = (call_id, timeout_ms=5000))]
+    fn wait_for_playout(&self, call_id: i32, timeout_ms: u64) -> PyResult<bool> {
+        self.inner
+            .wait_for_playout(call_id, timeout_ms)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Pause audio playback. Queued frames are preserved.
+    fn pause(&self, call_id: i32) -> PyResult<()> {
+        self.inner
+            .pause(call_id)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Resume audio playback after a pause.
+    fn resume(&self, call_id: i32) -> PyResult<()> {
+        self.inner
+            .resume(call_id)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Poll for the next event (non-blocking).
+    fn poll_event(&self) -> PyResult<Option<String>> {
+        match self.inner.events().try_recv() {
+            Ok(event) => Ok(Some(format!("{:?}", event))),
+            Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Ok(None),
+        }
+    }
+
+    /// Shut down the endpoint.
+    fn shutdown(&self) -> PyResult<()> {
+        self.inner
+            .shutdown()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+}
+
+#[pymodule]
+fn plivo_endpoint(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PlivoEndpoint>()?;
+    m.add_class::<AudioFrame>()?;
+    m.add_class::<CallSession>()?;
+    Ok(())
+}

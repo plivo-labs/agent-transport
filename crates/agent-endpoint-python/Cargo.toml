@@ -1,0 +1,15 @@
+[package]
+name = "agent-endpoint-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Python bindings for agent-endpoint (Plivo SIP UA)"
+
+[lib]
+name = "plivo_endpoint"
+crate-type = ["cdylib"]
+
+[dependencies]
+agent-endpoint = { path = "../agent-endpoint" }
+crossbeam-channel.workspace = true
+pyo3 = { version = "0.23", features = ["extension-module"] }

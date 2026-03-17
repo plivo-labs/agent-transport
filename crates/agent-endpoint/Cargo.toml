@@ -1,0 +1,32 @@
+[package]
+name = "agent-endpoint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SIP user agent for Plivo with PJSUA backend"
+
+[dependencies]
+pjsua-sys = { path = "../pjsua-sys" }
+thiserror.workspace = true
+tracing.workspace = true
+crossbeam-channel.workspace = true
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+
+[[example]]
+name = "register"
+
+[[example]]
+name = "outbound_call"
+
+[[example]]
+name = "full_test"
+
+[[example]]
+name = "call_and_record"
+
+[[example]]
+name = "inbound_echo"

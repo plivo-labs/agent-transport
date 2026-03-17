@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pjsua-sys",
+    "crates/agent-endpoint",
+    "crates/agent-endpoint-python",
+    "crates/agent-endpoint-node",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/bevenky/agent_endpoint"
+
+[workspace.dependencies]
+thiserror = "2"
+tracing = "0.1"
+crossbeam-channel = "0.5"
+anyhow = "1"
+tracing-subscriber = "0.3"

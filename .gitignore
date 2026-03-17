@@ -19,3 +19,20 @@ target
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Node.js
+node_modules/
+*.node
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+*.whl
+
+# PJSIP build artifacts (within submodule — git ignores submodule contents anyway)
+pjproject/pjlib/include/pj/config_site.h
+.env
+.DS_Store
+audio/temp/

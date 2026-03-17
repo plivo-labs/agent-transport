@@ -1,0 +1,24 @@
+{
+  "name": "plivo-endpoint",
+  "version": "0.1.0",
+  "description": "Plivo SIP endpoint for AI agents (PJSUA-backed, Rust native)",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "MIT",
+  "napi": {
+    "binaryName": "plivo-endpoint",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-unknown-linux-gnu"
+    ]
+  },
+  "scripts": {
+    "build": "napi build --release",
+    "build:debug": "napi build"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3"
+  }
+}

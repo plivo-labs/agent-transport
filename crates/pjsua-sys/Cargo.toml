@@ -1,0 +1,11 @@
+[package]
+name = "pjsua-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Raw FFI bindings to PJSUA (PJSIP high-level C API)"
+links = "pjsua"
+
+[build-dependencies]
+bindgen = "0.71"
+pkg-config = "0.3"

@@ -1,0 +1,17 @@
+[package]
+name = "agent-endpoint-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Node.js bindings for agent-endpoint (Plivo SIP UA)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+agent-endpoint = { path = "../agent-endpoint" }
+napi = { version = "2", features = ["default", "napi9"] }
+napi-derive = "2"
+
+[build-dependencies]
+napi-build = "2"
