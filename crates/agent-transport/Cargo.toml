@@ -3,7 +3,7 @@ name = "agent-transport"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "SIP transport for AI agents — pure Rust (rsipstack + rtc-rtp)"
+description = "SIP transport for AI agents — pure Rust"
 
 [dependencies]
 beep-detector.workspace = true
@@ -12,12 +12,20 @@ tracing.workspace = true
 crossbeam-channel.workspace = true
 tokio.workspace = true
 
+# SIP signaling
 rsipstack = "0.4"
 rsip = "0.4"
-rtc-rtp = "0.9"
-rtc-shared = "0.9"
+
+# RTP (webrtc-rs established crate)
+rtp = "0.17"
+webrtc-util = { version = "0.17", features = ["marshal"] }
+
+# G.711 codec (mu-law / A-law)
+audio-codec-algorithms = "0.7"
+
+# Utilities
 bytes = "1"
-rand = "0.9"
+rand = "0.8"
 tokio-util = { version = "0.7", features = ["rt"] }
 
 [features]
