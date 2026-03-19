@@ -7,6 +7,7 @@ name = "agent-endpoint"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "beep-detector",
  "crossbeam-channel",
  "pjsua-sys",
  "thiserror",
@@ -19,6 +20,7 @@ name = "agent-endpoint-node"
 version = "0.1.0"
 dependencies = [
  "agent-endpoint",
+ "crossbeam-channel",
  "napi",
  "napi-build",
  "napi-derive",
@@ -53,6 +55,13 @@ name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
+
+[[package]]
+name = "beep-detector"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+]
 
 [[package]]
 name = "bindgen"

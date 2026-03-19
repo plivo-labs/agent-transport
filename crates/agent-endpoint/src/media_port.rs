@@ -13,8 +13,9 @@ use crossbeam_channel::{Receiver, Sender};
 
 use pjsua_sys::*;
 
+use beep_detector::BeepDetectorResult;
+
 use crate::audio::AudioFrame;
-use crate::beep::BeepDetectorResult;
 use crate::events::EndpointEvent;
 
 /// Internal state attached to each custom media port via `port_data.pdata`.
@@ -180,7 +181,6 @@ impl CustomMediaPort {
     }
 
     /// Disconnect this port from a call's conference slot.
-    #[allow(dead_code)]
     pub unsafe fn disconnect_from_call(&self, call_conf_slot: i32) {
         pjsua_conf_disconnect(self.conf_slot, call_conf_slot);
         pjsua_conf_disconnect(call_conf_slot, self.conf_slot);

@@ -23,16 +23,18 @@
 //! ```
 
 mod audio;
-mod beep;
 mod call;
+mod callbacks;
 mod config;
+mod dtmf;
 mod endpoint;
 mod error;
 mod events;
 mod media_port;
+mod pj_helpers;
 
 pub use audio::AudioFrame;
-pub use beep::BeepDetectorConfig;
+pub use beep_detector::BeepDetectorConfig;
 pub use call::{CallDirection, CallSession, CallState};
 pub use config::{Codec, EndpointConfig, TurnConfig};
 pub use endpoint::SipEndpoint;

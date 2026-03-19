@@ -1,11 +1,21 @@
-use pyo3::prelude::*;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use agent_endpoint::{
     AudioFrame as RustAudioFrame, BeepDetectorConfig as RustBeepConfig,
     CallSession as RustCallSession, Codec as RustCodec,
-    EndpointConfig as RustEndpointConfig, SipEndpoint as RustSipEndpoint,
+    EndpointConfig as RustEndpointConfig, EndpointEvent, SipEndpoint as RustSipEndpoint,
 };
+
+fn py_err(e: impl std::fmt::Display) -> PyErr {
+    PyRuntimeError::new_err(e.to_string())
+}
 
 /// Python-visible AudioFrame matching LiveKit's format.
 #[pyclass]
@@ -38,14 +48,12 @@ impl AudioFrame {
         }
     }
 
-    /// Create a silent frame.
     #[staticmethod]
     fn silence(sample_rate: u32, num_channels: u32, duration_ms: u32) -> Self {
         let f = RustAudioFrame::silence(sample_rate, num_channels, duration_ms);
         Self::from_rust(f)
     }
 
-    /// Duration in milliseconds.
     fn duration_ms(&self) -> u32 {
         if self.sample_rate == 0 {
             return 0;
@@ -53,12 +61,10 @@ impl AudioFrame {
         self.samples_per_channel * 1000 / self.sample_rate
     }
 
-    /// Get raw bytes (little-endian int16).
     fn as_bytes(&self) -> Vec<u8> {
         self.data.iter().flat_map(|s| s.to_le_bytes()).collect()
     }
 
-    /// Create from raw bytes.
     #[staticmethod]
     fn from_bytes(data: Vec<u8>, sample_rate: u32, num_channels: u32) -> Self {
         let f = RustAudioFrame::from_bytes(&data, sample_rate, num_channels);
@@ -97,6 +103,8 @@ struct CallSession {
     remote_uri: String,
     #[pyo3(get)]
     local_uri: String,
+    #[pyo3(get)]
+    extra_headers: HashMap<String, String>,
 }
 
 impl From<RustCallSession> for CallSession {
@@ -108,6 +116,116 @@ impl From<RustCallSession> for CallSession {
             state: format!("{:?}", s.state),
             remote_uri: s.remote_uri,
             local_uri: s.local_uri,
+            extra_headers: s.extra_headers,
+        }
+    }
+}
+
+/// Returned by `ep.on("event_name")` — usable as a decorator.
+///
+/// ```python
+/// @ep.on("incoming_call")
+/// def handler(session):
+///     ep.answer(session.call_id)
+/// ```
+#[pyclass]
+struct EventDecorator {
+    callbacks: Arc<Mutex<HashMap<String, Vec<Py<PyAny>>>>>,
+    event_name: String,
+}
+
+#[pymethods]
+impl EventDecorator {
+    fn __call__(&self, py: Python, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        self.callbacks
+            .lock()
+            .unwrap()
+            .entry(self.event_name.clone())
+            .or_default()
+            .push(func.clone_ref(py));
+        Ok(func)
+    }
+}
+
+/// Convert an EndpointEvent to a Python dict.
+fn event_to_dict<'py>(py: Python<'py>, event: &EndpointEvent) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    match event {
+        EndpointEvent::Registered => {
+            dict.set_item("type", "registered")?;
+        }
+        EndpointEvent::RegistrationFailed { error } => {
+            dict.set_item("type", "registration_failed")?;
+            dict.set_item("error", error)?;
+        }
+        EndpointEvent::Unregistered => {
+            dict.set_item("type", "unregistered")?;
+        }
+        EndpointEvent::IncomingCall { session } => {
+            dict.set_item("type", "incoming_call")?;
+            dict.set_item("session", CallSession::from(session.clone()).into_pyobject(py)?)?;
+        }
+        EndpointEvent::CallStateChanged { session } => {
+            dict.set_item("type", "call_state")?;
+            dict.set_item("session", CallSession::from(session.clone()).into_pyobject(py)?)?;
+        }
+        EndpointEvent::CallMediaActive { call_id } => {
+            dict.set_item("type", "call_media_active")?;
+            dict.set_item("call_id", call_id)?;
+        }
+        EndpointEvent::CallTerminated { session, reason } => {
+            dict.set_item("type", "call_terminated")?;
+            dict.set_item("session", CallSession::from(session.clone()).into_pyobject(py)?)?;
+            dict.set_item("reason", reason)?;
+        }
+        EndpointEvent::DtmfReceived {
+            call_id,
+            digit,
+            method,
+        } => {
+            dict.set_item("type", "dtmf_received")?;
+            dict.set_item("call_id", call_id)?;
+            dict.set_item("digit", digit.to_string())?;
+            dict.set_item("method", method)?;
+        }
+        EndpointEvent::BeepDetected {
+            call_id,
+            frequency_hz,
+            duration_ms,
+        } => {
+            dict.set_item("type", "beep_detected")?;
+            dict.set_item("call_id", call_id)?;
+            dict.set_item("frequency_hz", frequency_hz)?;
+            dict.set_item("duration_ms", duration_ms)?;
+        }
+        EndpointEvent::BeepTimeout { call_id } => {
+            dict.set_item("type", "beep_timeout")?;
+            dict.set_item("call_id", call_id)?;
+        }
+    }
+    Ok(dict)
+}
+
+/// Dispatch an event to registered Python callbacks.
+fn dispatch_event(
+    py: Python,
+    callbacks: &Arc<Mutex<HashMap<String, Vec<Py<PyAny>>>>>,
+    event: &EndpointEvent,
+) {
+    let name = event.callback_name();
+    let cbs = callbacks.lock().unwrap();
+    let Some(handlers) = cbs.get(name) else {
+        return;
+    };
+
+    let dict = match event_to_dict(py, event) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    for handler in handlers {
+        if let Err(e) = handler.call1(py, (&dict,)) {
+            e.print(py);
         }
     }
 }
@@ -116,12 +234,14 @@ impl From<RustCallSession> for CallSession {
 #[pyclass]
 struct PlivoEndpoint {
     inner: RustSipEndpoint,
+    callbacks: Arc<Mutex<HashMap<String, Vec<Py<PyAny>>>>>,
+    event_thread_running: Arc<AtomicBool>,
 }
 
 #[pymethods]
 impl PlivoEndpoint {
     #[new]
-    #[pyo3(signature = (sip_server="sip.plivo.com", stun_server="stun.plivo.com:3478", codecs=None, log_level=3))]
+    #[pyo3(signature = (sip_server="phone.plivo.com", stun_server="stun.plivo.com:3478", codecs=None, log_level=3))]
     fn new(
         sip_server: &str,
         stun_server: &str,
@@ -129,7 +249,7 @@ impl PlivoEndpoint {
         log_level: u32,
     ) -> PyResult<Self> {
         let codec_list = codecs
-            .unwrap_or_else(|| vec!["opus".into(), "pcmu".into()])
+            .unwrap_or_else(|| vec!["pcmu".into(), "pcma".into()])
             .iter()
             .filter_map(|c| match c.to_lowercase().as_str() {
                 "opus" => Some(RustCodec::Opus),
@@ -149,23 +269,73 @@ impl PlivoEndpoint {
         };
 
         let inner = RustSipEndpoint::new(config)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(py_err)?;
 
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            callbacks: Arc::new(Mutex::new(HashMap::new())),
+            event_thread_running: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Register an event callback. Can be used as a decorator:
+    ///
+    /// ```python
+    /// @ep.on("incoming_call")
+    /// def handler(event):
+    ///     print(event["session"].remote_uri)
+    ///     ep.answer(event["session"].call_id)
+    /// ```
+    ///
+    /// Or with a direct callback:
+    ///
+    /// ```python
+    /// ep.on("dtmf_received", lambda event: print(event["digit"]))
+    /// ```
+    ///
+    /// Event names: registered, registration_failed, unregistered,
+    /// incoming_call, call_state, call_media_active, call_terminated,
+    /// dtmf_received, beep_detected, beep_timeout
+    #[pyo3(signature = (event_name, callback=None))]
+    fn on(
+        &self,
+        py: Python,
+        event_name: String,
+        callback: Option<Py<PyAny>>,
+    ) -> PyResult<PyObject> {
+        if let Some(cb) = callback {
+            // Direct registration: ep.on("event", callback)
+            self.callbacks
+                .lock()
+                .unwrap()
+                .entry(event_name)
+                .or_default()
+                .push(cb);
+            self.ensure_event_loop();
+            Ok(py.None())
+        } else {
+            // Decorator mode: @ep.on("event")
+            self.ensure_event_loop();
+            let decorator = EventDecorator {
+                callbacks: self.callbacks.clone(),
+                event_name,
+            };
+            Ok(decorator.into_pyobject(py)?.into_any().unbind())
+        }
     }
 
     /// Register with the SIP server.
     fn register(&self, username: &str, password: &str) -> PyResult<()> {
         self.inner
             .register(username, password)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
     }
 
     /// Unregister.
     fn unregister(&self) -> PyResult<()> {
         self.inner
             .unregister()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
     }
 
     /// Check registration status.
@@ -174,10 +344,12 @@ impl PlivoEndpoint {
     }
 
     /// Make an outbound call. Returns call_id.
-    fn call(&self, dest_uri: &str) -> PyResult<i32> {
+    /// Optional headers dict adds custom SIP headers to the INVITE.
+    #[pyo3(signature = (dest_uri, headers=None))]
+    fn call(&self, dest_uri: &str, headers: Option<HashMap<String, String>>) -> PyResult<i32> {
         self.inner
-            .call(dest_uri, None)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .call(dest_uri, headers)
+            .map_err(py_err)
     }
 
     /// Answer an incoming call.
@@ -185,7 +357,7 @@ impl PlivoEndpoint {
     fn answer(&self, call_id: i32, code: u16) -> PyResult<()> {
         self.inner
             .answer(call_id, code)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
     }
 
     /// Reject an incoming call.
@@ -193,56 +365,57 @@ impl PlivoEndpoint {
     fn reject(&self, call_id: i32, code: u16) -> PyResult<()> {
         self.inner
             .reject(call_id, code)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
     }
 
     /// Hang up an active call.
     fn hangup(&self, call_id: i32) -> PyResult<()> {
         self.inner
             .hangup(call_id)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
     }
 
     /// Send DTMF digits.
-    fn send_dtmf(&self, call_id: i32, digits: &str) -> PyResult<()> {
+    #[pyo3(signature = (call_id, digits, method="rfc2833"))]
+    fn send_dtmf(&self, call_id: i32, digits: &str, method: &str) -> PyResult<()> {
         self.inner
-            .send_dtmf(call_id, digits)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .send_dtmf_with_method(call_id, digits, method)
+            .map_err(py_err)
     }
 
     /// Blind transfer via SIP REFER.
     fn transfer(&self, call_id: i32, dest_uri: &str) -> PyResult<()> {
         self.inner
             .transfer(call_id, dest_uri)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
     }
 
     /// Attended transfer (connect two calls).
     fn transfer_attended(&self, call_id: i32, target_call_id: i32) -> PyResult<()> {
         self.inner
             .transfer_attended(call_id, target_call_id)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
     }
 
     /// Mute outgoing audio.
     fn mute(&self, call_id: i32) -> PyResult<()> {
         self.inner
             .mute(call_id)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
     }
 
     /// Unmute outgoing audio.
     fn unmute(&self, call_id: i32) -> PyResult<()> {
         self.inner
             .unmute(call_id)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
     }
 
     /// Send an audio frame.
     fn send_audio(&self, call_id: i32, frame: &AudioFrame) -> PyResult<()> {
         self.inner
             .send_audio(call_id, &frame.to_rust())
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
     }
 
     /// Receive an audio frame (non-blocking, returns None if no frame ready).
@@ -250,24 +423,24 @@ impl PlivoEndpoint {
         self.inner
             .recv_audio(call_id)
             .map(|opt| opt.map(AudioFrame::from_rust))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
     }
 
     /// Start recording a call to a WAV file.
     fn start_recording(&self, call_id: i32, path: &str) -> PyResult<()> {
         self.inner
             .start_recording(call_id, path)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
     }
 
     /// Stop recording a call.
     fn stop_recording(&self, call_id: i32) -> PyResult<()> {
         self.inner
             .stop_recording(call_id)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
     }
 
-    /// Start async beep detection on a call. Fires BeepDetected or BeepTimeout event.
+    /// Start async beep detection on a call.
     #[pyo3(signature = (call_id, timeout_ms=30000, min_duration_ms=80, max_duration_ms=5000))]
     fn detect_beep(
         &self,
@@ -285,66 +458,116 @@ impl PlivoEndpoint {
         };
         self.inner
             .detect_beep(call_id, config)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
     }
 
     /// Cancel beep detection on a call.
     fn cancel_beep_detection(&self, call_id: i32) -> PyResult<()> {
         self.inner
             .cancel_beep_detection(call_id)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
     }
 
     /// Mark the current playback segment as complete.
     fn flush(&self, call_id: i32) -> PyResult<()> {
         self.inner
             .flush(call_id)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
     }
 
     /// Clear all queued outgoing audio immediately (barge-in / interruption).
     fn clear_buffer(&self, call_id: i32) -> PyResult<()> {
         self.inner
             .clear_buffer(call_id)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
     }
 
-    /// Block until all queued audio finishes playing. Returns True if completed, False if timeout.
+    /// Block until all queued audio finishes playing.
     #[pyo3(signature = (call_id, timeout_ms=5000))]
     fn wait_for_playout(&self, call_id: i32, timeout_ms: u64) -> PyResult<bool> {
         self.inner
             .wait_for_playout(call_id, timeout_ms)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
     }
 
-    /// Pause audio playback. Queued frames are preserved.
+    /// Pause audio playback.
     fn pause(&self, call_id: i32) -> PyResult<()> {
         self.inner
             .pause(call_id)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
     }
 
-    /// Resume audio playback after a pause.
+    /// Resume audio playback.
     fn resume(&self, call_id: i32) -> PyResult<()> {
         self.inner
             .resume(call_id)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
     }
 
-    /// Poll for the next event (non-blocking).
-    fn poll_event(&self) -> PyResult<Option<String>> {
+    /// Poll for the next event (non-blocking). Returns a dict or None.
+    fn poll_event(&self, py: Python) -> PyResult<Option<PyObject>> {
         match self.inner.events().try_recv() {
-            Ok(event) => Ok(Some(format!("{:?}", event))),
-            Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
-            Err(crossbeam_channel::TryRecvError::Disconnected) => Ok(None),
+            Ok(event) => {
+                let dict = event_to_dict(py, &event)?;
+                Ok(Some(dict.into()))
+            }
+            Err(_) => Ok(None),
         }
     }
 
-    /// Shut down the endpoint.
+    /// Block until an event is received. Returns a dict.
+    /// Timeout in milliseconds (0 = wait forever).
+    #[pyo3(signature = (timeout_ms=0))]
+    fn wait_for_event(&self, py: Python, timeout_ms: u64) -> PyResult<Option<PyObject>> {
+        let rx = self.inner.events();
+        let result = if timeout_ms == 0 {
+            // Allow other Python threads to run while we block
+            py.allow_threads(|| rx.recv().ok())
+        } else {
+            py.allow_threads(|| rx.recv_timeout(Duration::from_millis(timeout_ms)).ok())
+        };
+        match result {
+            Some(event) => {
+                let dict = event_to_dict(py, &event)?;
+                Ok(Some(dict.into()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Shut down the endpoint. Stops the event loop and tears down SIP stack.
     fn shutdown(&self) -> PyResult<()> {
+        self.event_thread_running.store(false, Ordering::Relaxed);
         self.inner
             .shutdown()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(py_err)
+    }
+}
+
+impl PlivoEndpoint {
+    /// Start the background event dispatch thread if not already running.
+    fn ensure_event_loop(&self) {
+        if self.event_thread_running.swap(true, Ordering::Relaxed) {
+            return; // already running
+        }
+
+        let rx = self.inner.events();
+        let callbacks = self.callbacks.clone();
+        let running = self.event_thread_running.clone();
+
+        std::thread::spawn(move || {
+            while running.load(Ordering::Relaxed) {
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(event) => {
+                        Python::with_gil(|py| {
+                            dispatch_event(py, &callbacks, &event);
+                        });
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        });
     }
 }
 

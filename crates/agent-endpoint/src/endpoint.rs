@@ -4,15 +4,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once};
 
 use crossbeam_channel::{Receiver, Sender};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
+
+use beep_detector::{BeepDetector, BeepDetectorConfig};
 
 use crate::audio::AudioFrame;
-use crate::beep::{BeepDetector, BeepDetectorConfig, BeepDetectorResult};
-use crate::call::{CallDirection, CallSession, CallState};
+use crate::call::{CallDirection, CallSession};
 use crate::config::{Codec, EndpointConfig};
 use crate::error::{EndpointError, Result};
 use crate::events::EndpointEvent;
 use crate::media_port::CustomMediaPort;
+use crate::pj_helpers::{check_status, get_call_info, pj_str_from_cstr};
 
 use pjsua_sys::*;
 
@@ -20,16 +22,12 @@ use pjsua_sys::*;
 static INIT: Once = Once::new();
 
 pub(crate) struct GlobalState {
-    event_tx: Sender<EndpointEvent>,
-    calls: HashMap<i32, CallSession>,
-    /// Per-call custom media ports for audio I/O
-    media_ports: HashMap<i32, CustomMediaPort>,
-    /// Per-call WAV recorders (recorder_id)
-    recorders: HashMap<i32, pjsua_recorder_id>,
-    /// Per-call beep detectors (running async on incoming audio)
+    pub(crate) event_tx: Sender<EndpointEvent>,
+    pub(crate) calls: HashMap<i32, CallSession>,
+    pub(crate) media_ports: HashMap<i32, CustomMediaPort>,
+    pub(crate) recorders: HashMap<i32, pjsua_recorder_id>,
     pub(crate) beep_detectors: HashMap<i32, BeepDetector>,
-    /// Conference bridge clock rate (set during init)
-    clock_rate: u32,
+    pub(crate) clock_rate: u32,
 }
 
 static mut GLOBAL: Option<Mutex<GlobalState>> = None;
@@ -103,12 +101,12 @@ impl SipEndpoint {
         pjsua_config_default(&mut cfg);
 
         // Set callbacks
-        cfg.cb.on_reg_state2 = Some(on_reg_state);
-        cfg.cb.on_incoming_call = Some(on_incoming_call);
-        cfg.cb.on_call_state = Some(on_call_state);
-        cfg.cb.on_call_media_state = Some(on_call_media_state);
-        cfg.cb.on_dtmf_digit2 = Some(on_dtmf_digit2);
-        cfg.cb.on_call_transfer_status = Some(on_call_transfer_status);
+        cfg.cb.on_reg_state2 = Some(crate::callbacks::on_reg_state);
+        cfg.cb.on_incoming_call = Some(crate::callbacks::on_incoming_call);
+        cfg.cb.on_call_state = Some(crate::callbacks::on_call_state);
+        cfg.cb.on_call_media_state = Some(crate::callbacks::on_call_media_state);
+        cfg.cb.on_dtmf_digit2 = Some(crate::callbacks::on_dtmf_digit2);
+        cfg.cb.on_call_transfer_status = Some(crate::callbacks::on_call_transfer_status);
 
         // User-Agent
         let ua_cstr = CString::new(config.user_agent.as_str()).unwrap();
@@ -312,11 +310,12 @@ impl SipEndpoint {
 
     /// Make an outbound call.
     ///
-    /// Returns the call ID.
+    /// Returns the call ID. Optional `headers` are added as custom SIP headers
+    /// on the outgoing INVITE.
     pub fn call(
         &self,
         dest_uri: &str,
-        _headers: Option<HashMap<String, String>>,
+        headers: Option<HashMap<String, String>>,
     ) -> Result<i32> {
         let acc_id = self
             .account_id
@@ -330,16 +329,58 @@ impl SipEndpoint {
             let mut call_id: pjsua_call_id = -1;
             let uri = pj_str_from_cstr(&uri_cstr);
 
-            // TODO: add custom headers via msg_data if provided
+            // Build msg_data with custom headers if provided
+            let msg_data_ptr = if let Some(ref hdrs) = headers {
+                if hdrs.is_empty() {
+                    std::ptr::null()
+                } else {
+                    let pool = pjsua_pool_create(
+                        b"call-hdrs\0".as_ptr() as *const _,
+                        1024,
+                        1024,
+                    );
+                    let msg_data = Box::into_raw(Box::new(std::mem::zeroed::<pjsua_msg_data>()));
+                    pjsua_msg_data_init(msg_data);
+
+                    for (name, value) in hdrs {
+                        let hdr_name = CString::new(name.as_str()).unwrap();
+                        let hdr_value = CString::new(value.as_str()).unwrap();
+                        let pj_name = pj_str_from_cstr(&hdr_name);
+                        let pj_value = pj_str_from_cstr(&hdr_value);
+                        let hdr = pjsip_generic_string_hdr_create(pool, &pj_name, &pj_value);
+                        if !hdr.is_null() {
+                            pj_list_insert_before(
+                                &mut (*msg_data).hdr_list as *mut pjsip_hdr as *mut pj_list_type,
+                                hdr as *mut pj_list_type,
+                            );
+                        }
+                        // CStrings can be dropped — pjsip_generic_string_hdr_create copies
+                        // the strings into the pool
+                    }
+
+                    // Store pool pointer so we can release it after the call
+                    // msg_data is on the heap so its address is stable
+                    msg_data as *const pjsua_msg_data
+                }
+            } else {
+                std::ptr::null()
+            };
 
             let status = pjsua_call_make_call(
                 acc_id,
                 &uri,
-                std::ptr::null(),  // call_setting
+                std::ptr::null(),     // call_setting
                 std::ptr::null_mut(), // user_data
-                std::ptr::null(),  // msg_data
+                msg_data_ptr,
                 &mut call_id,
             );
+
+            // Clean up msg_data if we allocated it
+            if !msg_data_ptr.is_null() {
+                let _ = Box::from_raw(msg_data_ptr as *mut pjsua_msg_data);
+                // Pool is released by pjsua internally after the message is sent
+            }
+
             check_status(status, "pjsua_call_make_call")?;
 
             // Create call session
@@ -392,27 +433,14 @@ impl SipEndpoint {
     ///
     /// `method`: "rfc2833" (default), "sip_info", or "auto"
     pub fn send_dtmf(&self, call_id: i32, digits: &str) -> Result<()> {
-        self.send_dtmf_with_method(call_id, digits, "rfc2833")
+        crate::dtmf::send_dtmf(call_id, digits, "rfc2833")
     }
 
     /// Send DTMF digits with explicit method selection.
     ///
     /// Methods: "rfc2833" (RTP events), "sip_info" (SIP INFO message)
     pub fn send_dtmf_with_method(&self, call_id: i32, digits: &str, method: &str) -> Result<()> {
-        let digits_cstr = CString::new(digits).unwrap();
-        unsafe {
-            let mut param: pjsua_call_send_dtmf_param = std::mem::zeroed();
-            pjsua_call_send_dtmf_param_default(&mut param);
-            param.digits = pj_str_from_cstr(&digits_cstr);
-            param.method = match method {
-                "sip_info" | "sipinfo" | "info" => pjsua_dtmf_method_PJSUA_DTMF_METHOD_SIP_INFO,
-                _ => pjsua_dtmf_method_PJSUA_DTMF_METHOD_RFC2833,
-            };
-            let status = pjsua_call_send_dtmf(call_id, &param);
-            check_status(status, "pjsua_call_send_dtmf")?;
-        }
-        info!("DTMF sent on call {} ({}): {}", call_id, method, digits);
-        Ok(())
+        crate::dtmf::send_dtmf(call_id, digits, method)
     }
 
     /// Blind transfer via SIP REFER.
@@ -667,254 +695,3 @@ impl Drop for SipEndpoint {
     }
 }
 
-// ─── SIP Callbacks ──────────────────────────────────────────────────────────
-
-unsafe extern "C" fn on_reg_state(acc_id: pjsua_acc_id, info: *mut pjsua_reg_info) {
-    let state = match global_state().lock() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-
-    if info.is_null() {
-        return;
-    }
-
-    let cbparam = (*info).cbparam;
-    if cbparam.is_null() {
-        return;
-    }
-
-    let status = (*cbparam).status;
-    let code = (*cbparam).code;
-
-    let event = if status == pj_constants__PJ_SUCCESS as i32 && (code / 100 == 2) {
-        info!("Registration successful (acc_id={})", acc_id);
-        EndpointEvent::Registered
-    } else if code == 0 || code == 408 {
-        warn!("Unregistered (acc_id={})", acc_id);
-        EndpointEvent::Unregistered
-    } else {
-        error!("Registration failed (acc_id={}, code={})", acc_id, code);
-        EndpointEvent::RegistrationFailed {
-            error: format!("SIP {}", code),
-        }
-    };
-
-    let _ = state.event_tx.try_send(event);
-}
-
-unsafe extern "C" fn on_incoming_call(
-    _acc_id: pjsua_acc_id,
-    call_id: pjsua_call_id,
-    _rdata: *mut pjsip_rx_data,
-) {
-    let mut state = match global_state().lock() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-
-    let mut session = CallSession::new(call_id, CallDirection::Inbound);
-
-    // Get call info for remote URI
-    if let Ok(ci) = get_call_info(call_id) {
-        session.remote_uri = pj_str_to_string(&ci.remote_info);
-        session.local_uri = pj_str_to_string(&ci.local_info);
-    }
-
-    info!(
-        "Incoming call from {} (call_id={})",
-        session.remote_uri, call_id
-    );
-
-    state.calls.insert(call_id, session.clone());
-
-    let _ = state.event_tx.try_send(EndpointEvent::IncomingCall { session });
-}
-
-unsafe extern "C" fn on_call_state(call_id: pjsua_call_id, _e: *mut pjsip_event) {
-    let ci = match get_call_info(call_id) {
-        Ok(ci) => ci,
-        Err(_) => return,
-    };
-
-    let mut state = match global_state().lock() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-
-    let call_state = match ci.state {
-        val if val == pjsip_inv_state_PJSIP_INV_STATE_CALLING => CallState::Calling,
-        val if val == pjsip_inv_state_PJSIP_INV_STATE_INCOMING => CallState::Incoming,
-        val if val == pjsip_inv_state_PJSIP_INV_STATE_EARLY => CallState::Early,
-        val if val == pjsip_inv_state_PJSIP_INV_STATE_CONNECTING => CallState::Connecting,
-        val if val == pjsip_inv_state_PJSIP_INV_STATE_CONFIRMED => CallState::Confirmed,
-        val if val == pjsip_inv_state_PJSIP_INV_STATE_DISCONNECTED => CallState::Disconnected,
-        _ => CallState::Failed("unknown state".into()),
-    };
-
-    debug!("Call {} state: {:?}", call_id, call_state);
-
-    // Update session
-    if let Some(session) = state.calls.get_mut(&call_id) {
-        session.state = call_state.clone();
-        session.remote_uri = pj_str_to_string(&ci.remote_info);
-        session.local_uri = pj_str_to_string(&ci.local_info);
-
-        let session_clone = session.clone();
-
-        if matches!(call_state, CallState::Disconnected | CallState::Failed(_)) {
-            // Clean up
-            let reason = pj_str_to_string(&ci.last_status_text);
-            state.calls.remove(&call_id);
-            if let Some(port) = state.media_ports.remove(&call_id) {
-                port.destroy();
-            }
-            if let Some(rec_id) = state.recorders.remove(&call_id) {
-                pjsua_recorder_destroy(rec_id);
-            }
-            state.beep_detectors.remove(&call_id);
-
-            let _ = state.event_tx.try_send(EndpointEvent::CallTerminated {
-                session: session_clone,
-                reason,
-            });
-        } else {
-            let _ = state.event_tx.try_send(EndpointEvent::CallStateChanged {
-                session: session_clone,
-            });
-        }
-    }
-}
-
-unsafe extern "C" fn on_call_media_state(call_id: pjsua_call_id) {
-    let ci = match get_call_info(call_id) {
-        Ok(ci) => ci,
-        Err(_) => return,
-    };
-
-    if ci.media_status == pjsua_call_media_status_PJSUA_CALL_MEDIA_ACTIVE {
-        let clock_rate;
-        let event_tx;
-        {
-            let mut state = global_state().lock().unwrap();
-            clock_rate = state.clock_rate;
-            event_tx = state.event_tx.clone();
-            // Destroy existing media port for this call (ICE renegotiation can
-            // trigger on_call_media_state multiple times)
-            if let Some(old_port) = state.media_ports.remove(&call_id) {
-                debug!("Replacing existing media port for call {}", call_id);
-                old_port.destroy();
-            }
-        }
-
-        let channels = 1u32;
-        let samples_per_frame = clock_rate / 50; // 20ms frames
-
-        match CustomMediaPort::new(call_id, clock_rate, channels, samples_per_frame, event_tx) {
-            Ok(port) => {
-                if let Err(e) = port.connect_to_call(ci.conf_slot as i32) {
-                    error!("Failed to connect media port to call {}: {}", call_id, e);
-                    return;
-                }
-
-                info!(
-                    "Call {} media active (conf_slot={}, port={})",
-                    call_id, ci.conf_slot, port.conf_slot
-                );
-
-                if let Ok(mut state) = global_state().lock() {
-                    state.media_ports.insert(call_id, port);
-                    let _ = state
-                        .event_tx
-                        .try_send(EndpointEvent::CallMediaActive { call_id });
-                }
-            }
-            Err(status) => {
-                error!("Failed to create media port for call {}: {}", call_id, status);
-            }
-        }
-    }
-}
-
-unsafe extern "C" fn on_dtmf_digit2(call_id: pjsua_call_id, info: *const pjsua_dtmf_info) {
-    if info.is_null() {
-        return;
-    }
-    let dtmf_info = &*info;
-    let ch = char::from(dtmf_info.digit as u8);
-    let method = match dtmf_info.method {
-        pjsua_dtmf_method_PJSUA_DTMF_METHOD_SIP_INFO => "sip_info",
-        _ => "rfc2833",
-    };
-    debug!("DTMF received on call {} ({}): {}", call_id, method, ch);
-
-    if let Ok(state) = global_state().lock() {
-        let _ = state.event_tx.try_send(EndpointEvent::DtmfReceived {
-            call_id,
-            digit: ch,
-            method: method.to_string(),
-        });
-    }
-}
-
-unsafe extern "C" fn on_call_transfer_status(
-    call_id: pjsua_call_id,
-    st_code: ::std::os::raw::c_int,
-    st_text: *const pj_str_t,
-    final_: pj_bool_t,
-    p_cont: *mut pj_bool_t,
-) {
-    let text = if !st_text.is_null() {
-        pj_str_to_string(&*st_text)
-    } else {
-        String::new()
-    };
-
-    info!(
-        "Transfer status for call {}: {} {} (final={})",
-        call_id, st_code, text, final_
-    );
-
-    // Continue monitoring transfer status
-    if !p_cont.is_null() {
-        *p_cont = pj_constants__PJ_TRUE as i32;
-    }
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-unsafe fn get_call_info(call_id: pjsua_call_id) -> Result<pjsua_call_info> {
-    let mut ci: pjsua_call_info = std::mem::zeroed();
-    let status = pjsua_call_get_info(call_id, &mut ci);
-    if status != pj_constants__PJ_SUCCESS as i32 {
-        return Err(EndpointError::InvalidCallId(call_id));
-    }
-    Ok(ci)
-}
-
-unsafe fn pj_str_from_cstr(s: &CString) -> pj_str_t {
-    pj_str_t {
-        ptr: s.as_ptr() as *mut _,
-        slen: s.as_bytes().len() as _,
-    }
-}
-
-unsafe fn pj_str_to_string(s: &pj_str_t) -> String {
-    if s.ptr.is_null() || s.slen <= 0 {
-        return String::new();
-    }
-    let slice = std::slice::from_raw_parts(s.ptr as *const u8, s.slen as usize);
-    String::from_utf8_lossy(slice).into_owned()
-}
-
-fn check_status(status: i32, context: &str) -> Result<()> {
-    if status == pj_constants__PJ_SUCCESS as i32 {
-        Ok(())
-    } else {
-        error!("{} failed with status {}", context, status);
-        Err(EndpointError::Pjsua {
-            code: status,
-            message: format!("{} failed", context),
-        })
-    }
-}

@@ -64,7 +64,7 @@ fn main() -> anyhow::Result<()> {
                 println!("=== Media active on call {} ===", cid);
                 media_active = true;
             }
-            Ok(EndpointEvent::DtmfReceived { call_id: cid, digit }) => {
+            Ok(EndpointEvent::DtmfReceived { call_id: cid, digit, .. }) => {
                 println!("DTMF on call {}: {}", cid, digit);
             }
             Ok(EndpointEvent::CallTerminated { session: _, reason }) => {

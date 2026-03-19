@@ -47,7 +47,7 @@ fn main() -> anyhow::Result<()> {
                 // With null sound device + conf bridge, the SIP stack handles
                 // the audio path. For echo, we'd need a custom media port.
             }
-            EndpointEvent::DtmfReceived { call_id, digit } => {
+            EndpointEvent::DtmfReceived { call_id, digit, .. } => {
                 println!("DTMF on call {}: {}", call_id, digit);
                 if digit == '#' {
                     println!("# received, hanging up.");
