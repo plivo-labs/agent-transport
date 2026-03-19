@@ -1,17 +1,17 @@
-//! Smoke test — verifies PJSUA initializes and shuts down without credentials.
+//! Smoke test — verifies endpoint initializes and shuts down.
 
 use agent_transport::{EndpointConfig, SipEndpoint};
 
 #[test]
-fn pjsua_init_and_shutdown() {
+fn endpoint_init_and_shutdown() {
     let config = EndpointConfig {
-        log_level: 0, // silent
+        log_level: 0,
         ..Default::default()
     };
 
-    let ep = SipEndpoint::new(config).expect("PJSUA should initialize");
+    let ep = SipEndpoint::new(config).expect("SipEndpoint should initialize");
     assert!(!ep.is_registered());
-    ep.shutdown().expect("PJSUA should shut down cleanly");
+    ep.shutdown().expect("SipEndpoint should shut down cleanly");
 }
 
 #[test]
@@ -26,7 +26,7 @@ fn audio_frame_basics() {
 
     // Roundtrip through bytes
     let bytes = frame.as_bytes();
-    assert_eq!(bytes.len(), 960 * 2); // 2 bytes per i16
+    assert_eq!(bytes.len(), 960 * 2);
     let restored = AudioFrame::from_bytes(&bytes, 48000, 1);
     assert_eq!(restored.data, frame.data);
 }
