@@ -1,6 +1,6 @@
 //! Inbound call echo example — answers incoming calls and echoes audio back.
 //!
-//! Usage: PLIVO_USER=xxx PLIVO_PASS=yyy cargo run --example inbound_echo
+//! Usage: SIP_USERNAME=xxx SIP_PASSWORD=yyy cargo run --example inbound_echo
 
 use agent_endpoint::{EndpointConfig, EndpointEvent, SipEndpoint};
 use std::env;
@@ -8,8 +8,8 @@ use std::env;
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let username = env::var("PLIVO_USER").expect("Set PLIVO_USER env var");
-    let password = env::var("PLIVO_PASS").expect("Set PLIVO_PASS env var");
+    let username = env::var("SIP_USERNAME").expect("Set SIP_USERNAME env var");
+    let password = env::var("SIP_PASSWORD").expect("Set SIP_PASSWORD env var");
 
     let ep = SipEndpoint::new(EndpointConfig {
         log_level: 4,

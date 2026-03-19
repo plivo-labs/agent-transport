@@ -3,18 +3,25 @@
 CLI Example Phone — make a real SIP call and talk from your terminal.
 
 Uses the plivo_endpoint Python binding for SIP + sounddevice for mic/speaker.
-Demonstrates the full programmatic audio API: recv_audio → speaker, mic → send_audio.
+Demonstrates the full programmatic audio API: recv_audio -> speaker, mic -> send_audio.
 
 Prerequisites:
     cd crates/agent-endpoint-python && maturin develop
     pip install sounddevice numpy
 
 Usage:
-    # Outbound call (call someone):
-    PLIVO_USER=xxx PLIVO_PASS=yyy python examples/cli_phone.py sip:+15551234567@phone.plivo.com
+    # Outbound call:
+    SIP_USERNAME=xxx SIP_PASSWORD=yyy SIP_DOMAIN=phone.plivo.com \
+        python examples/cli_phone.py sip:+15551234567@phone.plivo.com
 
     # Inbound (wait for a call):
-    PLIVO_USER=xxx PLIVO_PASS=yyy python examples/cli_phone.py
+    SIP_USERNAME=xxx SIP_PASSWORD=yyy python examples/cli_phone.py
+
+Environment variables:
+    SIP_USERNAME   - SIP account username (required)
+    SIP_PASSWORD   - SIP account password (required)
+    SIP_DOMAIN     - SIP server hostname (default: phone.plivo.com)
+    SIP_LOG_LEVEL  - pjsua log level 0-6 (default: 3)
 """
 
 import os
@@ -33,20 +40,21 @@ FRAME_SAMPLES = SAMPLE_RATE * FRAME_DURATION_MS // 1000  # 320 samples per frame
 
 
 def main():
-    username = os.environ.get("PLIVO_USER") or os.environ.get("PLIVO_USERNAME")
-    password = os.environ.get("PLIVO_PASS") or os.environ.get("PLIVO_PASSWORD")
-    sip_server = os.environ.get("PLIVO_SIP_DOMAIN", "phone.plivo.com")
+    username = os.environ.get("SIP_USERNAME")
+    password = os.environ.get("SIP_PASSWORD")
+    sip_domain = os.environ.get("SIP_DOMAIN", "phone.plivo.com")
+    log_level = int(os.environ.get("SIP_LOG_LEVEL", "3"))
     dest_uri = sys.argv[1] if len(sys.argv) > 1 else None
 
     if not username or not password:
-        print("Set PLIVO_USER and PLIVO_PASS environment variables.")
+        print("Set SIP_USERNAME and SIP_PASSWORD environment variables.")
         sys.exit(1)
 
     # --- Initialize endpoint ---
     print("Initializing SIP endpoint...")
-    ep = PlivoEndpoint(sip_server=sip_server, log_level=3)
+    ep = PlivoEndpoint(sip_server=sip_domain, log_level=log_level)
 
-    print(f"Registering as {username}@{sip_server}...")
+    print(f"Registering as {username}@{sip_domain}...")
     ep.register(username, password)
 
     # Wait for registration
@@ -91,7 +99,7 @@ def main():
     print("Press Enter to hang up.")
     print()
 
-    # --- Audio bridge: mic → send_audio, recv_audio → speaker ---
+    # --- Audio bridge: mic -> send_audio, recv_audio -> speaker ---
     running = threading.Event()
     running.set()
 
@@ -115,7 +123,7 @@ def main():
             dtype="float32",
             callback=mic_callback,
         ):
-            running.wait()  # blocks until running is cleared
+            running.wait()
 
     def sip_to_speaker():
         """Pull from SIP call via recv_audio, play through speaker."""
@@ -125,7 +133,6 @@ def main():
             frame = ep.recv_audio(call_id)
             if frame is not None:
                 samples = np.array(frame.data, dtype=np.int16).astype(np.float32) / 32767.0
-                # Pad or trim to match requested frame size
                 if len(samples) >= frames:
                     outdata[:, 0] = samples[:frames]
                 else:
@@ -143,14 +150,12 @@ def main():
         ):
             running.wait()
 
-    # Start audio threads
     mic_thread = threading.Thread(target=mic_to_sip, daemon=True)
     speaker_thread = threading.Thread(target=sip_to_speaker, daemon=True)
     mic_thread.start()
     speaker_thread.start()
 
     # --- Event loop: watch for hangup or call end ---
-    # Separate thread to watch for Enter key
     hangup = threading.Event()
 
     def wait_for_enter():
@@ -177,7 +182,6 @@ def main():
 
         time.sleep(0.05)
 
-    # --- Cleanup ---
     running.clear()
     mic_thread.join(timeout=1)
     speaker_thread.join(timeout=1)

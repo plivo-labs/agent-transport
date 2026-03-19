@@ -1,7 +1,7 @@
 //! Outbound call example — calls a destination and prints audio frame stats.
 //!
 //! Usage:
-//!   PLIVO_USER=xxx PLIVO_PASS=yyy cargo run --example outbound_call -- sip:+15551234567@phone.plivo.com
+//!   SIP_USERNAME=xxx SIP_PASSWORD=yyy cargo run --example outbound_call -- sip:+15551234567@phone.plivo.com
 //!
 //! For Plivo endpoints, dial format: sip:<number>@phone.plivo.com
 
@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let username = env::var("PLIVO_USER").expect("Set PLIVO_USER env var");
-    let password = env::var("PLIVO_PASS").expect("Set PLIVO_PASS env var");
-    let sip_server = env::var("PLIVO_SIP_DOMAIN").unwrap_or_else(|_| "phone.plivo.com".into());
+    let username = env::var("SIP_USERNAME").expect("Set SIP_USERNAME env var");
+    let password = env::var("SIP_PASSWORD").expect("Set SIP_PASSWORD env var");
+    let sip_server = env::var("SIP_DOMAIN").unwrap_or_else(|_| "phone.plivo.com".into());
     let dest = env::args()
         .nth(1)
         .unwrap_or_else(|| format!("sip:+14157583659@{}", sip_server));

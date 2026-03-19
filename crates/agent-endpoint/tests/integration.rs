@@ -1,8 +1,8 @@
-//! Integration tests — require live Plivo credentials.
+//! Integration tests — require a live SIP account.
 //!
-//! Run: PLIVO_USER=xxx PLIVO_PASS=yyy cargo test -p agent-endpoint --features integration
+//! Run: SIP_USERNAME=xxx SIP_PASSWORD=yyy cargo test -p agent-endpoint --features integration
 //!
-//! These tests register with Plivo, make real SIP calls, and verify the full
+//! These tests register with a SIP server, make real calls, and verify the full
 //! call lifecycle including audio I/O.
 #![cfg(feature = "integration")]
 
@@ -10,22 +10,18 @@ use agent_endpoint::{AudioFrame, EndpointConfig, EndpointEvent, SipEndpoint};
 use std::env;
 use std::time::Duration;
 
-fn plivo_creds() -> (String, String) {
-    let user = env::var("PLIVO_USER")
-        .or_else(|_| env::var("PLIVO_USERNAME"))
-        .expect("Set PLIVO_USER or PLIVO_USERNAME env var");
-    let pass = env::var("PLIVO_PASS")
-        .or_else(|_| env::var("PLIVO_PASSWORD"))
-        .expect("Set PLIVO_PASS or PLIVO_PASSWORD env var");
+fn sip_creds() -> (String, String) {
+    let user = env::var("SIP_USERNAME").expect("Set SIP_USERNAME env var");
+    let pass = env::var("SIP_PASSWORD").expect("Set SIP_PASSWORD env var");
     (user, pass)
 }
 
 fn sip_domain() -> String {
-    env::var("PLIVO_SIP_DOMAIN").unwrap_or_else(|_| "phone.plivo.com".into())
+    env::var("SIP_DOMAIN").unwrap_or_else(|_| "phone.plivo.com".into())
 }
 
 fn dest_uri() -> String {
-    env::var("PLIVO_DEST_URI").unwrap_or_else(|_| {
+    env::var("SIP_DEST_URI").unwrap_or_else(|_| {
         format!("sip:+14157583659@{}", sip_domain())
     })
 }
@@ -42,7 +38,7 @@ fn make_endpoint() -> SipEndpoint {
 
 #[test]
 fn register_and_unregister() {
-    let (user, pass) = plivo_creds();
+    let (user, pass) = sip_creds();
     let ep = make_endpoint();
 
     ep.register(&user, &pass).expect("register should succeed");
@@ -64,7 +60,7 @@ fn register_and_unregister() {
 
 #[test]
 fn outbound_call_and_hangup() {
-    let (user, pass) = plivo_creds();
+    let (user, pass) = sip_creds();
     let ep = make_endpoint();
 
     ep.register(&user, &pass).unwrap();
@@ -121,7 +117,7 @@ fn outbound_call_and_hangup() {
 
 #[test]
 fn send_and_receive_audio() {
-    let (user, pass) = plivo_creds();
+    let (user, pass) = sip_creds();
     let ep = make_endpoint();
 
     ep.register(&user, &pass).unwrap();

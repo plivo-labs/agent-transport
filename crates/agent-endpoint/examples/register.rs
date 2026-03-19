@@ -1,6 +1,6 @@
 //! Basic registration example.
 //!
-//! Usage: PLIVO_USER=xxx PLIVO_PASS=yyy cargo run --example register
+//! Usage: SIP_USERNAME=xxx SIP_PASSWORD=yyy cargo run --example register
 
 use agent_endpoint::{EndpointConfig, EndpointEvent, SipEndpoint};
 use std::env;
@@ -8,10 +8,10 @@ use std::env;
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let username = env::var("PLIVO_USER").expect("Set PLIVO_USER env var");
-    let password = env::var("PLIVO_PASS").expect("Set PLIVO_PASS env var");
+    let username = env::var("SIP_USERNAME").expect("Set SIP_USERNAME env var");
+    let password = env::var("SIP_PASSWORD").expect("Set SIP_PASSWORD env var");
 
-    let sip_server = env::var("PLIVO_SIP_DOMAIN").unwrap_or_else(|_| "phone.plivo.com".into());
+    let sip_server = env::var("SIP_DOMAIN").unwrap_or_else(|_| "phone.plivo.com".into());
 
     let config = EndpointConfig {
         sip_server,
