@@ -27,6 +27,7 @@ pub(crate) struct GlobalState {
     pub(crate) media_ports: HashMap<i32, CustomMediaPort>,
     pub(crate) recorders: HashMap<i32, pjsua_recorder_id>,
     pub(crate) beep_detectors: HashMap<i32, BeepDetector>,
+    pub(crate) use_sound_device: bool,
     pub(crate) clock_rate: u32,
 }
 
@@ -69,6 +70,7 @@ impl SipEndpoint {
                     media_ports: HashMap::new(),
                     recorders: HashMap::new(),
                     beep_detectors: HashMap::new(),
+                    use_sound_device: config.use_sound_device,
                     clock_rate: 8000,
                 }));
             }
@@ -157,9 +159,20 @@ impl SipEndpoint {
         );
         check_status(status, "pjsua_transport_create")?;
 
-        // Set null sound device (no physical audio device needed)
-        let status = pjsua_set_null_snd_dev();
-        check_status(status, "pjsua_set_null_snd_dev")?;
+        // Sound device setup
+        if config.use_sound_device {
+            // Use system microphone + speaker for live calls
+            let status = pjsua_set_snd_dev(
+                PJMEDIA_AUD_DEFAULT_CAPTURE_DEV,
+                PJMEDIA_AUD_DEFAULT_PLAYBACK_DEV,
+            );
+            check_status(status, "pjsua_set_snd_dev")?;
+            info!("Using system sound device (mic + speaker)");
+        } else {
+            // Null device for programmatic audio (bots, agents)
+            let status = pjsua_set_null_snd_dev();
+            check_status(status, "pjsua_set_null_snd_dev")?;
+        }
 
         // Start SIP stack
         let status = pjsua_start();

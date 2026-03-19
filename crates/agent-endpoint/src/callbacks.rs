@@ -184,10 +184,12 @@ pub(crate) unsafe extern "C" fn on_call_media_state(call_id: pjsua_call_id) {
     if ci.media_status == pjsua_call_media_status_PJSUA_CALL_MEDIA_ACTIVE {
         let clock_rate;
         let event_tx;
+        let use_sound_device;
         {
             let mut state = global_state().lock().unwrap();
             clock_rate = state.clock_rate;
             event_tx = state.event_tx.clone();
+            use_sound_device = state.use_sound_device;
             // Destroy existing media port for this call (ICE renegotiation can
             // trigger on_call_media_state multiple times)
             if let Some(old_port) = state.media_ports.remove(&call_id) {
@@ -196,9 +198,19 @@ pub(crate) unsafe extern "C" fn on_call_media_state(call_id: pjsua_call_id) {
             }
         }
 
+        // Connect call to system sound device (mic + speaker) if enabled.
+        // Slot 0 is always the sound device in pjsua's conference bridge.
+        if use_sound_device {
+            let call_slot = ci.conf_slot as i32;
+            pjsua_conf_connect(call_slot, 0); // call → speaker
+            pjsua_conf_connect(0, call_slot); // mic → call
+            info!("Call {} connected to sound device (conf_slot={})", call_id, call_slot);
+        }
+
         let channels = 1u32;
         let samples_per_frame = clock_rate / 50; // 20ms frames
 
+        // Also create the programmatic media port (for send_audio/recv_audio/beep detection)
         match CustomMediaPort::new(call_id, clock_rate, channels, samples_per_frame, event_tx)
         {
             Ok(port) => {

@@ -62,6 +62,11 @@ pub struct EndpointConfig {
 
     /// Registration expiry in seconds
     pub register_expires: u32,
+
+    /// Use the system sound device (microphone + speaker) instead of null audio.
+    /// When true, calls route audio through your hardware — you can actually talk.
+    /// When false (default), audio is programmatic only via send_audio/recv_audio.
+    pub use_sound_device: bool,
 }
 
 impl Default for EndpointConfig {
@@ -78,6 +83,7 @@ impl Default for EndpointConfig {
             enable_ice: true,
             enable_srtp: false,
             register_expires: 120,
+            use_sound_device: false,
         }
     }
 }
