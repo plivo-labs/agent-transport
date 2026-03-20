@@ -36,6 +36,29 @@ impl Codec {
             Codec::Opus => 48000,
         }
     }
+
+    /// Encode PCM samples to G.711 bytes.
+    pub fn encode(&self, samples: &[i16]) -> Vec<u8> {
+        match self {
+            Codec::PCMU => samples.iter().map(|&s| audio_codec_algorithms::encode_ulaw(s)).collect(),
+            Codec::PCMA => samples.iter().map(|&s| audio_codec_algorithms::encode_alaw(s)).collect(),
+            _ => samples.iter().map(|&s| audio_codec_algorithms::encode_ulaw(s)).collect(),
+        }
+    }
+
+    /// Decode G.711 bytes to PCM samples.
+    pub fn decode(&self, bytes: &[u8]) -> Vec<i16> {
+        match self {
+            Codec::PCMU => bytes.iter().map(|&b| audio_codec_algorithms::decode_ulaw(b)).collect(),
+            Codec::PCMA => bytes.iter().map(|&b| audio_codec_algorithms::decode_alaw(b)).collect(),
+            _ => bytes.iter().map(|&b| audio_codec_algorithms::decode_ulaw(b)).collect(),
+        }
+    }
+
+    /// Silence byte for this codec.
+    pub fn silence_byte(&self) -> u8 {
+        match self { Codec::PCMU => 0xFF, Codec::PCMA => 0xD5, _ => 0xFF }
+    }
 }
 
 /// TURN server configuration.

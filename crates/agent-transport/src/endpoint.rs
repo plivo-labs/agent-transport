@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -29,6 +30,8 @@ use crate::events::EndpointEvent;
 use crate::recorder::WavRecorder;
 use crate::rtp_transport::RtpTransport;
 use crate::sdp;
+
+fn err(e: impl Display) -> EndpointError { EndpointError::Other(e.to_string()) }
 
 // ─── Per-call context ────────────────────────────────────────────────────────
 
@@ -74,7 +77,7 @@ pub struct SipEndpoint {
 
 impl SipEndpoint {
     pub fn new(config: EndpointConfig) -> Result<Self> {
-        let rt = Runtime::new().map_err(|e| EndpointError::Other(format!("tokio: {}", e)))?;
+        let rt = Runtime::new().map_err(err)?;
         let (etx, erx) = crossbeam_channel::unbounded();
         let cancel = CancellationToken::new();
         let state = Arc::new(Mutex::new(EndpointState {
@@ -87,7 +90,7 @@ impl SipEndpoint {
         rt.block_on(async {
             let addr: SocketAddr = format!("0.0.0.0:{}", lp).parse().unwrap();
             let udp = UdpConnection::create_connection(addr, None, Some(cc.clone())).await
-                .map_err(|e| EndpointError::Other(format!("UDP: {}", e)))?;
+                .map_err(err)?;
             let la = udp.get_addr().clone();
             let tl = TransportLayer::new(cc.clone());
             tl.add_transport(udp.into());
@@ -96,7 +99,7 @@ impl SipEndpoint {
             let ep = b.build();
             let ei = ep.inner.clone();
             let dl = Arc::new(DialogLayer::new(ei.clone()));
-            let rx = ep.incoming_transactions().map_err(|e| EndpointError::Other(format!("incoming: {}", e)))?;
+            let rx = ep.incoming_transactions().map_err(err)?;
             let cc2 = cc.clone();
             tokio::spawn(async move { tokio::select! { _ = ep.serve() => {}, _ = cc2.cancelled() => {} } });
 
@@ -134,14 +137,14 @@ impl SipEndpoint {
             if let Some(a) = pa { info!("STUN: public {}", a); }
 
             let (ch, cp) = pa.map(|a| (a.ip().to_string(), a.port())).unwrap_or((la.addr.host.to_string(), la.addr.port.map(u16::from).unwrap_or(5060)));
-            let contact_uri: rsip::Uri = format!("sip:{}@{}:{}", user, ch, cp).try_into().map_err(|e| EndpointError::Other(format!("URI: {:?}", e)))?;
-            let contact_hp: rsip::HostWithPort = format!("{}:{}", ch, cp).try_into().map_err(|e| EndpointError::Other(format!("HP: {:?}", e)))?;
+            let contact_uri: rsip::Uri = format!("sip:{}@{}:{}", user, ch, cp).try_into().map_err(|e| err(format!("{:?}", e)))?;
+            let contact_hp: rsip::HostWithPort = format!("{}:{}", ch, cp).try_into().map_err(|e| err(format!("{:?}", e)))?;
             let contact = Registration::create_nat_aware_contact(&user, Some(contact_hp), &la);
             let mut reg = Registration::new(ei, Some(cred.clone()));
             reg.contact = Some(contact);
 
-            let server_uri: rsip::Uri = format!("sip:{}", srv).try_into().map_err(|e| EndpointError::Other(format!("srv: {:?}", e)))?;
-            let resp = reg.register(server_uri.clone(), Some(exp)).await.map_err(|e| EndpointError::Other(format!("register: {}", e)))?;
+            let server_uri: rsip::Uri = format!("sip:{}", srv).try_into().map_err(|e| err(format!("{:?}", e)))?;
+            let resp = reg.register(server_uri.clone(), Some(exp)).await.map_err(err)?;
 
             if resp.status_code == rsip::StatusCode::OK {
                 info!("Registered {}@{}", user, srv);
@@ -190,17 +193,17 @@ impl SipEndpoint {
                  s.public_addr)
             };
 
-            let rtp_sock = UdpSocket::bind("0.0.0.0:0").await.map_err(|e| EndpointError::Other(format!("RTP: {}", e)))?;
+            let rtp_sock = UdpSocket::bind("0.0.0.0:0").await.map_err(err)?;
             let rtp_port = rtp_sock.local_addr().unwrap().port();
             let sdp_ip = pa.map(|a| a.ip()).unwrap_or_else(|| la.addr.host.to_string().parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into()));
             let offer = sdp::build_offer(sdp_ip, rtp_port, &cfg.codecs);
 
             let custom_hdrs = headers.map(|h| h.into_iter().map(|(k, v)| rsip::Header::Other(k, v)).collect());
-            let callee: rsip::Uri = dest.clone().try_into().map_err(|e| EndpointError::Other(format!("URI: {:?}", e)))?;
+            let callee: rsip::Uri = dest.clone().try_into().map_err(|e| err(format!("{:?}", e)))?;
             let opt = InviteOption { caller: contact.clone(), callee, contact, credential: Some(cred), offer: Some(offer.into_bytes()), content_type: Some("application/sdp".into()), headers: custom_hdrs, ..Default::default() };
 
             let (ds, dr) = dl.new_dialog_state_channel();
-            let (dialog, resp) = dl.do_invite(opt, ds).await.map_err(|e| EndpointError::Other(format!("INVITE: {}", e)))?;
+            let (dialog, resp) = dl.do_invite(opt, ds).await.map_err(err)?;
             let call_id = { let mut s = st.lock().unwrap(); let id = s.next_call_id; s.next_call_id += 1; id };
 
             let mut session = CallSession::new(call_id, CallDirection::Outbound);
@@ -263,15 +266,15 @@ impl SipEndpoint {
             let ctx = s.calls.get_mut(&call_id).ok_or(EndpointError::CallNotActive(call_id))?;
             if let Some(ref d) = ctx.server_dialog {
                 if code >= 200 && code < 300 {
-                    let rtp_sock = UdpSocket::bind("0.0.0.0:0").await.map_err(|e| EndpointError::Other(format!("RTP: {}", e)))?;
+                    let rtp_sock = UdpSocket::bind("0.0.0.0:0").await.map_err(err)?;
                     let rtp_port = rtp_sock.local_addr().unwrap().port();
                     let ip = pa.map(|a| a.ip()).unwrap_or_else(|| la_str.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into()));
                     let body = sdp::build_offer(ip, rtp_port, &cfg.codecs);
-                    d.accept(None, Some(body.into_bytes())).map_err(|e| EndpointError::Other(format!("accept: {}", e)))?;
+                    d.accept(None, Some(body.into_bytes())).map_err(err)?;
                     ctx.session.state = CallState::Confirmed;
                     let _ = etx.try_send(EndpointEvent::CallMediaActive { call_id });
                 } else if code >= 100 && code < 200 {
-                    d.ringing(None, None).map_err(|e| EndpointError::Other(format!("ringing: {}", e)))?;
+                    d.ringing(None, None).map_err(err)?;
                 }
             }
             Ok(())
@@ -331,9 +334,9 @@ impl SipEndpoint {
         self.runtime.block_on(async {
             let s = st.lock().unwrap();
             let ctx = s.calls.get(&call_id).ok_or(EndpointError::CallNotActive(call_id))?;
-            let uri: rsip::Uri = dest.try_into().map_err(|e| EndpointError::Other(format!("URI: {:?}", e)))?;
-            if let Some(ref d) = ctx.client_dialog { d.refer(uri, None, None).await.map_err(|e| EndpointError::Other(e.to_string()))?; }
-            else if let Some(ref d) = ctx.server_dialog { d.refer(uri, None, None).await.map_err(|e| EndpointError::Other(e.to_string()))?; }
+            let uri: rsip::Uri = dest.try_into().map_err(|e| err(format!("{:?}", e)))?;
+            if let Some(ref d) = ctx.client_dialog { d.refer(uri, None, None).await.map_err(err)?; }
+            else if let Some(ref d) = ctx.server_dialog { d.refer(uri, None, None).await.map_err(err)?; }
             Ok(())
         })
     }
