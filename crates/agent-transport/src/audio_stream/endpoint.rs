@@ -175,26 +175,29 @@ impl AudioStreamEndpoint {
         Ok(())
     }
 
-    /// Hang up the call via Plivo REST API.
+    /// Hang up the call via Plivo REST API. Idempotent — safe to call multiple times.
     pub fn hangup(&self, session_id: i32) -> Result<()> {
+        // Remove session first to prevent duplicate hangup (Pipecat _hangup_attempted pattern)
         let call_id = {
-            let s = self.sessions.lock().unwrap();
-            let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
-            sess.call_id.clone()
+            let sess = self.sessions.lock().unwrap().remove(&session_id);
+            match sess {
+                Some(s) => s.call_id,
+                None => return Ok(()), // Already hung up — idempotent
+            }
         };
 
         let (auth_id, auth_token) = (self.config.plivo_auth_id.clone(), self.config.plivo_auth_token.clone());
+        if auth_id.is_empty() { return Ok(()); }
+
         self.runtime.block_on(async {
             let url = format!("https://api.plivo.com/v1/Account/{}/Call/{}/", auth_id, call_id);
             let client = reqwest::Client::new();
             match client.delete(&url).basic_auth(&auth_id, Some(&auth_token)).send().await {
                 Ok(r) if r.status().is_success() || r.status().as_u16() == 404 => { info!("Call {} hung up", call_id); }
-                Ok(r) => { warn!("Hangup failed: {}", r.status()); }
+                Ok(r) => { warn!("Hangup failed: {} {}", r.status(), r.text().await.unwrap_or_default()); }
                 Err(e) => { warn!("Hangup error: {}", e); }
             }
         });
-
-        self.sessions.lock().unwrap().remove(&session_id);
         Ok(())
     }
 
