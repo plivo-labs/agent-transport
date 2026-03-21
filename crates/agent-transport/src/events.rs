@@ -1,4 +1,4 @@
-use crate::call::CallSession;
+use crate::sip::call::CallSession;
 
 /// Events emitted by the SIP endpoint.
 #[derive(Debug, Clone)]
@@ -69,7 +69,7 @@ impl EndpointEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::call::{CallDirection, CallSession};
+    use crate::sip::call::{CallDirection, CallSession};
 
     #[test]
     fn test_callback_names() {

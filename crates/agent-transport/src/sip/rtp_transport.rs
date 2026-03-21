@@ -18,7 +18,7 @@ use webrtc_util::marshal::{Marshal, MarshalSize, Unmarshal};
 use beep_detector::{BeepDetector, BeepDetectorResult};
 use crate::audio::AudioFrame;
 use crate::config::Codec;
-use crate::dtmf;
+use crate::sip::dtmf;
 use crate::events::EndpointEvent;
 
 pub(crate) const DEFAULT_DTMF_PT: u8 = 101;
@@ -144,7 +144,7 @@ impl RtpTransport {
                 }
                 if last_rtp.elapsed() > MEDIA_TIMEOUT {
                     warn!("Media timeout call {} ({}s)", cid, MEDIA_TIMEOUT.as_secs());
-                    let _ = etx.try_send(EndpointEvent::CallTerminated { session: crate::call::CallSession::new(cid, crate::call::CallDirection::Outbound), reason: "media timeout".into() });
+                    let _ = etx.try_send(EndpointEvent::CallTerminated { session: crate::sip::call::CallSession::new(cid, crate::sip::call::CallDirection::Outbound), reason: "media timeout".into() });
                     break;
                 }
             }

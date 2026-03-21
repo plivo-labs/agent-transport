@@ -23,13 +23,13 @@ use rsipstack::transport::{SipAddr, TransportLayer};
 use rsipstack::EndpointBuilder;
 
 use crate::audio::AudioFrame;
-use crate::call::{CallDirection, CallSession, CallState};
+use crate::sip::call::{CallDirection, CallSession, CallState};
 use crate::config::{Codec, EndpointConfig};
 use crate::error::{EndpointError, Result};
 use crate::events::EndpointEvent;
 use crate::recorder::WavRecorder;
-use crate::rtp_transport::RtpTransport;
-use crate::sdp;
+use crate::sip::rtp_transport::RtpTransport;
+use crate::sip::sdp;
 
 fn err(e: impl Display) -> EndpointError { EndpointError::Other(e.to_string()) }
 
@@ -223,7 +223,7 @@ impl SipEndpoint {
             session.state = CallState::Confirmed;
 
             let cc = CancellationToken::new();
-            let dtmf_pt = answer.dtmf_payload_type.unwrap_or(crate::rtp_transport::DEFAULT_DTMF_PT);
+            let dtmf_pt = answer.dtmf_payload_type.unwrap_or(crate::sip::rtp_transport::DEFAULT_DTMF_PT);
             let rtp = Arc::new(RtpTransport::new(Arc::new(rtp_sock), remote_rtp, answer.codec, cc.clone(), dtmf_pt, answer.ptime_ms));
             let (otx, orx) = crossbeam_channel::bounded(50);
             let (itx, irx) = crossbeam_channel::bounded(50);

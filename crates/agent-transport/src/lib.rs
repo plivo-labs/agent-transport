@@ -1,9 +1,12 @@
-//! Agent Transport — SIP transport for AI agents.
+//! Agent Transport — multi-transport library for AI voice agents.
 //!
-//! Pure Rust implementation using rsipstack for SIP signaling
-//! and rtc-rtp for RTP media transport.
+//! Supports:
+//! - **SIP transport** (`sip` module): Direct SIP calling via rsipstack + RTP
+//! - **Audio streaming** (`audio_stream` module): Plivo WebSocket audio streaming
 //!
-//! # Example
+//! Both transports produce/consume the same `AudioFrame` format (int16 PCM, 16kHz mono).
+//!
+//! # Example (SIP)
 //! ```no_run
 //! use agent_transport::{SipEndpoint, EndpointConfig, Codec, AudioFrame};
 //!
@@ -15,32 +18,35 @@
 //!
 //! let ep = SipEndpoint::new(config).unwrap();
 //! ep.register("user", "pass").unwrap();
-//!
 //! let call_id = ep.call("sip:+15551234567@phone.plivo.com", None).unwrap();
-//! // ... send/receive audio frames ...
 //! ep.hangup(call_id).unwrap();
 //! ep.shutdown().unwrap();
 //! ```
 
+// Shared modules
 mod audio;
-mod call;
 #[cfg(feature = "comfort-noise")]
 pub mod comfort_noise;
 mod config;
-mod dtmf;
-mod endpoint;
 mod error;
 mod events;
 #[cfg(feature = "plc")]
 pub mod plc;
 mod recorder;
-mod rtp_transport;
-mod sdp;
 
+// Transport modules
+pub mod sip;
+pub mod audio_stream;
+
+// ─── Public re-exports (backward compatible) ─────────────────────────────────
+
+// Shared types
 pub use audio::AudioFrame;
 pub use beep_detector::BeepDetectorConfig;
-pub use call::{CallDirection, CallSession, CallState};
 pub use config::{AudioProcessingConfig, Codec, EndpointConfig, TurnConfig};
-pub use endpoint::SipEndpoint;
 pub use error::EndpointError;
 pub use events::EndpointEvent;
+
+// SIP transport (re-exported at root for backward compat)
+pub use sip::call::{CallDirection, CallSession, CallState};
+pub use sip::endpoint::SipEndpoint;

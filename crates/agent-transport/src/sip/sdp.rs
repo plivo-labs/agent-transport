@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 
 use crate::config::Codec;
 use crate::error::{EndpointError, Result};
-use crate::rtp_transport::DEFAULT_DTMF_PT;
+use crate::sip::rtp_transport::DEFAULT_DTMF_PT;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SdpAnswer {
