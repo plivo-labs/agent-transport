@@ -418,6 +418,16 @@ impl SipEndpoint {
             .map_err(napi_err)
     }
 
+    /// Receive audio frame, blocking until available or timeout (ms).
+    /// Use instead of polling recv_audio() in a loop.
+    #[napi]
+    pub fn recv_audio_blocking(&self, call_id: i32, timeout_ms: Option<u32>) -> Result<Option<AudioFrame>> {
+        self.inner
+            .recv_audio_blocking(call_id, timeout_ms.unwrap_or(20) as u64)
+            .map(|opt| opt.map(AudioFrame::from_rust))
+            .map_err(napi_err)
+    }
+
     /// Number of audio frames queued for sending. Multiply by 0.02 for seconds.
     #[napi]
     pub fn queued_frames(&self, call_id: i32) -> Result<u32> {

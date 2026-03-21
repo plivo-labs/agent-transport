@@ -382,6 +382,13 @@ impl SipEndpoint {
         self.with_call(call_id, |c| c.incoming_rx.try_recv().ok())
     }
 
+    /// Receive audio frame, blocking until one is available or timeout.
+    /// Use this instead of polling recv_audio() in a loop — avoids Python GIL contention.
+    pub fn recv_audio_blocking(&self, call_id: i32, timeout_ms: u64) -> Result<Option<AudioFrame>> {
+        let rx = self.with_call(call_id, |c| c.incoming_rx.clone())?;
+        Ok(rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)).ok())
+    }
+
     /// Number of audio frames queued for sending (outgoing buffer depth).
     pub fn queued_frames(&self, call_id: i32) -> Result<usize> {
         self.with_call(call_id, |c| c.outgoing_tx.len())

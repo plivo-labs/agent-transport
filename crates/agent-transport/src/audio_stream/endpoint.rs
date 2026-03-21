@@ -153,6 +153,17 @@ impl AudioStreamEndpoint {
         Ok(sess.incoming_rx.try_recv().ok())
     }
 
+    /// Receive audio frame, blocking until available or timeout.
+    /// Avoids Python polling loops that cause jitter at high concurrency.
+    pub fn recv_audio_blocking(&self, session_id: i32, timeout_ms: u64) -> Result<Option<AudioFrame>> {
+        let rx = {
+            let s = self.sessions.lock().unwrap();
+            let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+            sess.incoming_rx.clone()
+        };
+        Ok(rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)).ok())
+    }
+
     /// Clear buffered audio (send clearAudio to Plivo).
     pub fn clear_buffer(&self, session_id: i32) -> Result<()> {
         let s = self.sessions.lock().unwrap();

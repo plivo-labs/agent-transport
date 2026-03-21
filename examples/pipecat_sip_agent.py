@@ -75,10 +75,9 @@ async def main():
     print("Loopback mode. Press Ctrl+C to hang up.")
     try:
         while True:
-            frame = ep.recv_audio(call_id)
+            frame = ep.recv_audio_blocking(call_id, 20)
             if frame:
                 ep.send_audio(call_id, frame)
-            await asyncio.sleep(0.005)
     except KeyboardInterrupt:
         pass
 

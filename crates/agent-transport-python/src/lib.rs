@@ -441,6 +441,18 @@ impl SipEndpoint {
             .map_err(py_err)
     }
 
+    /// Receive an audio frame, blocking until one is available or timeout.
+    /// Releases the GIL while waiting — safe for high concurrency.
+    /// Use this instead of polling recv_audio() in a loop.
+    #[pyo3(signature = (call_id, timeout_ms=20))]
+    fn recv_audio_blocking(&self, py: Python, call_id: i32, timeout_ms: u64) -> PyResult<Option<AudioFrame>> {
+        let inner = &self.inner;
+        py.allow_threads(|| {
+            inner.recv_audio_blocking(call_id, timeout_ms)
+                .map(|opt| opt.map(AudioFrame::from_rust))
+        }).map_err(py_err)
+    }
+
     /// Number of audio frames queued for sending (outgoing buffer depth).
     /// Multiply by 0.02 to get queued duration in seconds (each frame = 20ms).
     fn queued_frames(&self, call_id: i32) -> PyResult<usize> {

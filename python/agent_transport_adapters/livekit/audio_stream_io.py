@@ -25,10 +25,11 @@ class AudioStreamInput(AudioInput):
 
     async def __anext__(self) -> rtc.AudioFrame:
         while not self._closed:
-            frame = self._ep.recv_audio(self._sid)
+            frame = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self._ep.recv_audio_blocking(self._sid, 20)
+            )
             if frame is not None:
                 return _to_livekit_frame(frame)
-            await asyncio.sleep(0.005)
         raise StopAsyncIteration
 
     def __aiter__(self):

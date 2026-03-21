@@ -1,5 +1,8 @@
 """Pipecat BaseTransport adapter for SIP transport.
 
+Uses recv_audio_blocking() via run_in_executor to avoid Python polling loops.
+This prevents audio jitter at high concurrency.
+
 Usage:
     from agent_transport import SipEndpoint
     from agent_transport_adapters.pipecat import SipTransport
@@ -18,16 +21,8 @@ from typing import Optional
 
 try:
     from pipecat.frames.frames import (
-        CancelFrame,
-        EndFrame,
-        Frame,
-        InputAudioRawFrame,
-        InputDTMFFrame,
-        InterruptionFrame,
-        OutputAudioRawFrame,
-        OutputDTMFFrame,
-        OutputDTMFUrgentFrame,
-        StartFrame,
+        CancelFrame, EndFrame, Frame, InputAudioRawFrame,
+        InputDTMFFrame, OutputAudioRawFrame, StartFrame,
     )
     from pipecat.transports.base_input import BaseInputTransport
     from pipecat.transports.base_output import BaseOutputTransport
@@ -39,7 +34,10 @@ from agent_transport import SipEndpoint, AudioFrame
 
 
 class SipInputTransport(BaseInputTransport):
-    """Receives audio from SIP call and pushes to Pipecat pipeline."""
+    """Receives audio from SIP call and pushes to Pipecat pipeline.
+
+    Uses Rust-side blocking recv (GIL released) instead of Python polling.
+    """
 
     def __init__(self, endpoint: SipEndpoint, call_id: int, **kwargs):
         super().__init__(**kwargs)
@@ -52,48 +50,43 @@ class SipInputTransport(BaseInputTransport):
     async def start(self, frame: StartFrame):
         await super().start(frame)
         self._running = True
-        self._audio_task = asyncio.create_task(self._audio_poll_loop())
-        self._event_task = asyncio.create_task(self._event_poll_loop())
+        self._audio_task = asyncio.create_task(self._audio_recv_loop())
+        self._event_task = asyncio.create_task(self._event_recv_loop())
 
     async def stop(self, frame: EndFrame):
         self._running = False
-        if self._audio_task:
-            self._audio_task.cancel()
-        if self._event_task:
-            self._event_task.cancel()
+        if self._audio_task: self._audio_task.cancel()
+        if self._event_task: self._event_task.cancel()
         await super().stop(frame)
 
     async def cancel(self, frame: CancelFrame):
         self._running = False
-        if self._audio_task:
-            self._audio_task.cancel()
-        if self._event_task:
-            self._event_task.cancel()
+        if self._audio_task: self._audio_task.cancel()
+        if self._event_task: self._event_task.cancel()
         await super().cancel(frame)
 
-    async def _audio_poll_loop(self):
-        """Poll recv_audio and push frames to pipeline."""
+    async def _audio_recv_loop(self):
+        """Receive audio via blocking Rust call in thread pool."""
+        loop = asyncio.get_event_loop()
         while self._running:
-            frame = self._ep.recv_audio(self._cid)
+            # Block in Rust thread, not Python event loop
+            frame = await loop.run_in_executor(
+                None, lambda: self._ep.recv_audio_blocking(self._cid, 20)
+            )
             if frame is not None:
-                # Convert int16 list to bytes
                 pcm_bytes = struct.pack(f"<{len(frame.data)}h", *frame.data)
-                await self.push_audio_frame(
-                    InputAudioRawFrame(
-                        audio=pcm_bytes,
-                        sample_rate=frame.sample_rate,
-                        num_channels=frame.num_channels,
-                    )
-                )
-            else:
-                await asyncio.sleep(0.005)
+                await self.push_audio_frame(InputAudioRawFrame(
+                    audio=pcm_bytes, sample_rate=frame.sample_rate, num_channels=frame.num_channels,
+                ))
 
-    async def _event_poll_loop(self):
-        """Poll events for DTMF and call state."""
+    async def _event_recv_loop(self):
+        """Receive events via blocking Rust call in thread pool."""
+        loop = asyncio.get_event_loop()
         while self._running:
-            event = self._ep.poll_event()
+            event = await loop.run_in_executor(
+                None, lambda: self._ep.wait_for_event(timeout_ms=100)
+            )
             if event is None:
-                await asyncio.sleep(0.02)
                 continue
             if event["type"] == "dtmf_received":
                 await self.push_frame(InputDTMFFrame(digit=event["digit"]))
@@ -111,13 +104,10 @@ class SipOutputTransport(BaseOutputTransport):
         self._cid = call_id
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
-        """Send audio frame to SIP call."""
-        # Convert bytes to int16 list
         n_samples = len(frame.audio) // 2
         data = list(struct.unpack(f"<{n_samples}h", frame.audio))
-        agent_frame = AudioFrame(data, frame.sample_rate, frame.num_channels)
         try:
-            self._ep.send_audio(self._cid, agent_frame)
+            self._ep.send_audio(self._cid, AudioFrame(data, frame.sample_rate, frame.num_channels))
             return True
         except Exception:
             return False
@@ -126,47 +116,25 @@ class SipOutputTransport(BaseOutputTransport):
         return True
 
     async def _write_dtmf_native(self, frame):
-        """Send DTMF via SIP (RFC 4733 or SIP INFO)."""
         digit = str(frame.digit) if hasattr(frame, "digit") else str(frame)
         self._ep.send_dtmf(self._cid, digit)
 
     async def stop(self, frame: EndFrame):
-        """Hang up the SIP call on pipeline end."""
-        try:
-            self._ep.hangup(self._cid)
-        except Exception:
-            pass
+        try: self._ep.hangup(self._cid)
+        except Exception: pass
         await super().stop(frame)
 
     async def cancel(self, frame: CancelFrame):
-        """Hang up on cancel."""
-        try:
-            self._ep.hangup(self._cid)
-        except Exception:
-            pass
+        try: self._ep.hangup(self._cid)
+        except Exception: pass
         await super().cancel(frame)
 
 
 class SipTransport(BaseTransport):
-    """Pipecat transport for SIP calls via agent-transport.
+    """Pipecat transport for SIP calls via agent-transport."""
 
-    Wraps a SipEndpoint and call_id into Pipecat's BaseTransport interface.
-    """
-
-    def __init__(
-        self,
-        endpoint: SipEndpoint,
-        call_id: int,
-        *,
-        name: Optional[str] = None,
-        input_name: Optional[str] = None,
-        output_name: Optional[str] = None,
-    ):
-        super().__init__(
-            name=name or "SipTransport",
-            input_name=input_name,
-            output_name=output_name,
-        )
+    def __init__(self, endpoint: SipEndpoint, call_id: int, *, name: Optional[str] = None, **kwargs):
+        super().__init__(name=name or "SipTransport", **kwargs)
         self._ep = endpoint
         self._cid = call_id
         self._input = None
@@ -174,14 +142,10 @@ class SipTransport(BaseTransport):
 
     def input(self) -> SipInputTransport:
         if self._input is None:
-            self._input = SipInputTransport(
-                self._ep, self._cid, name=f"{self._name}-input"
-            )
+            self._input = SipInputTransport(self._ep, self._cid, name=f"{self._name}-input")
         return self._input
 
     def output(self) -> SipOutputTransport:
         if self._output is None:
-            self._output = SipOutputTransport(
-                self._ep, self._cid, name=f"{self._name}-output"
-            )
+            self._output = SipOutputTransport(self._ep, self._cid, name=f"{self._name}-output")
         return self._output

@@ -50,7 +50,8 @@ def _from_livekit_frame(frame: rtc.AudioFrame) -> AudioFrame:
 class SipAudioInput(AudioInput):
     """Async iterator yielding AudioFrames from a SIP call.
 
-    Polls recv_audio() and yields frames as they arrive.
+    Uses recv_audio_blocking() which releases the GIL while waiting.
+    No Python polling loop — avoids jitter at high concurrency.
     """
 
     def __init__(self, endpoint: SipEndpoint, call_id: int):
@@ -60,10 +61,12 @@ class SipAudioInput(AudioInput):
 
     async def __anext__(self) -> rtc.AudioFrame:
         while not self._closed:
-            frame = self._ep.recv_audio(self._cid)
+            # Block in Rust (GIL released), not Python asyncio.sleep
+            frame = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self._ep.recv_audio_blocking(self._cid, 20)
+            )
             if frame is not None:
                 return _to_livekit_frame(frame)
-            await asyncio.sleep(0.005)  # 5ms poll interval
         raise StopAsyncIteration
 
     def __aiter__(self):

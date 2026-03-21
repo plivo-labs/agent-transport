@@ -1,9 +1,9 @@
 """Pipecat BaseTransport adapter for Plivo audio streaming transport.
 
+Uses recv_audio_blocking() via run_in_executor to avoid Python polling loops.
+
 Usage:
     from agent_transport_adapters.pipecat import AudioStreamTransport
-
-    # AudioStreamEndpoint runs a WebSocket server that Plivo connects to
     transport = AudioStreamTransport(endpoint, session_id)
     pipeline = Pipeline([transport.input(), stt, llm, tts, transport.output()])
 """
@@ -14,8 +14,8 @@ from typing import Optional
 
 try:
     from pipecat.frames.frames import (
-        CancelFrame, EndFrame, Frame, InputAudioRawFrame,
-        InputDTMFFrame, OutputAudioRawFrame, StartFrame,
+        CancelFrame, EndFrame, InputAudioRawFrame, InputDTMFFrame,
+        OutputAudioRawFrame, StartFrame,
     )
     from pipecat.transports.base_input import BaseInputTransport
     from pipecat.transports.base_output import BaseOutputTransport
@@ -27,7 +27,7 @@ from agent_transport import AudioFrame
 
 
 class AudioStreamInputTransport(BaseInputTransport):
-    """Receives audio from Plivo audio stream and pushes to Pipecat pipeline."""
+    """Receives audio from Plivo audio stream via blocking Rust call."""
 
     def __init__(self, endpoint, session_id: int, **kwargs):
         super().__init__(**kwargs)
@@ -39,7 +39,7 @@ class AudioStreamInputTransport(BaseInputTransport):
     async def start(self, frame: StartFrame):
         await super().start(frame)
         self._running = True
-        self._task = asyncio.create_task(self._poll_loop())
+        self._task = asyncio.create_task(self._recv_loop())
 
     async def stop(self, frame: EndFrame):
         self._running = False
@@ -51,25 +51,21 @@ class AudioStreamInputTransport(BaseInputTransport):
         if self._task: self._task.cancel()
         await super().cancel(frame)
 
-    async def _poll_loop(self):
+    async def _recv_loop(self):
+        loop = asyncio.get_event_loop()
         while self._running:
-            frame = self._ep.recv_audio(self._sid)
+            frame = await loop.run_in_executor(
+                None, lambda: self._ep.recv_audio_blocking(self._sid, 20)
+            )
             if frame is not None:
                 pcm_bytes = struct.pack(f"<{len(frame.data)}h", *frame.data)
                 await self.push_audio_frame(InputAudioRawFrame(
                     audio=pcm_bytes, sample_rate=frame.sample_rate, num_channels=frame.num_channels,
                 ))
-            else:
-                await asyncio.sleep(0.005)
-
-            # Check for DTMF events
-            event = self._ep.poll_event() if hasattr(self._ep, 'poll_event') else None
-            if event and event.get("type") == "dtmf_received":
-                await self.push_frame(InputDTMFFrame(digit=event["digit"]))
 
 
 class AudioStreamOutputTransport(BaseOutputTransport):
-    """Sends audio to Plivo audio stream from Pipecat pipeline."""
+    """Sends audio to Plivo audio stream."""
 
     def __init__(self, endpoint, session_id: int, **kwargs):
         super().__init__(**kwargs)
