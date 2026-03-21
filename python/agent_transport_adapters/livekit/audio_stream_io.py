@@ -85,8 +85,6 @@ class AudioStreamOutput(AudioOutput):
         self._playback_finished_event = asyncio.Event()
         self._last_ev: Optional[PlaybackFinishedEvent] = None
         self._flush_task: Optional[asyncio.Task] = None
-        self._paused = False
-
     @property
     def label(self) -> str: return self._label_str
     @property
@@ -104,8 +102,7 @@ class AudioStreamOutput(AudioOutput):
             self.on_playback_started(created_at=time.time())
         if frame.sample_rate > 0:
             self._pushed_duration += frame.samples_per_channel / frame.sample_rate
-        if not self._paused:
-            self._ep.send_audio_bytes(self._sid, bytes(frame.data), frame.sample_rate, frame.num_channels)
+        self._ep.send_audio_bytes(self._sid, bytes(frame.data), frame.sample_rate, frame.num_channels)
 
     def flush(self) -> None:
         try: self._ep.flush(self._sid)
@@ -162,11 +159,11 @@ class AudioStreamOutput(AudioOutput):
         self._pushed_duration = 0.0
 
     def pause(self) -> None:
-        self._paused = True
+        self._ep.pause(self._sid)
         if self._next_in_chain: self._next_in_chain.pause()
 
     def resume(self) -> None:
-        self._paused = False
+        self._ep.resume(self._sid)
         if self._next_in_chain: self._next_in_chain.resume()
 
     def on_attached(self) -> None: pass

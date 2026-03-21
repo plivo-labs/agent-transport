@@ -100,8 +100,6 @@ class SipAudioOutput(AudioOutput):
         self._playback_finished_event = asyncio.Event()
         self._last_ev: Optional[PlaybackFinishedEvent] = None
         self._flush_task: Optional[asyncio.Task] = None
-        self._paused = False
-
     @property
     def label(self) -> str: return self._label_str
     @property
@@ -129,9 +127,7 @@ class SipAudioOutput(AudioOutput):
         if frame.sample_rate > 0:
             self._pushed_duration += frame.samples_per_channel / frame.sample_rate
 
-        # Only send to transport if not paused
-        if not self._paused:
-            self._ep.send_audio_bytes(self._cid, bytes(frame.data), frame.sample_rate, frame.num_channels)
+        self._ep.send_audio_bytes(self._cid, bytes(frame.data), frame.sample_rate, frame.num_channels)
 
     def flush(self) -> None:
         """Non-blocking flush — starts async playout wait (matches LiveKit)."""
@@ -215,15 +211,12 @@ class SipAudioOutput(AudioOutput):
         self._pushed_duration = 0.0
 
     def pause(self) -> None:
-        """Pause — stop forwarding but keep accepting frames (LiveKit behavior)."""
-        self._paused = True
-        # Do NOT call self._ep.pause() — that drains the Rust queue.
-        # We manage pause at the adapter level.
+        """Pause — send loop outputs nothing, frames accumulate in Rust channel."""
+        self._ep.pause(self._cid)
         if self._next_in_chain: self._next_in_chain.pause()
 
     def resume(self) -> None:
-        """Resume forwarding."""
-        self._paused = False
+        self._ep.resume(self._cid)
         if self._next_in_chain: self._next_in_chain.resume()
 
     def on_attached(self) -> None: pass

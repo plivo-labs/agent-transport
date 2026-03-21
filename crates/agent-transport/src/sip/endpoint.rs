@@ -362,10 +362,7 @@ impl SipEndpoint {
     pub fn mute(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| c.muted.store(true, Ordering::Relaxed)) }
     pub fn unmute(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| c.muted.store(false, Ordering::Relaxed)) }
     pub fn pause(&self, call_id: i32) -> Result<()> {
-        self.with_call(call_id, |c| {
-            c.paused.store(true, Ordering::Relaxed);
-            c.flush_flag.store(true, Ordering::Relaxed); // Drain queue (matches LiveKit clear_queue on pause)
-        })
+        self.with_call(call_id, |c| c.paused.store(true, Ordering::Relaxed))
     }
     pub fn resume(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| c.paused.store(false, Ordering::Relaxed)) }
     pub fn flush(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| { if let Ok(mut d) = c.playout_notify.0.lock() { *d = false; } }) }
@@ -380,11 +377,7 @@ impl SipEndpoint {
     }
 
     pub fn send_audio(&self, call_id: i32, frame: &AudioFrame) -> Result<()> {
-        self.with_call(call_id, |c| {
-            // Silently drop frames when paused (matches LiveKit behavior)
-            if c.paused.load(Ordering::Relaxed) { return Ok(()); }
-            c.outgoing_tx.try_send(frame.data.clone()).map_err(|_| EndpointError::Other("buffer full".into()))
-        })?
+        self.with_call(call_id, |c| c.outgoing_tx.try_send(frame.data.clone()).map_err(|_| EndpointError::Other("buffer full".into())))?
     }
 
     pub fn recv_audio(&self, call_id: i32) -> Result<Option<AudioFrame>> {

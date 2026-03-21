@@ -132,11 +132,10 @@ impl AudioStreamEndpoint {
     }
 
     /// Send audio frame — queued and paced by Rust send loop (same as SIP).
-    /// Silently drops frames when paused (matches LiveKit behavior).
+    /// During pause, frames accumulate in the channel (same as LiveKit).
     pub fn send_audio(&self, session_id: i32, frame: &AudioFrame) -> Result<()> {
         let s = self.sessions.lock().unwrap();
         let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
-        if sess.paused.load(Ordering::Relaxed) { return Ok(()); }
         sess.outgoing_tx.try_send(frame.data.clone())
             .map_err(|_| EndpointError::Other("audio buffer full".into()))
     }
@@ -155,12 +154,12 @@ impl AudioStreamEndpoint {
         sess.muted.store(false, Ordering::Relaxed); Ok(())
     }
 
-    /// Pause audio playback — drains queue and drops new frames (matches LiveKit).
+    /// Pause audio playback — send loop outputs nothing, queue preserved.
+    /// Frames accumulate in the channel during pause (same as LiveKit).
     pub fn pause(&self, session_id: i32) -> Result<()> {
         let s = self.sessions.lock().unwrap();
         let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
         sess.paused.store(true, Ordering::Relaxed);
-        sess.flush_flag.store(true, Ordering::Relaxed); // Drain queue
         Ok(())
     }
 
