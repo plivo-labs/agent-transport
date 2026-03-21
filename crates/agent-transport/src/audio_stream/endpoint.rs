@@ -245,7 +245,7 @@ impl AudioStreamEndpoint {
     pub fn hangup(&self, session_id: i32) -> Result<()> {
         let call_id = {
             let sess = self.sessions.lock().unwrap().remove(&session_id);
-            match sess { Some(s) => s.call_id, None => return Ok(()) }
+            match sess { Some(s) => { s.cancel.cancel(); s.call_id }, None => return Ok(()) }
         };
         let (auth_id, auth_token) = (self.config.plivo_auth_id.clone(), self.config.plivo_auth_token.clone());
         if auth_id.is_empty() { return Ok(()); }
@@ -461,7 +461,8 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                     }
                     "stop" => {
                         info!("Session {} stopped", sid);
-                        if sessions.lock().unwrap().remove(&sid).is_some() {
+                        if let Some(sess) = sessions.lock().unwrap().remove(&sid) {
+                            sess.cancel.cancel(); // Stop the send loop task
                             let session = crate::sip::call::CallSession::new(sid, crate::sip::call::CallDirection::Inbound);
                             let _ = etx.try_send(EndpointEvent::CallTerminated { session, reason: "stream stopped".into() });
                         }

@@ -21,7 +21,10 @@ Usage:
 """
 
 import asyncio
+import logging
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 try:
     from pipecat.audio.dtmf.types import KeypadEntry
@@ -76,9 +79,12 @@ class SipInputTransport(BaseInputTransport):
     async def _audio_recv_loop(self):
         loop = asyncio.get_running_loop()
         while self._running:
-            result = await loop.run_in_executor(
-                None, lambda: self._ep.recv_audio_bytes_blocking(self._cid, 20)
-            )
+            try:
+                result = await loop.run_in_executor(
+                    None, lambda: self._ep.recv_audio_bytes_blocking(self._cid, 20)
+                )
+            except Exception:
+                break  # Session removed — exit cleanly
             if result is not None:
                 audio_bytes, sample_rate, num_channels = result
                 await self.push_audio_frame(InputAudioRawFrame(
@@ -88,9 +94,12 @@ class SipInputTransport(BaseInputTransport):
     async def _event_recv_loop(self):
         loop = asyncio.get_running_loop()
         while self._running:
-            event = await loop.run_in_executor(
-                None, lambda: self._ep.wait_for_event(timeout_ms=100)
-            )
+            try:
+                event = await loop.run_in_executor(
+                    None, lambda: self._ep.wait_for_event(timeout_ms=100)
+                )
+            except Exception:
+                break  # Endpoint shut down — exit cleanly
             if event is None:
                 continue
             if event["type"] == "dtmf_received":
@@ -124,7 +133,8 @@ class SipOutputTransport(BaseOutputTransport):
         try:
             self._ep.send_audio_bytes(self._cid, frame.audio, frame.sample_rate, frame.num_channels)
             return True
-        except Exception:
+        except Exception as e:
+            logger.error("write_audio_frame failed: %s", e)
             return False
 
     def _supports_native_dtmf(self) -> bool:
@@ -139,20 +149,20 @@ class SipOutputTransport(BaseOutputTransport):
         """Handle InterruptionFrame → clear_buffer before base class processing."""
         if isinstance(frame, InterruptionFrame):
             try: self._ep.clear_buffer(self._cid)
-            except Exception: pass
+            except Exception as e: logger.debug("clear_buffer on interruption failed: %s", e)
 
         await super().process_frame(frame, direction)
 
     async def stop(self, frame: EndFrame):
         loop = asyncio.get_running_loop()
         try: await loop.run_in_executor(None, lambda: self._ep.hangup(self._cid))
-        except Exception: pass
+        except Exception as e: logger.debug("hangup on stop failed: %s", e)
         await super().stop(frame)
 
     async def cancel(self, frame: CancelFrame):
         loop = asyncio.get_running_loop()
         try: await loop.run_in_executor(None, lambda: self._ep.hangup(self._cid))
-        except Exception: pass
+        except Exception as e: logger.debug("hangup on cancel failed: %s", e)
         await super().cancel(frame)
 
 

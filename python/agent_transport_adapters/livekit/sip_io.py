@@ -71,9 +71,12 @@ class SipAudioInput(AudioInput):
 
         loop = asyncio.get_running_loop()
         while not self._closed:
-            result = await loop.run_in_executor(
-                None, lambda: self._ep.recv_audio_bytes_blocking(self._cid, 20)
-            )
+            try:
+                result = await loop.run_in_executor(
+                    None, lambda: self._ep.recv_audio_bytes_blocking(self._cid, 20)
+                )
+            except Exception:
+                raise StopAsyncIteration  # Session removed — end iterator
             if result is not None:
                 ab, sr, nc = result
                 return _to_livekit_frame(bytes(ab), sr, nc)
@@ -217,6 +220,8 @@ class SipAudioOutput(AudioOutput):
             self.next_in_chain.on_attached()
 
     def on_detached(self) -> None:
+        if self._flush_task and not self._flush_task.done():
+            self._flush_task.cancel()
         if self.next_in_chain:
             self.next_in_chain.on_detached()
 
