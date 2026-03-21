@@ -433,11 +433,27 @@ impl SipEndpoint {
             .map_err(py_err)
     }
 
+    /// Send raw PCM bytes (little-endian int16) directly. No Python list conversion.
+    /// Use this from Pipecat/LiveKit adapters for zero-copy performance.
+    fn send_audio_bytes(&self, call_id: i32, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
+        let frame = RustAudioFrame::from_bytes(audio, sample_rate, num_channels);
+        self.inner.send_audio(call_id, &frame).map_err(py_err)
+    }
+
     /// Receive an audio frame (non-blocking, returns None if no frame ready).
     fn recv_audio(&self, call_id: i32) -> PyResult<Option<AudioFrame>> {
         self.inner
             .recv_audio(call_id)
             .map(|opt| opt.map(AudioFrame::from_rust))
+            .map_err(py_err)
+    }
+
+    /// Receive audio as raw PCM bytes (little-endian int16). No Python list conversion.
+    /// Returns (bytes, sample_rate, num_channels) or None.
+    fn recv_audio_bytes(&self, call_id: i32) -> PyResult<Option<(Vec<u8>, u32, u32)>> {
+        self.inner
+            .recv_audio(call_id)
+            .map(|opt| opt.map(|f| (f.as_bytes(), f.sample_rate, f.num_channels)))
             .map_err(py_err)
     }
 
@@ -450,6 +466,18 @@ impl SipEndpoint {
         py.allow_threads(|| {
             inner.recv_audio_blocking(call_id, timeout_ms)
                 .map(|opt| opt.map(AudioFrame::from_rust))
+        }).map_err(py_err)
+    }
+
+    /// Receive audio as raw bytes, blocking until available. Releases GIL.
+    /// Returns (bytes, sample_rate, num_channels) or None.
+    /// This is the fastest path for Pipecat/LiveKit adapters.
+    #[pyo3(signature = (call_id, timeout_ms=20))]
+    fn recv_audio_bytes_blocking(&self, py: Python, call_id: i32, timeout_ms: u64) -> PyResult<Option<(Vec<u8>, u32, u32)>> {
+        let inner = &self.inner;
+        py.allow_threads(|| {
+            inner.recv_audio_blocking(call_id, timeout_ms)
+                .map(|opt| opt.map(|f| (f.as_bytes(), f.sample_rate, f.num_channels)))
         }).map_err(py_err)
     }
 

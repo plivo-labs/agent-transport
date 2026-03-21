@@ -418,13 +418,34 @@ impl SipEndpoint {
             .map_err(napi_err)
     }
 
+    /// Receive audio as raw PCM bytes (little-endian int16). No JS array conversion.
+    #[napi]
+    pub fn recv_audio_bytes(&self, call_id: i32) -> Result<Option<Vec<u8>>> {
+        self.inner.recv_audio(call_id).map(|opt| opt.map(|f| f.as_bytes())).map_err(napi_err)
+    }
+
+    /// Send raw PCM bytes (little-endian int16) directly.
+    #[napi]
+    pub fn send_audio_bytes(&self, call_id: i32, audio: Vec<u8>, sample_rate: u32, num_channels: u32) -> Result<()> {
+        let frame = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
+        self.inner.send_audio(call_id, &frame).map_err(napi_err)
+    }
+
     /// Receive audio frame, blocking until available or timeout (ms).
-    /// Use instead of polling recv_audio() in a loop.
     #[napi]
     pub fn recv_audio_blocking(&self, call_id: i32, timeout_ms: Option<u32>) -> Result<Option<AudioFrame>> {
         self.inner
             .recv_audio_blocking(call_id, timeout_ms.unwrap_or(20) as u64)
             .map(|opt| opt.map(AudioFrame::from_rust))
+            .map_err(napi_err)
+    }
+
+    /// Receive audio as raw bytes, blocking. Fastest path.
+    #[napi]
+    pub fn recv_audio_bytes_blocking(&self, call_id: i32, timeout_ms: Option<u32>) -> Result<Option<Vec<u8>>> {
+        self.inner
+            .recv_audio_blocking(call_id, timeout_ms.unwrap_or(20) as u64)
+            .map(|opt| opt.map(|f| f.as_bytes()))
             .map_err(napi_err)
     }
 

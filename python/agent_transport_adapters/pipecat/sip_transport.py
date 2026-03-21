@@ -1,7 +1,7 @@
 """Pipecat BaseTransport adapter for SIP transport.
 
-Uses recv_audio_blocking() via run_in_executor to avoid Python polling loops.
-This prevents audio jitter at high concurrency.
+Uses recv_audio_bytes_blocking() and send_audio_bytes() for zero-copy
+PCM transfer between Rust and Python. No struct.pack/unpack overhead.
 
 Usage:
     from agent_transport import SipEndpoint
@@ -16,12 +16,11 @@ Usage:
 """
 
 import asyncio
-import struct
 from typing import Optional
 
 try:
     from pipecat.frames.frames import (
-        CancelFrame, EndFrame, Frame, InputAudioRawFrame,
+        CancelFrame, EndFrame, InputAudioRawFrame,
         InputDTMFFrame, OutputAudioRawFrame, StartFrame,
     )
     from pipecat.transports.base_input import BaseInputTransport
@@ -30,16 +29,11 @@ try:
 except ImportError:
     raise ImportError("pipecat-ai is required: pip install pipecat-ai")
 
-from agent_transport import SipEndpoint, AudioFrame
-
 
 class SipInputTransport(BaseInputTransport):
-    """Receives audio from SIP call and pushes to Pipecat pipeline.
+    """Receives audio from SIP call. Uses Rust blocking recv (GIL released)."""
 
-    Uses Rust-side blocking recv (GIL released) instead of Python polling.
-    """
-
-    def __init__(self, endpoint: SipEndpoint, call_id: int, **kwargs):
+    def __init__(self, endpoint, call_id: int, **kwargs):
         super().__init__(**kwargs)
         self._ep = endpoint
         self._cid = call_id
@@ -66,21 +60,19 @@ class SipInputTransport(BaseInputTransport):
         await super().cancel(frame)
 
     async def _audio_recv_loop(self):
-        """Receive audio via blocking Rust call in thread pool."""
         loop = asyncio.get_event_loop()
         while self._running:
-            # Block in Rust thread, not Python event loop
-            frame = await loop.run_in_executor(
-                None, lambda: self._ep.recv_audio_blocking(self._cid, 20)
+            # Blocks in Rust, GIL released, returns raw PCM bytes
+            result = await loop.run_in_executor(
+                None, lambda: self._ep.recv_audio_bytes_blocking(self._cid, 20)
             )
-            if frame is not None:
-                pcm_bytes = struct.pack(f"<{len(frame.data)}h", *frame.data)
+            if result is not None:
+                audio_bytes, sample_rate, num_channels = result
                 await self.push_audio_frame(InputAudioRawFrame(
-                    audio=pcm_bytes, sample_rate=frame.sample_rate, num_channels=frame.num_channels,
+                    audio=bytes(audio_bytes), sample_rate=sample_rate, num_channels=num_channels,
                 ))
 
     async def _event_recv_loop(self):
-        """Receive events via blocking Rust call in thread pool."""
         loop = asyncio.get_event_loop()
         while self._running:
             event = await loop.run_in_executor(
@@ -96,18 +88,17 @@ class SipInputTransport(BaseInputTransport):
 
 
 class SipOutputTransport(BaseOutputTransport):
-    """Sends audio to SIP call from Pipecat pipeline."""
+    """Sends audio to SIP call. Uses raw bytes API for zero-copy."""
 
-    def __init__(self, endpoint: SipEndpoint, call_id: int, **kwargs):
+    def __init__(self, endpoint, call_id: int, **kwargs):
         super().__init__(**kwargs)
         self._ep = endpoint
         self._cid = call_id
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
-        n_samples = len(frame.audio) // 2
-        data = list(struct.unpack(f"<{n_samples}h", frame.audio))
         try:
-            self._ep.send_audio(self._cid, AudioFrame(data, frame.sample_rate, frame.num_channels))
+            # Send raw PCM bytes directly to Rust — no struct.pack/list conversion
+            self._ep.send_audio_bytes(self._cid, frame.audio, frame.sample_rate, frame.num_channels)
             return True
         except Exception:
             return False
@@ -133,7 +124,7 @@ class SipOutputTransport(BaseOutputTransport):
 class SipTransport(BaseTransport):
     """Pipecat transport for SIP calls via agent-transport."""
 
-    def __init__(self, endpoint: SipEndpoint, call_id: int, *, name: Optional[str] = None, **kwargs):
+    def __init__(self, endpoint, call_id: int, *, name: Optional[str] = None, **kwargs):
         super().__init__(name=name or "SipTransport", **kwargs)
         self._ep = endpoint
         self._cid = call_id

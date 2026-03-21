@@ -1,6 +1,6 @@
-"""Pipecat BaseTransport adapter for Plivo audio streaming transport.
+"""Pipecat BaseTransport adapter for Plivo audio streaming.
 
-Uses recv_audio_blocking() via run_in_executor to avoid Python polling loops.
+Uses raw bytes API for zero-copy PCM transfer.
 
 Usage:
     from agent_transport_adapters.pipecat import AudioStreamTransport
@@ -9,12 +9,11 @@ Usage:
 """
 
 import asyncio
-import struct
 from typing import Optional
 
 try:
     from pipecat.frames.frames import (
-        CancelFrame, EndFrame, InputAudioRawFrame, InputDTMFFrame,
+        CancelFrame, EndFrame, InputAudioRawFrame,
         OutputAudioRawFrame, StartFrame,
     )
     from pipecat.transports.base_input import BaseInputTransport
@@ -23,11 +22,9 @@ try:
 except ImportError:
     raise ImportError("pipecat-ai is required: pip install pipecat-ai")
 
-from agent_transport import AudioFrame
-
 
 class AudioStreamInputTransport(BaseInputTransport):
-    """Receives audio from Plivo audio stream via blocking Rust call."""
+    """Receives audio from Plivo audio stream. Blocking recv in Rust thread."""
 
     def __init__(self, endpoint, session_id: int, **kwargs):
         super().__init__(**kwargs)
@@ -54,18 +51,18 @@ class AudioStreamInputTransport(BaseInputTransport):
     async def _recv_loop(self):
         loop = asyncio.get_event_loop()
         while self._running:
-            frame = await loop.run_in_executor(
-                None, lambda: self._ep.recv_audio_blocking(self._sid, 20)
+            result = await loop.run_in_executor(
+                None, lambda: self._ep.recv_audio_bytes_blocking(self._sid, 20)
             )
-            if frame is not None:
-                pcm_bytes = struct.pack(f"<{len(frame.data)}h", *frame.data)
+            if result is not None:
+                audio_bytes, sample_rate, num_channels = result
                 await self.push_audio_frame(InputAudioRawFrame(
-                    audio=pcm_bytes, sample_rate=frame.sample_rate, num_channels=frame.num_channels,
+                    audio=bytes(audio_bytes), sample_rate=sample_rate, num_channels=num_channels,
                 ))
 
 
 class AudioStreamOutputTransport(BaseOutputTransport):
-    """Sends audio to Plivo audio stream."""
+    """Sends audio to Plivo audio stream. Raw bytes, no conversion."""
 
     def __init__(self, endpoint, session_id: int, **kwargs):
         super().__init__(**kwargs)
@@ -73,10 +70,8 @@ class AudioStreamOutputTransport(BaseOutputTransport):
         self._sid = session_id
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
-        n_samples = len(frame.audio) // 2
-        data = list(struct.unpack(f"<{n_samples}h", frame.audio))
         try:
-            self._ep.send_audio(self._sid, AudioFrame(data, frame.sample_rate, frame.num_channels))
+            self._ep.send_audio_bytes(self._sid, frame.audio, frame.sample_rate, frame.num_channels)
             return True
         except Exception:
             return False
@@ -93,7 +88,7 @@ class AudioStreamOutputTransport(BaseOutputTransport):
 
 
 class AudioStreamTransport(BaseTransport):
-    """Pipecat transport for Plivo audio streaming via agent-transport."""
+    """Pipecat transport for Plivo audio streaming."""
 
     def __init__(self, endpoint, session_id: int, *, name: Optional[str] = None, **kwargs):
         super().__init__(name=name or "AudioStreamTransport", **kwargs)

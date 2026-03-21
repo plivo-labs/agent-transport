@@ -1,5 +1,8 @@
 """LiveKit Agents AudioInput/AudioOutput adapters for SIP transport.
 
+Uses recv_audio_bytes_blocking() for zero-copy PCM in the input path.
+Uses send_audio_bytes() for zero-copy PCM in the output path.
+
 Usage:
     from agent_transport import SipEndpoint
     from agent_transport_adapters.livekit import SipAudioInput, SipAudioOutput
@@ -8,7 +11,6 @@ Usage:
     ep.register(username, password)
     call_id = ep.call(dest_uri)
 
-    # Connect to LiveKit agent session
     session.input.audio = SipAudioInput(ep, call_id)
     session.output.audio = SipAudioOutput(ep, call_id)
 """
@@ -22,51 +24,39 @@ try:
 except ImportError:
     raise ImportError("livekit-agents is required: pip install livekit-agents")
 
-from agent_transport import SipEndpoint, AudioFrame
 
-
-def _to_livekit_frame(frame: AudioFrame) -> rtc.AudioFrame:
-    """Convert agent-transport AudioFrame to LiveKit AudioFrame."""
-    pcm_bytes = bytes(
-        b for s in frame.data for b in s.to_bytes(2, byteorder="little", signed=True)
-    )
+def _to_livekit_frame(audio_bytes: bytes, sample_rate: int, num_channels: int) -> rtc.AudioFrame:
+    """Convert raw PCM bytes to LiveKit AudioFrame."""
+    samples_per_channel = len(audio_bytes) // (2 * num_channels)
     return rtc.AudioFrame(
-        data=pcm_bytes,
-        sample_rate=frame.sample_rate,
-        num_channels=frame.num_channels,
-        samples_per_channel=frame.samples_per_channel,
+        data=audio_bytes,
+        sample_rate=sample_rate,
+        num_channels=num_channels,
+        samples_per_channel=samples_per_channel,
     )
-
-
-def _from_livekit_frame(frame: rtc.AudioFrame) -> AudioFrame:
-    """Convert LiveKit AudioFrame to agent-transport AudioFrame."""
-    data = list(
-        int.from_bytes(frame.data[i : i + 2], byteorder="little", signed=True)
-        for i in range(0, len(frame.data), 2)
-    )
-    return AudioFrame(data, frame.sample_rate, frame.num_channels)
 
 
 class SipAudioInput(AudioInput):
     """Async iterator yielding AudioFrames from a SIP call.
 
-    Uses recv_audio_blocking() which releases the GIL while waiting.
-    No Python polling loop — avoids jitter at high concurrency.
+    Uses recv_audio_bytes_blocking() — blocks in Rust thread, GIL released.
+    No Python polling loop, no asyncio.sleep jitter.
     """
 
-    def __init__(self, endpoint: SipEndpoint, call_id: int):
+    def __init__(self, endpoint, call_id: int):
         self._ep = endpoint
         self._cid = call_id
         self._closed = False
 
     async def __anext__(self) -> rtc.AudioFrame:
+        loop = asyncio.get_event_loop()
         while not self._closed:
-            # Block in Rust (GIL released), not Python asyncio.sleep
-            frame = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: self._ep.recv_audio_blocking(self._cid, 20)
+            result = await loop.run_in_executor(
+                None, lambda: self._ep.recv_audio_bytes_blocking(self._cid, 20)
             )
-            if frame is not None:
-                return _to_livekit_frame(frame)
+            if result is not None:
+                audio_bytes, sample_rate, num_channels = result
+                return _to_livekit_frame(bytes(audio_bytes), sample_rate, num_channels)
         raise StopAsyncIteration
 
     def __aiter__(self):
@@ -80,17 +70,12 @@ class SipAudioInput(AudioInput):
 
 
 class SipAudioOutput(AudioOutput):
-    """Sends AudioFrames to a SIP call.
+    """Sends AudioFrames to a SIP call. Uses raw bytes API."""
 
-    Implements LiveKit's AudioOutput interface with flush, clear_buffer,
-    pause, and resume mapped to the SIP transport.
-    """
-
-    def __init__(self, endpoint: SipEndpoint, call_id: int):
+    def __init__(self, endpoint, call_id: int):
         super().__init__()
         self._ep = endpoint
         self._cid = call_id
-        self._pushed_duration = 0.0
 
     @property
     def sample_rate(self) -> Optional[int]:
@@ -101,16 +86,14 @@ class SipAudioOutput(AudioOutput):
         return True
 
     async def capture_frame(self, frame: rtc.AudioFrame) -> None:
-        agent_frame = _from_livekit_frame(frame)
-        self._ep.send_audio(self._cid, agent_frame)
-        self._pushed_duration += frame.samples_per_channel / frame.sample_rate
+        # Send raw PCM bytes directly — no Python int16 list conversion
+        self._ep.send_audio_bytes(self._cid, bytes(frame.data), frame.sample_rate, frame.num_channels)
 
     def flush(self) -> None:
         self._ep.flush(self._cid)
 
     def clear_buffer(self) -> None:
         self._ep.clear_buffer(self._cid)
-        self._pushed_duration = 0.0
 
     def pause(self) -> None:
         self._ep.pause(self._cid)
