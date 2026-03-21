@@ -10,8 +10,11 @@ We only implement transport-specific logic: sending audio to Rust SIP endpoint.
 """
 
 import asyncio
+import logging
 import time
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 try:
     from livekit import rtc
@@ -47,6 +50,10 @@ class SipAudioInput(AudioInput):
     """Async iterator yielding AudioFrames from a SIP call."""
 
     def __init__(self, endpoint, call_id: int, *, label: str = "sip-audio-input", source=None, **kwargs):
+        try:
+            super().__init__(label=label, source=source)
+        except TypeError:
+            pass
         self._ep = endpoint
         self._cid = call_id
         self._label = label
@@ -59,7 +66,6 @@ class SipAudioInput(AudioInput):
     def source(self): return self._source
 
     async def __anext__(self) -> rtc.AudioFrame:
-        # Delegate to source if set (matches base class __anext__)
         if self._source:
             return await self._source.__anext__()
 
@@ -74,9 +80,16 @@ class SipAudioInput(AudioInput):
         raise StopAsyncIteration
 
     def __aiter__(self): return self
-    def on_attached(self) -> None: pass
-    def on_detached(self) -> None: self._closed = True
-    def __repr__(self) -> str: return f"SipAudioInput(label={self._label!r})"
+
+    def on_attached(self) -> None:
+        if self._source: self._source.on_attached()
+
+    def on_detached(self) -> None:
+        self._closed = True
+        if self._source: self._source.on_detached()
+
+    def __repr__(self) -> str:
+        return f"SipAudioInput(label={self._label!r}, source={self._source!r})"
 
 
 class SipAudioOutput(AudioOutput):
@@ -102,6 +115,7 @@ class SipAudioOutput(AudioOutput):
 
         self._ep = endpoint
         self._cid = call_id
+        self._label_str = label
         self._pushed_duration = 0.0
         self._interrupted_event = asyncio.Event()
         self._flush_task: Optional[asyncio.Task] = None
@@ -115,8 +129,9 @@ class SipAudioOutput(AudioOutput):
         # Base class tracks __capturing and __playback_segments_count
         await super().capture_frame(frame)
 
-        # Wait for in-progress flush (matches LiveKit)
+        # Wait for in-progress flush (matches LiveKit: logs error + awaits)
         if self._flush_task and not self._flush_task.done():
+            logger.error("capture_frame called while flush is in progress")
             await self._flush_task
 
         # Send to SIP transport
@@ -139,6 +154,7 @@ class SipAudioOutput(AudioOutput):
             return
 
         if self._flush_task and not self._flush_task.done():
+            logger.error("flush called while playback is in progress")
             self._flush_task.cancel()
         self._flush_task = asyncio.ensure_future(self._async_wait_for_playout())
 
@@ -194,4 +210,4 @@ class SipAudioOutput(AudioOutput):
 
     def on_attached(self) -> None: pass
     def on_detached(self) -> None: pass
-    def __repr__(self) -> str: return f"SipAudioOutput(label={self._ep!r})"
+    def __repr__(self) -> str: return f"SipAudioOutput(label={self._label_str!r})"

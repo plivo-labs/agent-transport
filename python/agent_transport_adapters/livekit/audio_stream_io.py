@@ -1,15 +1,14 @@
 """LiveKit Agents AudioInput/AudioOutput adapters for Plivo audio streaming.
 
 Uses LiveKit base class implementations for:
-- Segment counting (capture_frame increments, flush resets)
-- wait_for_playout (base class asyncio.Event)
+- Segment counting (__playback_segments_count via super().capture_frame)
+- wait_for_playout (base class asyncio.Event + __playback_finished_count)
 - on_playback_started / on_playback_finished (base class EventEmitter)
 - pause/resume chain propagation (base class next_in_chain)
-
-We only implement transport-specific logic: sending audio to Rust endpoint.
 """
 
 import asyncio
+import logging
 import time
 from typing import Optional
 
@@ -36,9 +35,16 @@ except ImportError:
 
 from .sip_io import _to_livekit_frame
 
+logger = logging.getLogger(__name__)
+
 
 class AudioStreamInput(AudioInput):
     def __init__(self, endpoint, session_id: int, *, label: str = "audio-stream-input", source=None, **kwargs):
+        # Call base class __init__ to set __label and __source
+        try:
+            super().__init__(label=label, source=source)
+        except TypeError:
+            pass  # Fallback for versions without these params
         self._ep = endpoint
         self._sid = session_id
         self._label = label
@@ -51,7 +57,7 @@ class AudioStreamInput(AudioInput):
     def source(self): return self._source
 
     async def __anext__(self) -> rtc.AudioFrame:
-        # Delegate to source if set (matches base class behavior)
+        # Delegate to source if set (matches base class)
         if self._source:
             return await self._source.__anext__()
 
@@ -66,9 +72,20 @@ class AudioStreamInput(AudioInput):
         raise StopAsyncIteration
 
     def __aiter__(self): return self
-    def on_attached(self) -> None: pass
-    def on_detached(self) -> None: self._closed = True
-    def __repr__(self) -> str: return f"AudioStreamInput(label={self._label!r})"
+
+    def on_attached(self) -> None:
+        # Propagate to source (matches base class)
+        if self._source:
+            self._source.on_attached()
+
+    def on_detached(self) -> None:
+        self._closed = True
+        # Propagate to source (matches base class)
+        if self._source:
+            self._source.on_detached()
+
+    def __repr__(self) -> str:
+        return f"AudioStreamInput(label={self._label!r}, source={self._source!r})"
 
 
 class AudioStreamOutput(AudioOutput):
@@ -81,7 +98,6 @@ class AudioStreamOutput(AudioOutput):
     def __init__(self, endpoint, session_id: int, *, label: str = "audio-stream-output",
                  capabilities=None, sample_rate: Optional[int] = None,
                  next_in_chain=None, **kwargs):
-        # Default capabilities if not provided (matches LiveKit's AudioOutputCapabilities(pause=True))
         if capabilities is None:
             capabilities = AudioOutputCapabilities(pause=True)
 
@@ -95,6 +111,7 @@ class AudioStreamOutput(AudioOutput):
 
         self._ep = endpoint
         self._sid = session_id
+        self._label_str = label
         self._pushed_duration = 0.0
         self._interrupted_event = asyncio.Event()
         self._flush_task: Optional[asyncio.Task] = None
@@ -105,30 +122,31 @@ class AudioStreamOutput(AudioOutput):
         return self._ep.sample_rate
 
     async def capture_frame(self, frame: rtc.AudioFrame) -> None:
-        # Let base class track __capturing and __playback_segments_count
+        # Base class tracks __capturing and __playback_segments_count
         await super().capture_frame(frame)
 
-        # Check if flush is in progress — wait for it (matches LiveKit)
+        # Wait for in-progress flush (matches LiveKit: logs error + awaits)
         if self._flush_task and not self._flush_task.done():
+            logger.error("capture_frame called while flush is in progress")
             await self._flush_task
 
-        # Send to transport
+        # Send to Rust transport
         self._ep.send_audio_bytes(self._sid, bytes(frame.data), frame.sample_rate, frame.num_channels)
 
-        # Track duration
+        # Track duration for playback position calculation
         if frame.sample_rate > 0:
             self._pushed_duration += frame.samples_per_channel / frame.sample_rate
 
-        # Emit playback_started AFTER frame sent (matches LiveKit _forward_audio timing)
+        # Emit playback_started AFTER frame sent (matches LiveKit _forward_audio)
         if not self._first_frame_sent:
             self._first_frame_sent = True
             self.on_playback_started(created_at=time.time())
 
     def flush(self) -> None:
-        # Let base class set __capturing = False
+        # Base class sets __capturing = False
         super().flush()
 
-        # Send checkpoint to Plivo for real playout tracking
+        # Send checkpoint to Plivo
         try: self._ep.flush(self._sid)
         except Exception: pass
 
@@ -136,6 +154,7 @@ class AudioStreamOutput(AudioOutput):
             return
 
         if self._flush_task and not self._flush_task.done():
+            logger.error("flush called while playback is in progress")
             self._flush_task.cancel()
         self._flush_task = asyncio.ensure_future(self._async_wait_for_playout())
 
@@ -164,12 +183,12 @@ class AudioStreamOutput(AudioOutput):
         else:
             wait_interrupt.cancel()
 
-        # Reset state for next segment
+        # Reset state for next segment (matches LiveKit cleanup)
         self._pushed_duration = 0.0
         self._interrupted_event.clear()
         self._first_frame_sent = False
 
-        # Let base class handle counting, event emission, and __playback_finished_event
+        # Base class handles counting, event, __playback_finished_event
         self.on_playback_finished(
             playback_position=pushed,
             interrupted=interrupted,
@@ -182,17 +201,16 @@ class AudioStreamOutput(AudioOutput):
         )
 
     def pause(self) -> None:
-        # Base class propagates to next_in_chain
-        super().pause()
+        super().pause()  # Base class propagates to next_in_chain
         self._ep.pause(self._sid)
 
     def resume(self) -> None:
-        # Base class propagates to next_in_chain
-        super().resume()
+        super().resume()  # Base class propagates to next_in_chain
         self._ep.resume(self._sid)
-        # Reset first-frame tracking for next segment (matches LiveKit clear _first_frame_event)
-        self._first_frame_sent = False
+        self._first_frame_sent = False  # Reset for next segment
 
     def on_attached(self) -> None: pass
     def on_detached(self) -> None: pass
-    def __repr__(self) -> str: return f"AudioStreamOutput(label={self._ep!r})"
+
+    def __repr__(self) -> str:
+        return f"AudioStreamOutput(label={self._label_str!r})"
