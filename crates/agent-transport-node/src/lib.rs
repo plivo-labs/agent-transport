@@ -15,6 +15,8 @@ use agent_transport_core::{
     CallSession as RustCallSession, Codec as RustCodec,
     EndpointConfig as RustEndpointConfig, EndpointEvent, SipEndpoint as RustSipEndpoint,
 };
+use agent_transport_core::audio_stream::config::AudioStreamConfig as RustAudioStreamConfig;
+use agent_transport_core::audio_stream::endpoint::AudioStreamEndpoint as RustAudioStreamEndpoint;
 
 fn napi_err(e: impl std::fmt::Display) -> napi::Error {
     Error::from_reason(e.to_string())
@@ -595,4 +597,86 @@ impl SipEndpoint {
             }
         });
     }
+}
+
+// ─── AudioStreamEndpoint (Plivo WebSocket audio streaming) ───────────────────
+
+#[napi(object)]
+pub struct AudioStreamConfigJs {
+    pub listen_addr: Option<String>,
+    pub plivo_auth_id: Option<String>,
+    pub plivo_auth_token: Option<String>,
+    pub sample_rate: Option<u32>,
+    pub auto_hangup: Option<bool>,
+}
+
+#[napi]
+pub struct AudioStreamEndpoint {
+    inner: RustAudioStreamEndpoint,
+}
+
+#[napi]
+impl AudioStreamEndpoint {
+    #[napi(constructor)]
+    pub fn new(config: Option<AudioStreamConfigJs>) -> Result<Self> {
+        let cfg = config.unwrap_or(AudioStreamConfigJs { listen_addr: None, plivo_auth_id: None, plivo_auth_token: None, sample_rate: None, auto_hangup: None });
+        let rc = RustAudioStreamConfig {
+            listen_addr: cfg.listen_addr.unwrap_or_else(|| "0.0.0.0:8080".into()),
+            plivo_auth_id: cfg.plivo_auth_id.unwrap_or_default(),
+            plivo_auth_token: cfg.plivo_auth_token.unwrap_or_default(),
+            sample_rate: cfg.sample_rate.unwrap_or(16000),
+            auto_hangup: cfg.auto_hangup.unwrap_or(true),
+        };
+        Ok(Self { inner: RustAudioStreamEndpoint::new(rc).map_err(napi_err)? })
+    }
+
+    #[napi]
+    pub fn send_audio(&self, session_id: i32, frame: AudioFrame) -> Result<()> {
+        self.inner.send_audio(session_id, &frame.to_rust()).map_err(napi_err)
+    }
+
+    #[napi]
+    pub fn send_audio_bytes(&self, session_id: i32, audio: Vec<u8>, sample_rate: u32, num_channels: u32) -> Result<()> {
+        let f = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
+        self.inner.send_audio(session_id, &f).map_err(napi_err)
+    }
+
+    #[napi]
+    pub fn recv_audio(&self, session_id: i32) -> Result<Option<AudioFrame>> {
+        self.inner.recv_audio(session_id).map(|o| o.map(AudioFrame::from_rust)).map_err(napi_err)
+    }
+
+    #[napi]
+    pub fn recv_audio_bytes(&self, session_id: i32) -> Result<Option<Vec<u8>>> {
+        self.inner.recv_audio(session_id).map(|o| o.map(|f| f.as_bytes())).map_err(napi_err)
+    }
+
+    #[napi]
+    pub fn recv_audio_blocking(&self, session_id: i32, timeout_ms: Option<u32>) -> Result<Option<AudioFrame>> {
+        self.inner.recv_audio_blocking(session_id, timeout_ms.unwrap_or(20) as u64).map(|o| o.map(AudioFrame::from_rust)).map_err(napi_err)
+    }
+
+    #[napi]
+    pub fn clear_buffer(&self, session_id: i32) -> Result<()> {
+        self.inner.clear_buffer(session_id).map_err(napi_err)
+    }
+
+    #[napi]
+    pub fn hangup(&self, session_id: i32) -> Result<()> {
+        self.inner.hangup(session_id).map_err(napi_err)
+    }
+
+    #[napi]
+    pub fn poll_event(&self) -> Result<Option<EventInfo>> {
+        match self.inner.events().try_recv() {
+            Ok(event) => Ok(Some(event_to_info(&event))),
+            Err(_) => Ok(None),
+        }
+    }
+
+    #[napi(getter)]
+    pub fn sample_rate(&self) -> u32 { self.inner.sample_rate() }
+
+    #[napi]
+    pub fn shutdown(&self) -> Result<()> { self.inner.shutdown().map_err(napi_err) }
 }

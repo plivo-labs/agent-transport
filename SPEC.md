@@ -1,14 +1,20 @@
 # Agent Transport Specification
 
+> **Note:** This spec was originally written for the pjsua (C FFI) backend.
+> The main branch now uses a pure Rust backend (rsipstack + rtp crate).
+> See CLAUDE.md for current architecture. Core concepts and APIs remain the same.
+
 ## Overview
 
-A Rust library providing a SIP user agent that can register with Plivo, make/receive calls,
-send/receive audio frames, send DTMF, and perform call transfers (SIP REFER). Exposes
-bindings to both Python (PyO3) and TypeScript/Node.js (napi-rs).
+A pure Rust multi-transport library for AI voice agents. Supports:
+- **SIP transport**: Direct SIP calling via rsipstack + RTP
+- **Audio streaming transport**: Plivo WebSocket audio streaming
 
-The audio frame interface is designed to be compatible with LiveKit Agents' `AudioFrame`
-format (int16 PCM, 48kHz), enabling drop-in replacement of LiveKit's WebRTC transport
-with direct Plivo SIP connectivity.
+Exposes bindings to Python (PyO3) and TypeScript/Node.js (napi-rs), with
+adapters for LiveKit Agents and Pipecat frameworks.
+
+Audio frame format: int16 PCM, 16kHz mono — compatible with both LiveKit
+(configurable, Deepgram STT defaults to 16kHz) and Pipecat (16kHz default).
 
 ## Architecture
 

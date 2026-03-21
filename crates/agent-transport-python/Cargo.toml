@@ -3,13 +3,13 @@ name = "agent-transport-python"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Python bindings for agent-transport (SIP UA)"
+description = "Python bindings for agent-transport (SIP + audio streaming)"
 
 [lib]
 name = "agent_transport"
 crate-type = ["cdylib"]
 
 [dependencies]
-agent_transport_core = { path = "../agent-transport", package = "agent-transport" }
+agent_transport_core = { path = "../agent-transport", package = "agent-transport", features = ["audio-stream"] }
 crossbeam-channel.workspace = true
 pyo3 = { version = "0.23", features = ["extension-module"] }

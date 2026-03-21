@@ -9,7 +9,7 @@ description = "Node.js bindings for agent-transport (SIP UA)"
 crate-type = ["cdylib"]
 
 [dependencies]
-agent_transport_core = { path = "../agent-transport", package = "agent-transport" }
+agent_transport_core = { path = "../agent-transport", package = "agent-transport", features = ["audio-stream"] }
 crossbeam-channel.workspace = true
 napi = { version = "2", features = ["default", "napi9"] }
 napi-derive = "2"

@@ -12,6 +12,8 @@ use agent_transport_core::{
     CallSession as RustCallSession, Codec as RustCodec,
     EndpointConfig as RustEndpointConfig, EndpointEvent, SipEndpoint as RustSipEndpoint,
 };
+use agent_transport_core::audio_stream::config::AudioStreamConfig as RustAudioStreamConfig;
+use agent_transport_core::audio_stream::endpoint::AudioStreamEndpoint as RustAudioStreamEndpoint;
 
 fn py_err(e: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
@@ -644,9 +646,90 @@ impl SipEndpoint {
     }
 }
 
+/// Plivo WebSocket audio streaming endpoint.
+#[pyclass]
+struct AudioStreamEndpoint {
+    inner: RustAudioStreamEndpoint,
+}
+
+#[pymethods]
+impl AudioStreamEndpoint {
+    #[new]
+    #[pyo3(signature = (listen_addr="0.0.0.0:8080", plivo_auth_id="", plivo_auth_token="", sample_rate=16000, auto_hangup=true))]
+    fn new(listen_addr: &str, plivo_auth_id: &str, plivo_auth_token: &str, sample_rate: u32, auto_hangup: bool) -> PyResult<Self> {
+        let config = RustAudioStreamConfig {
+            listen_addr: listen_addr.into(), plivo_auth_id: plivo_auth_id.into(),
+            plivo_auth_token: plivo_auth_token.into(), sample_rate, auto_hangup,
+        };
+        let inner = RustAudioStreamEndpoint::new(config).map_err(py_err)?;
+        Ok(Self { inner })
+    }
+
+    fn send_audio(&self, session_id: i32, frame: &AudioFrame) -> PyResult<()> {
+        self.inner.send_audio(session_id, &frame.to_rust()).map_err(py_err)
+    }
+
+    fn send_audio_bytes(&self, session_id: i32, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
+        let frame = RustAudioFrame::from_bytes(audio, sample_rate, num_channels);
+        self.inner.send_audio(session_id, &frame).map_err(py_err)
+    }
+
+    fn recv_audio(&self, session_id: i32) -> PyResult<Option<AudioFrame>> {
+        self.inner.recv_audio(session_id).map(|opt| opt.map(AudioFrame::from_rust)).map_err(py_err)
+    }
+
+    fn recv_audio_bytes(&self, session_id: i32) -> PyResult<Option<(Vec<u8>, u32, u32)>> {
+        self.inner.recv_audio(session_id).map(|opt| opt.map(|f| (f.as_bytes(), f.sample_rate, f.num_channels))).map_err(py_err)
+    }
+
+    #[pyo3(signature = (session_id, timeout_ms=20))]
+    fn recv_audio_blocking(&self, py: Python, session_id: i32, timeout_ms: u64) -> PyResult<Option<AudioFrame>> {
+        let inner = &self.inner;
+        py.allow_threads(|| inner.recv_audio_blocking(session_id, timeout_ms).map(|opt| opt.map(AudioFrame::from_rust))).map_err(py_err)
+    }
+
+    #[pyo3(signature = (session_id, timeout_ms=20))]
+    fn recv_audio_bytes_blocking(&self, py: Python, session_id: i32, timeout_ms: u64) -> PyResult<Option<(Vec<u8>, u32, u32)>> {
+        let inner = &self.inner;
+        py.allow_threads(|| inner.recv_audio_blocking(session_id, timeout_ms).map(|opt| opt.map(|f| (f.as_bytes(), f.sample_rate, f.num_channels)))).map_err(py_err)
+    }
+
+    fn clear_buffer(&self, session_id: i32) -> PyResult<()> {
+        self.inner.clear_buffer(session_id).map_err(py_err)
+    }
+
+    fn hangup(&self, session_id: i32) -> PyResult<()> {
+        self.inner.hangup(session_id).map_err(py_err)
+    }
+
+    fn poll_event(&self, py: Python) -> PyResult<Option<PyObject>> {
+        match self.inner.events().try_recv() {
+            Ok(event) => { let dict = event_to_dict(py, &event)?; Ok(Some(dict.into())) }
+            Err(_) => Ok(None),
+        }
+    }
+
+    #[pyo3(signature = (timeout_ms=0))]
+    fn wait_for_event(&self, py: Python, timeout_ms: u64) -> PyResult<Option<PyObject>> {
+        let rx = self.inner.events();
+        let result = if timeout_ms == 0 { py.allow_threads(|| rx.recv().ok()) }
+        else { py.allow_threads(|| rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)).ok()) };
+        match result {
+            Some(event) => { let dict = event_to_dict(py, &event)?; Ok(Some(dict.into())) }
+            None => Ok(None),
+        }
+    }
+
+    #[getter]
+    fn sample_rate(&self) -> u32 { self.inner.sample_rate() }
+
+    fn shutdown(&self) -> PyResult<()> { self.inner.shutdown().map_err(py_err) }
+}
+
 #[pymodule]
 fn agent_transport(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SipEndpoint>()?;
+    m.add_class::<AudioStreamEndpoint>()?;
     m.add_class::<AudioFrame>()?;
     m.add_class::<CallSession>()?;
     Ok(())
