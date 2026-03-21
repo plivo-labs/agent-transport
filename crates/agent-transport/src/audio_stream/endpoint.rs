@@ -267,6 +267,20 @@ impl AudioStreamEndpoint {
         sess.ws_tx.send(Message::Text(message.to_string())).map_err(|_| EndpointError::Other("WS send failed".into()))
     }
 
+    /// Get the incoming audio receiver for async operations (used by Node.js async tasks).
+    pub fn incoming_rx(&self, session_id: i32) -> Result<Receiver<AudioFrame>> {
+        let s = self.sessions.lock().unwrap();
+        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        Ok(sess.incoming_rx.clone())
+    }
+
+    /// Get the checkpoint notify handle for async operations (used by Node.js async tasks).
+    pub fn checkpoint_notify(&self, session_id: i32) -> Result<Arc<(Mutex<Option<String>>, Condvar)>> {
+        let s = self.sessions.lock().unwrap();
+        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        Ok(sess.checkpoint_notify.clone())
+    }
+
     pub fn queued_frames(&self, session_id: i32) -> Result<usize> {
         let s = self.sessions.lock().unwrap();
         let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;

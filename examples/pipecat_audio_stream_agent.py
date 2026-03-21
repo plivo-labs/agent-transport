@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Example: Pipecat Agent with Plivo audio streaming transport.
+"""Pipecat agent with Plivo audio streaming transport.
 
-Starts a WebSocket server that Plivo connects to for audio streaming.
-No SIP registration needed — Plivo initiates the call and streams audio.
+Starts a WebSocket server that Plivo connects to for bidirectional audio.
+No SIP registration needed — Plivo initiates the connection.
 
 Prerequisites:
     cd crates/agent-transport-python && maturin develop --features audio-stream
-    pip install agent-transport-adapters[pipecat]
+    cd python && pip install -e ".[pipecat]"
 
 Setup:
-    1. Configure Plivo to send audio stream to ws://your-server:8080/ws
-    2. Set Plivo XML response with <Stream bidirectional="true"> pointing here
+    1. Configure Plivo XML with: <Stream bidirectional="true" url="ws://your-server:8080" />
+    2. Set PLIVO_AUTH_ID and PLIVO_AUTH_TOKEN env vars
 
 Usage:
     PLIVO_AUTH_ID=xxx PLIVO_AUTH_TOKEN=yyy python examples/pipecat_audio_stream_agent.py
@@ -19,39 +19,70 @@ Usage:
 import asyncio
 import os
 
-# Note: AudioStreamEndpoint would need to be exposed in the Python binding
-# This example shows the intended usage pattern
+from agent_transport import AudioStreamEndpoint
+from agent_transport_adapters.pipecat import AudioStreamTransport
 
-print("""
-Plivo Audio Streaming + Pipecat Example
-========================================
+# Uncomment with pipecat-ai installed:
+# from pipecat.pipeline.pipeline import Pipeline
+# from pipecat.pipeline.runner import PipelineRunner
+# from pipecat.services.deepgram import DeepgramSTTService
+# from pipecat.services.openai import OpenAILLMService
+# from pipecat.services.elevenlabs import ElevenLabsTTSService
 
-This example demonstrates the intended usage:
 
-1. AudioStreamEndpoint starts a WebSocket server on port 8080
-2. Configure Plivo to stream audio to ws://your-server:8080
-3. When Plivo connects, a session is created
-4. Audio flows through the Pipecat pipeline:
-   Plivo -> WebSocket -> AudioStreamInput -> STT -> LLM -> TTS -> AudioStreamOutput -> WebSocket -> Plivo
-
-Usage pattern:
-
-    from agent_transport import AudioStreamEndpoint, AudioStreamConfig
-    from agent_transport_adapters.pipecat import AudioStreamTransport
-
-    config = AudioStreamConfig(
+async def main():
+    ep = AudioStreamEndpoint(
         listen_addr="0.0.0.0:8080",
-        plivo_auth_id=os.environ["PLIVO_AUTH_ID"],
-        plivo_auth_token=os.environ["PLIVO_AUTH_TOKEN"],
+        plivo_auth_id=os.environ.get("PLIVO_AUTH_ID", ""),
+        plivo_auth_token=os.environ.get("PLIVO_AUTH_TOKEN", ""),
     )
-    ep = AudioStreamEndpoint(config)
+    print("WebSocket server listening on 0.0.0.0:8080")
+    print("Configure Plivo to stream audio here. Waiting for connection...")
 
     # Wait for Plivo to connect
-    event = ep.wait_for_event(timeout_ms=30000)
-    session_id = event["session"].call_id
+    loop = asyncio.get_running_loop()
+    event = await loop.run_in_executor(None, lambda: ep.wait_for_event(timeout_ms=60000))
+    if not event or event["type"] != "incoming_call":
+        print(f"No connection: {event}")
+        return
 
-    # Create Pipecat transport
+    session_id = event["session"]["call_id"]
+    print(f"Plivo connected — session {session_id}")
+
+    # Wait for media active
+    event = await loop.run_in_executor(None, lambda: ep.wait_for_event(timeout_ms=5000))
+
+    # Create transport
     transport = AudioStreamTransport(ep, session_id)
-    pipeline = Pipeline([transport.input(), stt, llm, tts, transport.output()])
-    await runner.run(pipeline)
-""")
+
+    # Build pipeline:
+    # pipeline = Pipeline([
+    #     transport.input(),
+    #     DeepgramSTTService(api_key=os.environ["DEEPGRAM_API_KEY"]),
+    #     OpenAILLMService(api_key=os.environ["OPENAI_API_KEY"]),
+    #     ElevenLabsTTSService(api_key=os.environ["ELEVENLABS_API_KEY"]),
+    #     transport.output(),
+    # ])
+    # runner = PipelineRunner()
+    # await runner.run(pipeline)
+
+    # Loopback until disconnect
+    print("Loopback mode — echoing audio. Ctrl+C to stop.")
+    try:
+        while True:
+            result = await loop.run_in_executor(
+                None, lambda: ep.recv_audio_bytes_blocking(session_id, 20)
+            )
+            if result is not None:
+                audio, sr, nc = result
+                ep.send_audio_bytes(session_id, audio, sr, nc)
+    except KeyboardInterrupt:
+        pass
+
+    ep.hangup(session_id)
+    ep.shutdown()
+    print("Done.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -22,6 +22,64 @@ fn napi_err(e: impl std::fmt::Display) -> napi::Error {
     Error::from_reason(e.to_string())
 }
 
+// ─── Async tasks for blocking operations ─────────────────────────────────────
+
+use napi::Task;
+
+pub struct RecvAudioTask {
+    rx: crossbeam_channel::Receiver<agent_transport_core::AudioFrame>,
+    timeout_ms: u64,
+}
+
+impl Task for RecvAudioTask {
+    type Output = Option<Vec<u8>>;
+    type JsValue = Option<Vec<u8>>;
+    fn compute(&mut self) -> Result<Self::Output> {
+        Ok(self.rx.recv_timeout(std::time::Duration::from_millis(self.timeout_ms)).ok().map(|f| f.as_bytes()))
+    }
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+pub struct WaitForPlayoutTask {
+    notify: Arc<(std::sync::Mutex<Option<String>>, std::sync::Condvar)>,
+    timeout_ms: u64,
+}
+
+impl Task for WaitForPlayoutTask {
+    type Output = bool;
+    type JsValue = bool;
+    fn compute(&mut self) -> Result<Self::Output> {
+        let (lock, cvar) = &*self.notify;
+        let guard = lock.lock().unwrap();
+        let result = cvar.wait_timeout_while(guard, std::time::Duration::from_millis(self.timeout_ms), |cp| cp.is_none()).unwrap();
+        Ok(!result.1.timed_out())
+    }
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+pub struct SipWaitForPlayoutTask {
+    notify: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    timeout_ms: u64,
+}
+
+impl Task for SipWaitForPlayoutTask {
+    type Output = bool;
+    type JsValue = bool;
+    fn compute(&mut self) -> Result<Self::Output> {
+        let (lock, cvar) = &*self.notify;
+        let guard = lock.lock().unwrap();
+        let result = cvar.wait_timeout_while(guard, std::time::Duration::from_millis(self.timeout_ms), |done| !*done).unwrap();
+        Ok(!result.1.timed_out())
+    }
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
 /// AudioFrame compatible with LiveKit's format.
 #[napi(object)]
 pub struct AudioFrame {
@@ -451,6 +509,20 @@ impl SipEndpoint {
             .map_err(napi_err)
     }
 
+    /// Receive audio as raw bytes, non-blocking Promise. Runs on libuv thread pool.
+    #[napi(ts_return_type = "Promise<Buffer | null>")]
+    pub fn recv_audio_bytes_async(&self, call_id: i32, timeout_ms: Option<u32>) -> Result<AsyncTask<RecvAudioTask>> {
+        let rx = self.inner.incoming_rx(call_id).map_err(napi_err)?;
+        Ok(AsyncTask::new(RecvAudioTask { rx, timeout_ms: timeout_ms.unwrap_or(20) as u64 }))
+    }
+
+    /// Wait for playout, non-blocking Promise. Runs on libuv thread pool.
+    #[napi(ts_return_type = "Promise<boolean>")]
+    pub fn wait_for_playout_async(&self, call_id: i32, timeout_ms: Option<u32>) -> Result<AsyncTask<SipWaitForPlayoutTask>> {
+        let notify = self.inner.playout_notify(call_id).map_err(napi_err)?;
+        Ok(AsyncTask::new(SipWaitForPlayoutTask { notify, timeout_ms: timeout_ms.unwrap_or(5000) as u64 }))
+    }
+
     /// Number of audio frames queued for sending. Multiply by 0.02 for seconds.
     #[napi]
     pub fn queued_frames(&self, call_id: i32) -> Result<u32> {
@@ -659,6 +731,20 @@ impl AudioStreamEndpoint {
     #[napi]
     pub fn recv_audio_bytes_blocking(&self, session_id: i32, timeout_ms: Option<u32>) -> Result<Option<Vec<u8>>> {
         self.inner.recv_audio_blocking(session_id, timeout_ms.unwrap_or(20) as u64).map(|o| o.map(|f| f.as_bytes())).map_err(napi_err)
+    }
+
+    /// Receive audio as raw bytes, non-blocking Promise. Runs on libuv thread pool.
+    #[napi(ts_return_type = "Promise<Buffer | null>")]
+    pub fn recv_audio_bytes_async(&self, session_id: i32, timeout_ms: Option<u32>) -> Result<AsyncTask<RecvAudioTask>> {
+        let rx = self.inner.incoming_rx(session_id).map_err(napi_err)?;
+        Ok(AsyncTask::new(RecvAudioTask { rx, timeout_ms: timeout_ms.unwrap_or(20) as u64 }))
+    }
+
+    /// Wait for playout, non-blocking Promise. Runs on libuv thread pool.
+    #[napi(ts_return_type = "Promise<boolean>")]
+    pub fn wait_for_playout_async(&self, session_id: i32, timeout_ms: Option<u32>) -> Result<AsyncTask<WaitForPlayoutTask>> {
+        let notify = self.inner.checkpoint_notify(session_id).map_err(napi_err)?;
+        Ok(AsyncTask::new(WaitForPlayoutTask { notify, timeout_ms: timeout_ms.unwrap_or(5000) as u64 }))
     }
 
     #[napi]

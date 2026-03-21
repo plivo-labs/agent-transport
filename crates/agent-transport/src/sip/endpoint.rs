@@ -391,6 +391,16 @@ impl SipEndpoint {
         Ok(rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)).ok())
     }
 
+    /// Get the incoming audio receiver for async operations (used by Node.js async tasks).
+    pub fn incoming_rx(&self, call_id: i32) -> Result<Receiver<AudioFrame>> {
+        self.with_call(call_id, |c| c.incoming_rx.clone())
+    }
+
+    /// Get the playout notify handle for async operations (used by Node.js async tasks).
+    pub fn playout_notify(&self, call_id: i32) -> Result<Arc<(Mutex<bool>, Condvar)>> {
+        self.with_call(call_id, |c| c.playout_notify.clone())
+    }
+
     /// Number of audio frames queued for sending (outgoing buffer depth).
     pub fn queued_frames(&self, call_id: i32) -> Result<usize> {
         self.with_call(call_id, |c| c.outgoing_tx.len())

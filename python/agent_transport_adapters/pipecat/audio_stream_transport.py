@@ -142,7 +142,12 @@ class AudioStreamOutputTransport(BaseOutputTransport):
         return self._ep.queued_frames(self._sid)
 
     async def send_message(self, frame):
-        """Send OutputTransportMessageFrame as raw JSON over the WebSocket."""
+        """Send OutputTransportMessageFrame as raw JSON over the WebSocket.
+
+        Filters RTVI internal messages (matching PlivoFrameSerializer.should_ignore_frame).
+        """
+        if isinstance(frame.message, dict) and frame.message.get("type", "").startswith("rtvi-"):
+            return
         try:
             msg = json.dumps(frame.message) if not isinstance(frame.message, str) else frame.message
             self._ep.send_raw_message(self._sid, msg)
