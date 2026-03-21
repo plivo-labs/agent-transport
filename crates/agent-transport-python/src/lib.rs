@@ -698,6 +698,29 @@ impl AudioStreamEndpoint {
         self.inner.clear_buffer(session_id).map_err(py_err)
     }
 
+    /// Send checkpoint — Plivo responds with playedStream when audio finishes.
+    #[pyo3(signature = (session_id, name=None))]
+    fn checkpoint(&self, session_id: i32, name: Option<&str>) -> PyResult<String> {
+        self.inner.checkpoint(session_id, name).map_err(py_err)
+    }
+
+    /// Flush: send checkpoint and mark segment complete.
+    fn flush(&self, session_id: i32) -> PyResult<()> {
+        self.inner.flush(session_id).map_err(py_err)
+    }
+
+    /// Wait for last checkpoint to be confirmed (playedStream event from Plivo).
+    #[pyo3(signature = (session_id, timeout_ms=5000))]
+    fn wait_for_playout(&self, py: Python, session_id: i32, timeout_ms: u64) -> PyResult<bool> {
+        let inner = &self.inner;
+        py.allow_threads(|| inner.wait_for_playout(session_id, timeout_ms)).map_err(py_err)
+    }
+
+    /// Send DTMF digits via Plivo audio streaming.
+    fn send_dtmf(&self, session_id: i32, digits: &str) -> PyResult<()> {
+        self.inner.send_dtmf(session_id, digits).map_err(py_err)
+    }
+
     fn hangup(&self, session_id: i32) -> PyResult<()> {
         self.inner.hangup(session_id).map_err(py_err)
     }

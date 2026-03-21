@@ -103,6 +103,9 @@ class AudioStreamOutput(AudioOutput):
         self._ep.send_audio_bytes(self._sid, bytes(frame.data), frame.sample_rate, frame.num_channels)
 
     def flush(self) -> None:
+        # Send checkpoint to Plivo — playedStream event confirms playback
+        try: self._ep.flush(self._sid)
+        except Exception: pass
         if self._capturing:
             self._capturing = False
             self.on_playback_finished(playback_position=1.0, interrupted=False)
