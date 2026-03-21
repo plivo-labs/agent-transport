@@ -732,6 +732,10 @@ impl AudioStreamEndpoint {
         py.allow_threads(|| inner.wait_for_playout(session_id, timeout_ms)).map_err(py_err)
     }
 
+    fn queued_frames(&self, session_id: i32) -> PyResult<usize> {
+        self.inner.queued_frames(session_id).map_err(py_err)
+    }
+
     /// Send DTMF digits via Plivo audio streaming.
     fn send_dtmf(&self, session_id: i32, digits: &str) -> PyResult<()> {
         self.inner.send_dtmf(session_id, digits).map_err(py_err)
@@ -739,6 +743,11 @@ impl AudioStreamEndpoint {
 
     fn hangup(&self, session_id: i32) -> PyResult<()> {
         self.inner.hangup(session_id).map_err(py_err)
+    }
+
+    /// Send a raw text message over the WebSocket.
+    fn send_raw_message(&self, session_id: i32, message: &str) -> PyResult<()> {
+        self.inner.send_raw_message(session_id, message).map_err(py_err)
     }
 
     fn poll_event(&self, py: Python) -> PyResult<Option<PyObject>> {

@@ -260,6 +260,13 @@ impl AudioStreamEndpoint {
         Ok(())
     }
 
+    /// Send a raw text message over the WebSocket (e.g. for OutputTransportMessageFrame pass-through).
+    pub fn send_raw_message(&self, session_id: i32, message: &str) -> Result<()> {
+        let s = self.sessions.lock().unwrap();
+        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        sess.ws_tx.send(Message::Text(message.to_string())).map_err(|_| EndpointError::Other("WS send failed".into()))
+    }
+
     pub fn queued_frames(&self, session_id: i32) -> Result<usize> {
         let s = self.sessions.lock().unwrap();
         let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;

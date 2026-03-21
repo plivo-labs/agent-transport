@@ -703,6 +703,11 @@ impl AudioStreamEndpoint {
     pub fn hangup(&self, session_id: i32) -> Result<()> { self.inner.hangup(session_id).map_err(napi_err) }
 
     #[napi]
+    pub fn send_raw_message(&self, session_id: i32, message: String) -> Result<()> {
+        self.inner.send_raw_message(session_id, &message).map_err(napi_err)
+    }
+
+    #[napi]
     pub fn poll_event(&self) -> Result<Option<EventInfo>> {
         match self.inner.events().try_recv() {
             Ok(event) => Ok(Some(event_to_info(&event))),

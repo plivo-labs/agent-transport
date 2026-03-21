@@ -50,6 +50,7 @@ interface TransportEndpoint {
   resume(sessionId: number): void;
   queuedFrames(sessionId: number): number;
   waitForPlayout(sessionId: number, timeoutMs?: number): boolean;
+  sendRawMessage(sessionId: number, message: string): void;
   sampleRate: number;
 }
 
@@ -231,6 +232,10 @@ export class SipAudioOutput {
     this._endpoint.resume(this._sessionId);
     this._firstFrameSent = false;
     this.nextInChain?.resume();
+  }
+
+  sendRawMessage(message: string): void {
+    this._endpoint.sendRawMessage(this._sessionId, message);
   }
 
   onAttached(): void {}
