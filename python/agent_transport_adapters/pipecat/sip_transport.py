@@ -132,7 +132,8 @@ class SipOutputTransport(BaseOutputTransport):
 
     async def _write_dtmf_native(self, frame):
         digit = str(frame.button.value) if hasattr(frame, "button") else str(frame)
-        self._ep.send_dtmf(self._cid, digit)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: self._ep.send_dtmf(self._cid, digit))
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Handle InterruptionFrame → clear_buffer before base class processing."""
@@ -143,12 +144,14 @@ class SipOutputTransport(BaseOutputTransport):
         await super().process_frame(frame, direction)
 
     async def stop(self, frame: EndFrame):
-        try: self._ep.hangup(self._cid)
+        loop = asyncio.get_running_loop()
+        try: await loop.run_in_executor(None, lambda: self._ep.hangup(self._cid))
         except Exception: pass
         await super().stop(frame)
 
     async def cancel(self, frame: CancelFrame):
-        try: self._ep.hangup(self._cid)
+        loop = asyncio.get_running_loop()
+        try: await loop.run_in_executor(None, lambda: self._ep.hangup(self._cid))
         except Exception: pass
         await super().cancel(frame)
 

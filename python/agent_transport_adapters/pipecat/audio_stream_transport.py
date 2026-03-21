@@ -158,12 +158,14 @@ class AudioStreamOutputTransport(BaseOutputTransport):
         await super().process_frame(frame, direction)
 
     async def stop(self, frame: EndFrame):
-        try: self._ep.hangup(self._sid)
+        loop = asyncio.get_running_loop()
+        try: await loop.run_in_executor(None, lambda: self._ep.hangup(self._sid))
         except Exception: pass
         await super().stop(frame)
 
     async def cancel(self, frame: CancelFrame):
-        try: self._ep.hangup(self._sid)
+        loop = asyncio.get_running_loop()
+        try: await loop.run_in_executor(None, lambda: self._ep.hangup(self._sid))
         except Exception: pass
         await super().cancel(frame)
 
