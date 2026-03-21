@@ -341,18 +341,18 @@ impl SipEndpoint {
         }
     }
 
-    /// Register with the SIP server.
-    fn register(&self, username: &str, password: &str) -> PyResult<()> {
-        self.inner
-            .register(username, password)
-            .map_err(py_err)
+    /// Register with the SIP server. Releases GIL (blocks on SIP signaling).
+    fn register(&self, py: Python, username: &str, password: &str) -> PyResult<()> {
+        let inner = &self.inner;
+        let u = username.to_string();
+        let p = password.to_string();
+        py.allow_threads(move || inner.register(&u, &p)).map_err(py_err)
     }
 
-    /// Unregister.
-    fn unregister(&self) -> PyResult<()> {
-        self.inner
-            .unregister()
-            .map_err(py_err)
+    /// Unregister. Releases GIL.
+    fn unregister(&self, py: Python) -> PyResult<()> {
+        let inner = &self.inner;
+        py.allow_threads(|| inner.unregister()).map_err(py_err)
     }
 
     /// Check registration status.
@@ -360,58 +360,54 @@ impl SipEndpoint {
         self.inner.is_registered()
     }
 
-    /// Make an outbound call. Returns call_id.
-    /// Optional headers dict adds custom SIP headers to the INVITE.
+    /// Make an outbound call. Returns call_id. Releases GIL (blocks on SIP signaling).
     #[pyo3(signature = (dest_uri, headers=None))]
-    fn call(&self, dest_uri: &str, headers: Option<HashMap<String, String>>) -> PyResult<i32> {
-        self.inner
-            .call(dest_uri, headers)
-            .map_err(py_err)
+    fn call(&self, py: Python, dest_uri: &str, headers: Option<HashMap<String, String>>) -> PyResult<i32> {
+        let inner = &self.inner;
+        let uri = dest_uri.to_string();
+        py.allow_threads(move || inner.call(&uri, headers)).map_err(py_err)
     }
 
-    /// Answer an incoming call.
+    /// Answer an incoming call. Releases GIL.
     #[pyo3(signature = (call_id, code=200))]
-    fn answer(&self, call_id: i32, code: u16) -> PyResult<()> {
-        self.inner
-            .answer(call_id, code)
-            .map_err(py_err)
+    fn answer(&self, py: Python, call_id: i32, code: u16) -> PyResult<()> {
+        let inner = &self.inner;
+        py.allow_threads(move || inner.answer(call_id, code)).map_err(py_err)
     }
 
-    /// Reject an incoming call.
+    /// Reject an incoming call. Releases GIL.
     #[pyo3(signature = (call_id, code=486))]
-    fn reject(&self, call_id: i32, code: u16) -> PyResult<()> {
-        self.inner
-            .reject(call_id, code)
-            .map_err(py_err)
+    fn reject(&self, py: Python, call_id: i32, code: u16) -> PyResult<()> {
+        let inner = &self.inner;
+        py.allow_threads(move || inner.reject(call_id, code)).map_err(py_err)
     }
 
-    /// Hang up an active call.
-    fn hangup(&self, call_id: i32) -> PyResult<()> {
-        self.inner
-            .hangup(call_id)
-            .map_err(py_err)
+    /// Hang up an active call. Releases GIL.
+    fn hangup(&self, py: Python, call_id: i32) -> PyResult<()> {
+        let inner = &self.inner;
+        py.allow_threads(move || inner.hangup(call_id)).map_err(py_err)
     }
 
-    /// Send DTMF digits.
+    /// Send DTMF digits. Releases GIL.
     #[pyo3(signature = (call_id, digits, method="rfc2833"))]
-    fn send_dtmf(&self, call_id: i32, digits: &str, method: &str) -> PyResult<()> {
-        self.inner
-            .send_dtmf_with_method(call_id, digits, method)
-            .map_err(py_err)
+    fn send_dtmf(&self, py: Python, call_id: i32, digits: &str, method: &str) -> PyResult<()> {
+        let inner = &self.inner;
+        let d = digits.to_string();
+        let m = method.to_string();
+        py.allow_threads(move || inner.send_dtmf_with_method(call_id, &d, &m)).map_err(py_err)
     }
 
-    /// Blind transfer via SIP REFER.
-    fn transfer(&self, call_id: i32, dest_uri: &str) -> PyResult<()> {
-        self.inner
-            .transfer(call_id, dest_uri)
-            .map_err(py_err)
+    /// Blind transfer via SIP REFER. Releases GIL.
+    fn transfer(&self, py: Python, call_id: i32, dest_uri: &str) -> PyResult<()> {
+        let inner = &self.inner;
+        let uri = dest_uri.to_string();
+        py.allow_threads(move || inner.transfer(call_id, &uri)).map_err(py_err)
     }
 
-    /// Attended transfer (connect two calls).
-    fn transfer_attended(&self, call_id: i32, target_call_id: i32) -> PyResult<()> {
-        self.inner
-            .transfer_attended(call_id, target_call_id)
-            .map_err(py_err)
+    /// Attended transfer (connect two calls). Releases GIL.
+    fn transfer_attended(&self, py: Python, call_id: i32, target_call_id: i32) -> PyResult<()> {
+        let inner = &self.inner;
+        py.allow_threads(move || inner.transfer_attended(call_id, target_call_id)).map_err(py_err)
     }
 
     /// Mute outgoing audio.
@@ -557,12 +553,11 @@ impl SipEndpoint {
             .map_err(py_err)
     }
 
-    /// Block until all queued audio finishes playing.
+    /// Block until all queued audio finishes playing. Releases GIL.
     #[pyo3(signature = (call_id, timeout_ms=5000))]
-    fn wait_for_playout(&self, call_id: i32, timeout_ms: u64) -> PyResult<bool> {
-        self.inner
-            .wait_for_playout(call_id, timeout_ms)
-            .map_err(py_err)
+    fn wait_for_playout(&self, py: Python, call_id: i32, timeout_ms: u64) -> PyResult<bool> {
+        let inner = &self.inner;
+        py.allow_threads(|| inner.wait_for_playout(call_id, timeout_ms)).map_err(py_err)
     }
 
     /// Pause audio playback.
@@ -741,8 +736,10 @@ impl AudioStreamEndpoint {
         self.inner.send_dtmf(session_id, digits).map_err(py_err)
     }
 
-    fn hangup(&self, session_id: i32) -> PyResult<()> {
-        self.inner.hangup(session_id).map_err(py_err)
+    /// Hang up via Plivo REST API. Releases GIL (blocks on HTTP request).
+    fn hangup(&self, py: Python, session_id: i32) -> PyResult<()> {
+        let inner = &self.inner;
+        py.allow_threads(move || inner.hangup(session_id)).map_err(py_err)
     }
 
     /// Send a raw text message over the WebSocket.

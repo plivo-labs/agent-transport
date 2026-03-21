@@ -180,14 +180,20 @@ export class SipAudioOutput {
     this._pushedDuration = 0;
     this._firstFrameSent = false;
 
-    // Use setTimeout to not block — the Rust endpoint handles the actual wait
-    setTimeout(() => {
-      const completed = this._endpoint.waitForPlayout(this._sessionId, 30000);
-      this.onPlaybackFinished({
-        playbackPosition: pushed,
-        interrupted: !completed,
-      });
-    }, 0);
+    // Poll with short timeouts to avoid blocking the Node.js event loop.
+    // Each waitForPlayout call blocks for at most 100ms, letting other
+    // callbacks run between iterations.
+    this._interrupted = false;
+    const checkPlayout = (): void => {
+      if (this._interrupted) return; // clearBuffer already emitted playbackFinished
+      const completed = this._endpoint.waitForPlayout(this._sessionId, 100);
+      if (completed) {
+        this.onPlaybackFinished({ playbackPosition: pushed, interrupted: false });
+      } else {
+        setImmediate(checkPlayout);
+      }
+    };
+    setImmediate(checkPlayout);
   }
 
   clearBuffer(): void {
