@@ -69,6 +69,9 @@ class AudioStreamOutputTransport(BaseOutputTransport):
         self._ep = endpoint
         self._sid = session_id
 
+    def _supports_native_dtmf(self) -> bool:
+        return False  # Plivo audio streaming doesn't support outbound DTMF
+
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
         try:
             self._ep.send_audio_bytes(self._sid, frame.audio, frame.sample_rate, frame.num_channels)
