@@ -1,23 +1,25 @@
 """LiveKit Agents AudioInput/AudioOutput adapters for SIP transport.
 
-Matches LiveKit's _ParticipantAudioOutput behavior exactly:
-- flush() is non-blocking, starts async playout wait, emits playback_finished when done
-- clear_buffer() sets interrupted flag, playout wait detects and emits
-- pause() stops forwarding but preserves capture_frame() calls (no queue drain)
-- resume() restarts forwarding
+Uses LiveKit base class implementations for:
+- Segment counting (capture_frame increments, flush resets)
+- wait_for_playout (base class asyncio.Event)
+- on_playback_started / on_playback_finished (base class EventEmitter)
+- pause/resume chain propagation (base class next_in_chain)
+
+We only implement transport-specific logic: sending audio to Rust SIP endpoint.
 """
 
 import asyncio
 import time
-from dataclasses import dataclass
 from typing import Optional
 
 try:
     from livekit import rtc
     from livekit.agents.voice.io import AudioInput, AudioOutput
     try:
-        from livekit.agents.voice.io import PlaybackStartedEvent, PlaybackFinishedEvent
+        from livekit.agents.voice.io import PlaybackStartedEvent, PlaybackFinishedEvent, AudioOutputCapabilities
     except ImportError:
+        from dataclasses import dataclass
         @dataclass
         class PlaybackStartedEvent:
             created_at: float
@@ -26,6 +28,9 @@ try:
             playback_position: float
             interrupted: bool
             synchronized_transcript: Optional[str] = None
+        @dataclass
+        class AudioOutputCapabilities:
+            pause: bool
 except ImportError:
     raise ImportError("livekit-agents is required: pip install livekit-agents")
 
@@ -54,6 +59,10 @@ class SipAudioInput(AudioInput):
     def source(self): return self._source
 
     async def __anext__(self) -> rtc.AudioFrame:
+        # Delegate to source if set (matches base class __anext__)
+        if self._source:
+            return await self._source.__anext__()
+
         loop = asyncio.get_event_loop()
         while not self._closed:
             result = await loop.run_in_executor(
@@ -71,90 +80,79 @@ class SipAudioInput(AudioInput):
 
 
 class SipAudioOutput(AudioOutput):
-    """Sends AudioFrames to a SIP call — matches LiveKit _ParticipantAudioOutput."""
+    """Sends AudioFrames to a SIP call.
+
+    Relies on base class for: segment counting, wait_for_playout,
+    playback events, pause/resume chain propagation.
+    """
 
     def __init__(self, endpoint, call_id: int, *, label: str = "sip-audio-output",
                  capabilities=None, sample_rate: Optional[int] = None,
                  next_in_chain=None, **kwargs):
-        try:
-            kw = {"label": label, "sample_rate": sample_rate, "next_in_chain": next_in_chain}
-            if capabilities is not None: kw["capabilities"] = capabilities
-            kw.update(kwargs)
-            super().__init__(**kw)
-        except TypeError:
-            super().__init__()
+        if capabilities is None:
+            capabilities = AudioOutputCapabilities(pause=True)
+
+        super().__init__(
+            label=label,
+            capabilities=capabilities,
+            sample_rate=sample_rate,
+            next_in_chain=next_in_chain,
+            **kwargs,
+        )
 
         self._ep = endpoint
         self._cid = call_id
-        self._label_str = label
-        self._capabilities = capabilities
-        self._sample_rate = sample_rate
-        self._next_in_chain = next_in_chain
-
-        # Playback state (matches LiveKit internals)
-        self._capturing = False
-        self._segment_count = 0
-        self._finished_count = 0
         self._pushed_duration = 0.0
         self._interrupted_event = asyncio.Event()
-        self._playback_finished_event = asyncio.Event()
-        self._last_ev: Optional[PlaybackFinishedEvent] = None
         self._flush_task: Optional[asyncio.Task] = None
-    @property
-    def label(self) -> str: return self._label_str
-    @property
-    def sample_rate(self) -> Optional[int]: return self._sample_rate or self._ep.sample_rate
-    @property
-    def next_in_chain(self): return self._next_in_chain
+        self._first_frame_sent = False
 
     @property
-    def can_pause(self) -> bool:
-        if self._capabilities and hasattr(self._capabilities, 'pause') and not self._capabilities.pause:
-            return False
-        if self._next_in_chain and not self._next_in_chain.can_pause:
-            return False
-        return True
+    def sample_rate(self) -> Optional[int]:
+        return self._ep.sample_rate
 
     async def capture_frame(self, frame: rtc.AudioFrame) -> None:
-        first_frame = not self._capturing
-        if first_frame:
-            self._capturing = True
-            self._segment_count += 1
-            self._interrupted_event.clear()
+        # Base class tracks __capturing and __playback_segments_count
+        await super().capture_frame(frame)
 
-        # Send to transport first (matches LiveKit: emit after frame queued)
+        # Wait for in-progress flush (matches LiveKit)
+        if self._flush_task and not self._flush_task.done():
+            await self._flush_task
+
+        # Send to SIP transport
         self._ep.send_audio_bytes(self._cid, bytes(frame.data), frame.sample_rate, frame.num_channels)
 
-        # Track duration for playback position calculation
         if frame.sample_rate > 0:
             self._pushed_duration += frame.samples_per_channel / frame.sample_rate
 
-        # Emit playback_started AFTER frame is sent (matches LiveKit timing)
-        if first_frame:
+        # Emit playback_started AFTER send (matches LiveKit _forward_audio timing)
+        if not self._first_frame_sent:
+            self._first_frame_sent = True
             self.on_playback_started(created_at=time.time())
 
     def flush(self) -> None:
-        """Non-blocking flush — starts async playout wait (matches LiveKit)."""
+        # Base class sets __capturing = False
+        super().flush()
         self._ep.flush(self._cid)
+
         if not self._pushed_duration:
             return
-        # Cancel any existing flush task
+
         if self._flush_task and not self._flush_task.done():
             self._flush_task.cancel()
         self._flush_task = asyncio.ensure_future(self._async_wait_for_playout())
 
     def clear_buffer(self) -> None:
-        """Clear buffer and signal interruption (matches LiveKit)."""
         self._ep.clear_buffer(self._cid)
         if self._pushed_duration:
             self._interrupted_event.set()
 
     async def _async_wait_for_playout(self) -> None:
-        """Wait for playout or interruption, then emit playback_finished."""
+        """Race playout vs interruption (matches LiveKit _wait_for_playout)."""
         wait_interrupt = asyncio.create_task(self._interrupted_event.wait())
         wait_playout = asyncio.create_task(self._wait_rust_playout())
 
-        done, pending = await asyncio.wait(
+        done, _ = await asyncio.wait(
             [wait_interrupt, wait_playout],
             return_when=asyncio.FIRST_COMPLETED,
         )
@@ -163,7 +161,6 @@ class SipAudioOutput(AudioOutput):
         pushed = self._pushed_duration
 
         if interrupted:
-            # Calculate how much actually played (approximate)
             queued = self._ep.queued_frames(self._cid) * 0.02
             pushed = max(pushed - queued, 0.0)
             wait_playout.cancel()
@@ -171,58 +168,30 @@ class SipAudioOutput(AudioOutput):
             wait_interrupt.cancel()
 
         self._pushed_duration = 0.0
-        self._capturing = False
         self._interrupted_event.clear()
+        self._first_frame_sent = False
 
+        # Base class handles counting, event emission, __playback_finished_event
         self.on_playback_finished(
             playback_position=pushed,
             interrupted=interrupted,
         )
 
     async def _wait_rust_playout(self) -> None:
-        """Wait for Rust transport queue to drain."""
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
             None, lambda: self._ep.wait_for_playout(self._cid, 30000)
         )
 
-    def on_playback_started(self, *, created_at: float) -> None:
-        ev = PlaybackStartedEvent(created_at=created_at)
-        try: self.emit("playback_started", ev)
-        except Exception: pass
-
-    def on_playback_finished(self, *, playback_position: float, interrupted: bool,
-                              synchronized_transcript: Optional[str] = None) -> None:
-        self._finished_count += 1
-        self._last_ev = PlaybackFinishedEvent(
-            playback_position=playback_position, interrupted=interrupted,
-            synchronized_transcript=synchronized_transcript,
-        )
-        self._playback_finished_event.set()
-        try: self.emit("playback_finished", self._last_ev)
-        except Exception: pass
-
-    async def wait_for_playout(self) -> Optional[PlaybackFinishedEvent]:
-        if self._segment_count <= self._finished_count:
-            return self._last_ev
-        self._playback_finished_event.clear()
-        await self._playback_finished_event.wait()
-        return self._last_ev
-
-    def _reset_playback_count(self) -> None:
-        self._segment_count = 0
-        self._finished_count = 0
-        self._pushed_duration = 0.0
-
     def pause(self) -> None:
-        """Pause — send loop outputs nothing, frames accumulate in Rust channel."""
+        super().pause()  # Base class propagates to next_in_chain
         self._ep.pause(self._cid)
-        if self._next_in_chain: self._next_in_chain.pause()
 
     def resume(self) -> None:
+        super().resume()  # Base class propagates to next_in_chain
         self._ep.resume(self._cid)
-        if self._next_in_chain: self._next_in_chain.resume()
+        self._first_frame_sent = False  # Reset for next segment (matches LiveKit)
 
     def on_attached(self) -> None: pass
     def on_detached(self) -> None: pass
-    def __repr__(self) -> str: return f"SipAudioOutput(label={self._label_str!r})"
+    def __repr__(self) -> str: return f"SipAudioOutput(label={self._ep!r})"
