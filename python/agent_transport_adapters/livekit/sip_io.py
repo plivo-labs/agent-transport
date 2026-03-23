@@ -196,7 +196,7 @@ class SipAudioOutput(AudioOutput):
             endpoint, call_id,
             sample_rate=_sample_rate,
             num_channels=num_channels,
-            queue_size_ms=200,
+            queue_size_ms=1000,  # matches rtc.AudioSource default
         )
 
         self._audio_buf: Chan[rtc.AudioFrame] = Chan()
