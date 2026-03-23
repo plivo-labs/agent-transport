@@ -115,9 +115,10 @@ impl RtpTransport {
                 let ts = t.timestamp.fetch_add(spf, Ordering::Relaxed);
 
                 if flush.swap(false, Ordering::Relaxed) {
+                    let flushed_samples = pcm_buf.len();
                     pcm_buf.clear();
-                    while rx.try_recv().is_ok() {}
-                    // Reset buffer level and wake blocked senders
+                    let drained = {let mut n = 0; while rx.try_recv().is_ok() { n += 1; } n};
+                    info!("RTP flush: cleared {} samples from pcm_buf + {} frames from channel", flushed_samples, drained);
                     { let mut level = buf_level.0.lock().unwrap(); *level = 0; buf_level.1.notify_all(); }
                     notify(&playout);
                     first = true;

@@ -104,11 +104,14 @@ class SipAudioInput(AudioInput):
     async def _forward_audio(self) -> None:
         """Read frames from Rust transport and push into _data_ch.
 
+        This is the inbound audio path: Rust RTP recv → here → Chan → agent pipeline → VAD + STT
+
         On stream end, pushes 0.5s silence to flush STT final results
         (matches _ParticipantAudioInputStream._forward_task).
         Does NOT close the Chan — that's done by aclose() (matches LiveKit).
         """
         loop = asyncio.get_running_loop()
+        frame_count = 0
         try:
             while not self._closed:
                 try:
@@ -122,6 +125,11 @@ class SipAudioInput(AudioInput):
                     ab, sr, nc = result
                     frame = _to_livekit_frame(bytes(ab), sr, nc)
                     await self._data_ch.send(frame)
+                    frame_count += 1
+                    if frame_count == 1:
+                        logger.info("SipAudioInput: first frame received sr=%d samples=%d", sr, frame.samples_per_channel)
+                    elif frame_count % 250 == 0:  # every 5 seconds
+                        logger.info("SipAudioInput: %d frames forwarded to pipeline (%.1fs)", frame_count, frame_count * 0.02)
         finally:
             # Push 0.5s silence to flush STT (matches LiveKit exactly)
             silent_samples = int(self._sample_rate * 0.5)
@@ -279,10 +287,13 @@ class SipAudioOutput(AudioOutput):
     # -- clear_buffer: matches _ParticipantAudioOutput.clear_buffer --
 
     def clear_buffer(self) -> None:
+        logger.info("SipAudioOutput.clear_buffer: clearing bstream, pushed_dur=%.3fs", self._pushed_duration)
         self._audio_bstream.clear()
 
         if not self._pushed_duration:
+            logger.info("SipAudioOutput.clear_buffer: no pushed_duration, skipping interrupt")
             return
+        logger.info("SipAudioOutput.clear_buffer: setting _interrupted_event")
         self._interrupted_event.set()
 
     # -- pause/resume: matches _ParticipantAudioOutput --

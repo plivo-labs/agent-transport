@@ -78,6 +78,9 @@ class SipAudioSource:
 
     def clear_queue(self) -> None:
         """Clear the queue and release all pending waiters."""
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info("SipAudioSource.clear_queue: clearing Rust buffer id=%d, q_size=%.3fs", self._id, self._q_size)
         self._ep.clear_buffer(self._id)
         self._release_waiter()
         self._release_capture_waiter()

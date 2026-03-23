@@ -35,16 +35,12 @@ fn err(e: impl Display) -> EndpointError { EndpointError::Other(e.to_string()) }
 
 // ─── Per-call context ────────────────────────────────────────────────────────
 
-/// Audio buffer thresholds in samples (16kHz), matching WebRTC C++ AudioSource exactly.
+/// Audio buffer capacity in samples (16kHz), matching WebRTC C++ AudioSource exactly.
 ///
-/// WebRTC uses queue_size_ms=1000 (default from Python SDK):
-/// - notify_threshold = queue_size_samples = 16000 (1 second)
-/// - buffer capacity = queue_size_samples + notify_threshold = 32000 (2 seconds)
-///
-/// When buffer > notify_threshold: send_audio blocks (callback deferred in WebRTC)
-/// When buffer >= capacity: frame rejected (WebRTC returns false)
-const AUDIO_BUF_NOTIFY_THRESHOLD: usize = 16000; // 1 second at 16kHz — backpressure kicks in
-const AUDIO_BUF_CAPACITY: usize = 32000;          // 2 seconds at 16kHz — hard reject limit
+/// WebRTC C++ buffer: capacity = queue_size_samples + notify_threshold_samples = 2 * 16000 = 32000.
+/// Pacing (backpressure) is handled in Python by SipAudioSource (matching rtc.AudioSource).
+/// The Rust layer rejects frames when pcm_buf + incoming would exceed capacity.
+const AUDIO_BUF_CAPACITY: usize = 32000; // 2 seconds at 16kHz — hard reject, same as WebRTC
 
 struct CallContext {
     session: CallSession,
@@ -107,8 +103,8 @@ async fn setup_rtp(
     debug!("Call {} negotiated: codec={:?} dtmf_pt={} ptime={}ms remote_rtp={}", call_id, answer.codec, dtmf_pt, answer.ptime_ms, remote_rtp);
     let rtp = Arc::new(RtpTransport::new(Arc::new(rtp_sock), remote_rtp, answer.codec, ctx.cancel.clone(), dtmf_pt, answer.ptime_ms));
 
-    let (otx, orx) = crossbeam_channel::bounded(18000);
-    let (itx, irx) = crossbeam_channel::bounded(18000);
+    let (otx, orx) = crossbeam_channel::bounded(100);
+    let (itx, irx) = crossbeam_channel::bounded(100);
     rtp.start_send_loop(orx, ctx.muted.clone(), ctx.paused.clone(), ctx.flush_flag.clone(), ctx.playout_notify.clone(), ctx.buf_level.clone());
     rtp.start_recv_loop(itx, etx.clone(), call_id, ctx.beep_detector.clone(), ctx.held.clone());
 
@@ -176,8 +172,8 @@ fn start_session_timer(
 
 fn new_call_context(call_id: i32, direction: CallDirection, cc: CancellationToken) -> (CallContext, CallSession) {
     let session = CallSession::new(call_id, direction);
-    let (otx, _orx) = crossbeam_channel::bounded(18000);
-    let (_itx, irx) = crossbeam_channel::bounded(18000);
+    let (otx, _orx) = crossbeam_channel::bounded(100);
+    let (_itx, irx) = crossbeam_channel::bounded(100);
     let ctx = CallContext {
         session: session.clone(), rtp: None, outgoing_tx: otx, incoming_rx: irx,
         muted: Arc::new(AtomicBool::new(false)), paused: Arc::new(AtomicBool::new(false)),
@@ -572,7 +568,10 @@ impl SipEndpoint {
     pub fn pause(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| c.paused.store(true, Ordering::Relaxed)) }
     pub fn resume(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| c.paused.store(false, Ordering::Relaxed)) }
     pub fn flush(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| { if let Ok(mut d) = c.playout_notify.0.lock() { *d = false; } }) }
-    pub fn clear_buffer(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| c.flush_flag.store(true, Ordering::Relaxed)) }
+    pub fn clear_buffer(&self, call_id: i32) -> Result<()> {
+        info!("clear_buffer: call={} setting flush_flag", call_id);
+        self.with_call(call_id, |c| c.flush_flag.store(true, Ordering::Relaxed))
+    }
 
     pub fn wait_for_playout(&self, call_id: i32, timeout_ms: u64) -> Result<bool> {
         self.with_call(call_id, |c| {
@@ -583,45 +582,23 @@ impl SipEndpoint {
     }
 
     pub fn send_audio(&self, call_id: i32, frame: &AudioFrame) -> Result<()> {
-        // Extract what we need from the state lock, then release it BEFORE blocking.
-        // This avoids deadlocking other operations (queued_frames, recv_audio, etc.)
-        // that also need the state lock.
-        let (buf_level, otx) = {
+        // Pacing/backpressure is handled in Python by SipAudioSource (matching
+        // rtc.AudioSource's call_later timer). Frames arrive at real-time rate.
+        //
+        // Hard capacity check: reject if pcm_buf would exceed 32000 samples
+        // (2 seconds at 16kHz), matching WebRTC C++ AudioSource's buffer capacity
+        // of queue_size_samples + notify_threshold_samples.
+        let (buf_level_arc, otx) = {
             let s = self.state.lock().unwrap();
             let ctx = s.calls.get(&call_id).ok_or(EndpointError::CallNotActive(call_id))?;
             (ctx.buf_level.clone(), ctx.outgoing_tx.clone())
         };
-
-        let (lock, cvar) = &*buf_level;
-
-        // Check hard capacity limit (WebRTC returns false = frame rejected)
         {
-            let level = lock.lock().unwrap();
+            let level = buf_level_arc.0.lock().unwrap();
             if *level + frame.data.len() >= AUDIO_BUF_CAPACITY {
                 return Err(EndpointError::Other("buffer full".into()));
             }
         }
-
-        // Backpressure: if buffer > notify_threshold, block until it drains.
-        {
-            let guard = lock.lock().unwrap();
-            if *guard > AUDIO_BUF_NOTIFY_THRESHOLD {
-                debug!("send_audio: backpressure active, buf_level={}, waiting...", *guard);
-                let _guard = cvar.wait_timeout_while(
-                    guard,
-                    std::time::Duration::from_secs(5),
-                    |level| *level > AUDIO_BUF_NOTIFY_THRESHOLD,
-                ).unwrap();
-                debug!("send_audio: backpressure released, buf_level={}", *_guard.0);
-            }
-        }
-
-        // Update buffer level with the new samples
-        {
-            let mut level = lock.lock().unwrap();
-            *level += frame.data.len();
-        }
-
         otx.try_send(frame.data.clone())
             .map_err(|_| EndpointError::Other("channel full".into()))
     }
