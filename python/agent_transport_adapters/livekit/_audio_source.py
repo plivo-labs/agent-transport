@@ -1,27 +1,17 @@
 """SipAudioSource — drop-in equivalent of rtc.AudioSource for SIP/RTP transport.
 
-Replicates rtc.AudioSource's exact behavior including backpressure:
-- capture_frame() tracks _q_size and provides natural pacing
-- When buffer > notify_threshold (queue_size_ms), capture_frame WAITS
-  until the playout timer drains it — matching WebRTC C++ behavior
-- wait_for_playout() returns a Future resolved by call_later timer
-- clear_queue() discards queued audio and releases waiters
-- queued_duration property tracks remaining playout time
+Matches WebRTC's async backpressure pattern exactly:
+- capture_frame() pushes audio to Rust buffer (sync, fast)
+- If buffer <= threshold: Rust fires completion callback immediately
+- If buffer > threshold: Rust stores callback, fires when RTP loop drains
+- Completion callback uses loop.call_soon_threadsafe to resolve a Python Future
+- capture_frame() awaits the Future — async suspension, no thread blocked
 
-The WebRTC C++ AudioSource works as follows:
-- Buffer capacity = 2 × queue_size_samples
-- notify_threshold = queue_size_samples
-- If buffer ≤ threshold: on_complete fires immediately (fast return)
-- If buffer > threshold: on_complete deferred until playout drains (BLOCKS)
-- If buffer ≥ capacity: frame rejected
-
-We replicate this timing-based backpressure in Python.
+This matches WebRTC's C++ deferred on_complete → Rust oneshot → Python callback pattern.
 """
 
 import asyncio
-import functools
 import time
-from typing import Optional
 
 from livekit import rtc
 
@@ -29,7 +19,7 @@ from livekit import rtc
 class SipAudioSource:
     """Audio source that sends frames to a SIP/RTP or AudioStream endpoint.
 
-    Matches rtc.AudioSource's queue tracking and backpressure semantics exactly.
+    Matches rtc.AudioSource's backpressure and timing semantics exactly.
     """
 
     def __init__(
@@ -49,19 +39,11 @@ class SipAudioSource:
         self._loop = loop or asyncio.get_event_loop()
         self._disposed = False
 
-        # Threshold in seconds (matches WebRTC notify_threshold = queue_size_samples)
-        self._notify_threshold = queue_size_ms / 1000.0
-
-        # -- Exact copies of rtc.AudioSource fields --
+        # -- Timing fields (same as rtc.AudioSource for wait_for_playout) --
         self._last_capture = 0.0
         self._q_size = 0.0
         self._join_handle: asyncio.TimerHandle | None = None
         self._join_fut: asyncio.Future[None] | None = None
-
-        # Backpressure: when _q_size > threshold, capture_frame waits
-        # for this future to resolve (set by call_later when _q_size drains)
-        self._capture_wait_handle: asyncio.TimerHandle | None = None
-        self._capture_wait_fut: asyncio.Future[None] | None = None
 
     @property
     def sample_rate(self) -> int:
@@ -78,29 +60,27 @@ class SipAudioSource:
 
     def clear_queue(self) -> None:
         """Clear the queue and release all pending waiters."""
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.info("SipAudioSource.clear_queue: clearing Rust buffer id=%d, q_size=%.3fs", self._id, self._q_size)
         self._ep.clear_buffer(self._id)
         self._release_waiter()
-        self._release_capture_waiter()
 
     async def capture_frame(self, frame: rtc.AudioFrame) -> None:
         """Capture a frame and send it to the Rust transport layer.
 
-        Provides natural pacing matching WebRTC C++ AudioSource:
-        - If _q_size ≤ notify_threshold: send immediately, return fast
-        - If _q_size > notify_threshold: send, then WAIT until _q_size
-          drains below threshold (via call_later timer)
+        Matches WebRTC's async backpressure pattern:
+        1. Push audio to Rust buffer (sync, fast via send_audio_notify)
+        2. Rust fires completion callback immediately if below threshold
+        3. If above threshold, Rust defers callback until RTP loop drains
+        4. Callback resolves a Python Future via loop.call_soon_threadsafe
+        5. We await the Future — async suspension, no thread blocked
 
-        This is what makes the forwarding task naturally pace at real-time,
-        which backs up the Chan, which backs up _audio_forwarding_task,
-        which backs up TTS consumption, which slows down the pipeline.
+        This is the exact same pattern as WebRTC's:
+        Python → FFI request → C++ buffer → deferred on_complete → Rust oneshot →
+        FFI callback event → Python Future resolves
         """
         if frame.samples_per_channel == 0 or self._disposed:
             return
 
-        # -- Timing math: line-for-line copy of rtc.AudioSource.capture_frame --
+        # -- Timing math (same as rtc.AudioSource for wait_for_playout) --
         now = time.monotonic()
         elapsed = 0.0 if self._last_capture == 0.0 else now - self._last_capture
         self._q_size += frame.samples_per_channel / self.sample_rate - elapsed
@@ -112,63 +92,49 @@ class SipAudioSource:
         if self._join_fut is None:
             self._join_fut = self._loop.create_future()
 
-        self._join_handle = self._loop.call_later(max(self._q_size, 0), self._release_waiter)
+        self._join_handle = self._loop.call_later(self._q_size, self._release_waiter)
 
-        # -- Send frame to Rust via executor (avoids blocking asyncio loop) --
-        await self._loop.run_in_executor(
-            None,
-            functools.partial(
-                self._ep.send_audio_bytes,
-                self._id,
-                bytes(frame.data),
-                frame.sample_rate,
-                frame.num_channels,
-            ),
+        # -- Push to Rust with async completion notification --
+        # Create a Future that Rust will resolve via the completion callback
+        capture_fut = self._loop.create_future()
+
+        def _on_complete():
+            """Called from Rust RTP thread when buffer drains below threshold.
+            Uses call_soon_threadsafe to safely resolve the Python Future."""
+            try:
+                self._loop.call_soon_threadsafe(capture_fut.set_result, None)
+            except RuntimeError:
+                pass  # event loop closed
+
+        # Push audio to Rust — Rust fires _on_complete immediately if below
+        # threshold, or defers it until RTP loop drains
+        self._ep.send_audio_notify(
+            self._id,
+            bytes(frame.data),
+            frame.sample_rate,
+            frame.num_channels,
+            _on_complete,
         )
 
-        # -- Backpressure: if buffer > threshold, wait for drain --
-        # This matches WebRTC C++ behavior where on_complete is deferred
-        # when buffer exceeds notify_threshold. The caller (forwarding task)
-        # blocks until the playout timer drains below threshold.
-        if self._q_size > self._notify_threshold:
-            # Calculate how long until _q_size drains to threshold
-            wait_time = self._q_size - self._notify_threshold
-            if self._capture_wait_fut is not None and not self._capture_wait_fut.done():
-                self._capture_wait_handle.cancel()
-            self._capture_wait_fut = self._loop.create_future()
-            self._capture_wait_handle = self._loop.call_later(
-                wait_time, self._release_capture_waiter
-            )
-            await self._capture_wait_fut
+        # Await completion — instant if below threshold, suspends if above
+        await capture_fut
 
     async def wait_for_playout(self) -> None:
         """Wait for all queued audio to finish playing out."""
         if self._join_fut is None:
             return
-
         await asyncio.shield(self._join_fut)
 
     def _release_waiter(self) -> None:
         """Release the playout waiter."""
         if self._join_fut is None:
             return
-
         if not self._join_fut.done():
             self._join_fut.set_result(None)
-
         self._last_capture = 0.0
         self._q_size = 0.0
         self._join_fut = None
 
-    def _release_capture_waiter(self) -> None:
-        """Release the capture backpressure waiter."""
-        if self._capture_wait_fut is not None and not self._capture_wait_fut.done():
-            self._capture_wait_fut.set_result(None)
-        self._capture_wait_fut = None
-        self._capture_wait_handle = None
-
     async def aclose(self) -> None:
         """Close the audio source."""
         self._disposed = True
-        self._release_waiter()
-        self._release_capture_waiter()

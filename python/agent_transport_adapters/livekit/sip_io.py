@@ -222,8 +222,6 @@ class SipAudioOutput(AudioOutput):
         self._playback_enabled.set()
         self._first_frame_event = asyncio.Event()
 
-        self._ready = asyncio.Event()
-
     @property
     def sample_rate(self) -> int | None:
         return self._audio_source.sample_rate
@@ -232,7 +230,6 @@ class SipAudioOutput(AudioOutput):
 
     async def start(self) -> None:
         self._forwarding_task = asyncio.create_task(self._forward_audio())
-        self._ready.set()
 
     # -- aclose: matches _ParticipantAudioOutput.aclose --
 
@@ -251,8 +248,6 @@ class SipAudioOutput(AudioOutput):
     async def capture_frame(self, frame: rtc.AudioFrame) -> None:
         if self._forwarding_task is None:
             await self.start()
-
-        await self._ready.wait()
 
         await super().capture_frame(frame)
 

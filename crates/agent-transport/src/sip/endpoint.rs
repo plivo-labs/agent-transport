@@ -28,6 +28,7 @@ use crate::config::EndpointConfig;
 use crate::error::{EndpointError, Result};
 use crate::events::EndpointEvent;
 use crate::recorder::WavRecorder;
+use crate::sip::audio_buffer::AudioBuffer;
 use crate::sip::rtp_transport::RtpTransport;
 use crate::sip::sdp;
 
@@ -35,27 +36,17 @@ fn err(e: impl Display) -> EndpointError { EndpointError::Other(e.to_string()) }
 
 // ─── Per-call context ────────────────────────────────────────────────────────
 
-/// Audio buffer capacity in samples (16kHz), matching WebRTC C++ AudioSource exactly.
-///
-/// WebRTC C++ buffer: capacity = queue_size_samples + notify_threshold_samples = 2 * 16000 = 32000.
-/// Pacing (backpressure) is handled in Python by SipAudioSource (matching rtc.AudioSource).
-/// The Rust layer rejects frames when pcm_buf + incoming would exceed capacity.
-const AUDIO_BUF_CAPACITY: usize = 32000; // 2 seconds at 16kHz — hard reject, same as WebRTC
-
 struct CallContext {
     session: CallSession,
     rtp: Option<Arc<RtpTransport>>,
-    outgoing_tx: Sender<Vec<i16>>,
+    /// Shared audio buffer — replaces crossbeam channel.
+    /// Matches WebRTC C++ InternalSource's buffer_ (one buffer, one mutex).
+    audio_buf: Arc<AudioBuffer>,
     incoming_rx: Receiver<AudioFrame>,
     muted: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
-    flush_flag: Arc<AtomicBool>,
     held: Arc<AtomicBool>,
     playout_notify: Arc<(Mutex<bool>, Condvar)>,
-    /// Shared buffer level (samples) + condvar for backpressure.
-    /// send_audio blocks when buf_level > AUDIO_BUF_LIMIT_SAMPLES.
-    /// RTP send loop notifies after draining samples.
-    buf_level: Arc<(Mutex<usize>, Condvar)>,
     beep_detector: Arc<Mutex<Option<BeepDetector>>>,
     recorder: Option<WavRecorder>,
     cancel: CancellationToken,
@@ -103,13 +94,11 @@ async fn setup_rtp(
     debug!("Call {} negotiated: codec={:?} dtmf_pt={} ptime={}ms remote_rtp={}", call_id, answer.codec, dtmf_pt, answer.ptime_ms, remote_rtp);
     let rtp = Arc::new(RtpTransport::new(Arc::new(rtp_sock), remote_rtp, answer.codec, ctx.cancel.clone(), dtmf_pt, answer.ptime_ms));
 
-    let (otx, orx) = crossbeam_channel::bounded(100);
     let (itx, irx) = crossbeam_channel::bounded(100);
-    rtp.start_send_loop(orx, ctx.muted.clone(), ctx.paused.clone(), ctx.flush_flag.clone(), ctx.playout_notify.clone(), ctx.buf_level.clone());
+    rtp.start_send_loop(ctx.audio_buf.clone(), ctx.muted.clone(), ctx.paused.clone(), ctx.playout_notify.clone());
     rtp.start_recv_loop(itx, etx.clone(), call_id, ctx.beep_detector.clone(), ctx.held.clone());
 
     ctx.rtp = Some(rtp);
-    ctx.outgoing_tx = otx;
     ctx.incoming_rx = irx;
     ctx.session.state = CallState::Confirmed;
     ctx.local_sdp = Some(local_sdp.clone());
@@ -172,14 +161,14 @@ fn start_session_timer(
 
 fn new_call_context(call_id: i32, direction: CallDirection, cc: CancellationToken) -> (CallContext, CallSession) {
     let session = CallSession::new(call_id, direction);
-    let (otx, _orx) = crossbeam_channel::bounded(100);
     let (_itx, irx) = crossbeam_channel::bounded(100);
     let ctx = CallContext {
-        session: session.clone(), rtp: None, outgoing_tx: otx, incoming_rx: irx,
+        session: session.clone(), rtp: None,
+        audio_buf: Arc::new(AudioBuffer::new()),
+        incoming_rx: irx,
         muted: Arc::new(AtomicBool::new(false)), paused: Arc::new(AtomicBool::new(false)),
-        flush_flag: Arc::new(AtomicBool::new(false)), playout_notify: Arc::new((Mutex::new(false), Condvar::new())),
         held: Arc::new(AtomicBool::new(false)),
-        buf_level: Arc::new((Mutex::new(0usize), Condvar::new())),
+        playout_notify: Arc::new((Mutex::new(false), Condvar::new())),
         beep_detector: Arc::new(Mutex::new(None)), recorder: None, cancel: cc,
         client_dialog: None, server_dialog: None, local_sdp: None,
     };
@@ -569,8 +558,8 @@ impl SipEndpoint {
     pub fn resume(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| c.paused.store(false, Ordering::Relaxed)) }
     pub fn flush(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| { if let Ok(mut d) = c.playout_notify.0.lock() { *d = false; } }) }
     pub fn clear_buffer(&self, call_id: i32) -> Result<()> {
-        info!("clear_buffer: call={} setting flush_flag", call_id);
-        self.with_call(call_id, |c| c.flush_flag.store(true, Ordering::Relaxed))
+        info!("clear_buffer: call={} clearing audio buffer", call_id);
+        self.with_call(call_id, |c| c.audio_buf.clear())
     }
 
     pub fn wait_for_playout(&self, call_id: i32, timeout_ms: u64) -> Result<bool> {
@@ -581,26 +570,30 @@ impl SipEndpoint {
         })
     }
 
-    pub fn send_audio(&self, call_id: i32, frame: &AudioFrame) -> Result<()> {
-        // Pacing/backpressure is handled in Python by SipAudioSource (matching
-        // rtc.AudioSource's call_later timer). Frames arrive at real-time rate.
-        //
-        // Hard capacity check: reject if pcm_buf would exceed 32000 samples
-        // (2 seconds at 16kHz), matching WebRTC C++ AudioSource's buffer capacity
-        // of queue_size_samples + notify_threshold_samples.
-        let (buf_level_arc, otx) = {
+    /// Push audio samples into the shared AudioBuffer.
+    ///
+    /// If buffer is below threshold (1s), the completion callback fires immediately
+    /// and this returns quickly. If above threshold, the callback is deferred until
+    /// the RTP send loop drains below threshold.
+    ///
+    /// The `on_complete` callback is called from the RTP send loop's tokio thread.
+    /// It should use loop.call_soon_threadsafe to signal Python asynchronously.
+    ///
+    /// Matches WebRTC C++ InternalSource::capture_frame exactly.
+    pub fn send_audio_with_callback(&self, call_id: i32, frame: &AudioFrame, on_complete: crate::sip::audio_buffer::CompletionCallback) -> Result<()> {
+        let audio_buf = {
             let s = self.state.lock().unwrap();
             let ctx = s.calls.get(&call_id).ok_or(EndpointError::CallNotActive(call_id))?;
-            (ctx.buf_level.clone(), ctx.outgoing_tx.clone())
+            ctx.audio_buf.clone()
         };
-        {
-            let level = buf_level_arc.0.lock().unwrap();
-            if *level + frame.data.len() >= AUDIO_BUF_CAPACITY {
-                return Err(EndpointError::Other("buffer full".into()));
-            }
-        }
-        otx.try_send(frame.data.clone())
-            .map_err(|_| EndpointError::Other("channel full".into()))
+        audio_buf.push(&frame.data, on_complete)
+            .map_err(|e| EndpointError::Other(e.into()))
+    }
+
+    /// Simple send_audio without callback — for backward compatibility.
+    /// Uses a no-op callback (always immediate, no backpressure wait).
+    pub fn send_audio(&self, call_id: i32, frame: &AudioFrame) -> Result<()> {
+        self.send_audio_with_callback(call_id, frame, Box::new(|| {}))
     }
 
     pub fn recv_audio(&self, call_id: i32) -> Result<Option<AudioFrame>> {
@@ -621,7 +614,7 @@ impl SipEndpoint {
     }
 
     pub fn queued_frames(&self, call_id: i32) -> Result<usize> {
-        self.with_call(call_id, |c| c.outgoing_tx.len())
+        self.with_call(call_id, |c| c.audio_buf.len() / 320) // convert samples to 20ms frame count
     }
 
     pub fn start_recording(&self, call_id: i32, path: &str) -> Result<()> {

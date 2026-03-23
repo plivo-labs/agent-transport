@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Sender;
 use rtp::{header::Header, packet::Packet};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
@@ -18,6 +18,7 @@ use webrtc_util::marshal::{Marshal, MarshalSize, Unmarshal};
 use beep_detector::{BeepDetector, BeepDetectorResult};
 use crate::audio::AudioFrame;
 use crate::config::Codec;
+use crate::sip::audio_buffer::AudioBuffer;
 use crate::sip::dtmf;
 use crate::sip::resampler::Resampler;
 use crate::events::EndpointEvent;
@@ -67,13 +68,13 @@ impl RtpTransport {
         Ok(())
     }
 
-    pub fn start_send_loop(self: &Arc<Self>, rx: Receiver<Vec<i16>>, muted: Arc<AtomicBool>, paused: Arc<AtomicBool>, flush: Arc<AtomicBool>, playout: Arc<(Mutex<bool>, Condvar)>, buf_level: Arc<(Mutex<usize>, Condvar)>) -> tokio::task::JoinHandle<()> {
+    /// Start the RTP send loop. Drains from the shared AudioBuffer every ptime_ms.
+    /// Matches WebRTC C++ InternalSource::audio_task_ (10ms repeating task).
+    pub fn start_send_loop(self: &Arc<Self>, audio_buf: Arc<AudioBuffer>, muted: Arc<AtomicBool>, paused: Arc<AtomicBool>, playout: Arc<(Mutex<bool>, Condvar)>) -> tokio::task::JoinHandle<()> {
         let t = Arc::clone(self);
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(Duration::from_millis(t.ptime_ms as u64));
             let (sil, spf) = (t.codec.silence_byte(), t.spf());
-            // spf = samples per frame at 8kHz (160 for 20ms ptime)
-            // Input is 16kHz, so we need 2x samples per frame from the input
             let input_spf = (spf * 2) as usize; // 320 samples at 16kHz = 20ms
             let mut first = true;
             let mut pkt_count = 0u32;
@@ -82,11 +83,6 @@ impl RtpTransport {
             rtcp_iv.tick().await;
             let mut downsampler = Resampler::new_voip(16000, 8000);
 
-            // Internal buffer: accumulates incoming samples (16kHz) and drains
-            // exactly input_spf (320) samples per ptime tick.
-            // This matches WebRTC C++ AudioSource's internal buffer behavior.
-            let mut pcm_buf: Vec<i16> = Vec::new();
-
             loop {
                 tokio::select! {
                     _ = t.cancel.cancelled() => break,
@@ -94,36 +90,13 @@ impl RtpTransport {
                         let ts = t.timestamp.load(Ordering::Relaxed);
                         let sr = super::rtcp::build_sender_report(t.ssrc, ts, pkt_count, octet_count);
                         let _ = t.socket.send_to(&sr, t.remote()).await;
-                        let queued = rx.len();
-                        let buf_ms = (pcm_buf.len() as u32 * 1000) / 16000;
-                        debug!("RTP TX: pkts={} octets={} queued={} buf={}ms codec={:?} remote={}", pkt_count, octet_count, queued, buf_ms, t.codec, t.remote());
+                        let buf_ms = (audio_buf.len() as u32 * 1000) / 16000;
+                        debug!("RTP TX: pkts={} octets={} buf={}ms codec={:?} remote={}", pkt_count, octet_count, buf_ms, t.codec, t.remote());
                     }
                     _ = iv.tick() => {}
                 }
 
-                // Drain incoming frames from crossbeam channel into pcm_buf
-                while let Ok(s) = rx.try_recv() {
-                    pcm_buf.extend_from_slice(&s);
-                }
-                // Update shared buffer level so send_audio can backpressure
-                {
-                    let mut level = buf_level.0.lock().unwrap();
-                    *level = pcm_buf.len();
-                    buf_level.1.notify_all(); // wake any blocked send_audio calls
-                }
-
                 let ts = t.timestamp.fetch_add(spf, Ordering::Relaxed);
-
-                if flush.swap(false, Ordering::Relaxed) {
-                    let flushed_samples = pcm_buf.len();
-                    pcm_buf.clear();
-                    let drained = {let mut n = 0; while rx.try_recv().is_ok() { n += 1; } n};
-                    info!("RTP flush: cleared {} samples from pcm_buf + {} frames from channel", flushed_samples, drained);
-                    { let mut level = buf_level.0.lock().unwrap(); *level = 0; buf_level.1.notify_all(); }
-                    notify(&playout);
-                    first = true;
-                    continue;
-                }
 
                 if paused.load(Ordering::Relaxed) {
                     let _ = t.send(t.codec.payload_type(), ts, false, vec![sil; spf as usize]).await;
@@ -131,35 +104,30 @@ impl RtpTransport {
                     continue;
                 }
 
-                if pcm_buf.len() >= input_spf {
+                // Drain exactly input_spf samples from the shared AudioBuffer.
+                // This also fires any deferred completion callbacks if buffer
+                // dropped below threshold (matching WebRTC's audio_task_).
+                let samples = audio_buf.drain(input_spf);
+
+                if !samples.is_empty() {
                     if !muted.load(Ordering::Relaxed) {
                         let m = first; first = false;
-                        // Take exactly input_spf samples (20ms at 16kHz)
-                        let chunk: Vec<i16> = pcm_buf.drain(..input_spf).collect();
-                        // Downsample 16kHz→8kHz via speexdsp
                         let samples_8k = if let Some(ref mut ds) = downsampler {
-                            ds.process(&chunk).to_vec()
+                            ds.process(&samples).to_vec()
                         } else {
-                            chunk
+                            samples
                         };
                         let encoded = t.codec.encode(&samples_8k);
                         octet_count += encoded.len() as u32;
                         let _ = t.send(t.codec.payload_type(), ts, m, encoded).await;
                         pkt_count += 1;
                     } else {
-                        pcm_buf.drain(..input_spf);
                         let _ = t.send(t.codec.payload_type(), ts, false, vec![sil; spf as usize]).await;
                         pkt_count += 1; octet_count += spf;
                     }
-                    // Update buffer level after draining — notify blocked senders
-                    {
-                        let mut level = buf_level.0.lock().unwrap();
-                        *level = pcm_buf.len();
-                        buf_level.1.notify_all();
-                    }
                 } else {
-                    // Buffer doesn't have a full frame — send silence, notify playout if channel empty
-                    if rx.is_empty() && pcm_buf.is_empty() {
+                    // No audio — send silence, notify playout completion
+                    if audio_buf.is_empty() {
                         notify(&playout);
                         first = true;
                     }

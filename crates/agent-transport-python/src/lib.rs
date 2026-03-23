@@ -443,20 +443,35 @@ impl SipEndpoint {
         py.allow_threads(move || inner.unhold(call_id)).map_err(py_err)
     }
 
-    /// Send an audio frame. Releases GIL since Rust may block for backpressure.
-    fn send_audio(&self, py: Python, call_id: i32, frame: &AudioFrame) -> PyResult<()> {
-        let inner = &self.inner;
-        let f = frame.to_rust();
-        py.allow_threads(move || inner.send_audio(call_id, &f))
-            .map_err(py_err)
+    /// Send an audio frame (simple, no backpressure callback).
+    fn send_audio(&self, call_id: i32, frame: &AudioFrame) -> PyResult<()> {
+        self.inner.send_audio(call_id, &frame.to_rust()).map_err(py_err)
     }
 
-    /// Send raw PCM bytes (little-endian int16) directly. No Python list conversion.
-    /// Releases GIL since Rust may block for backpressure (matching WebRTC C++ behavior).
-    fn send_audio_bytes(&self, py: Python, call_id: i32, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
+    /// Send raw PCM bytes with async completion notification.
+    ///
+    /// Pushes audio into the shared buffer. If buffer is below threshold,
+    /// `notify_fn` is called immediately (sync). If above threshold, `notify_fn`
+    /// is called later by the RTP send loop when buffer drains (from another thread).
+    ///
+    /// Python should pass `lambda: loop.call_soon_threadsafe(future.set_result, None)`
+    /// as `notify_fn`. This matches WebRTC's deferred on_complete callback pattern.
+    fn send_audio_notify(&self, call_id: i32, audio: &[u8], sample_rate: u32, num_channels: u32, notify_fn: Py<PyAny>) -> PyResult<()> {
         let frame = RustAudioFrame::from_bytes(audio, sample_rate, num_channels);
-        let inner = &self.inner;
-        py.allow_threads(move || inner.send_audio(call_id, &frame)).map_err(py_err)
+        let callback: Box<dyn FnOnce() + Send> = Box::new(move || {
+            Python::with_gil(|py| {
+                if let Err(e) = notify_fn.call0(py) {
+                    e.print(py);
+                }
+            });
+        });
+        self.inner.send_audio_with_callback(call_id, &frame, callback).map_err(py_err)
+    }
+
+    /// Send raw PCM bytes (simple, no backpressure callback).
+    fn send_audio_bytes(&self, call_id: i32, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
+        let frame = RustAudioFrame::from_bytes(audio, sample_rate, num_channels);
+        self.inner.send_audio(call_id, &frame).map_err(py_err)
     }
 
     /// Receive an audio frame (non-blocking, returns None if no frame ready).
