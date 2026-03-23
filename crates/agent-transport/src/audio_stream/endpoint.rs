@@ -79,6 +79,7 @@ impl AudioEncoding {
     fn send_sample_rate(&self) -> u32 {
         match self { AudioEncoding::L16Rate16k => 16000, _ => 8000 }
     }
+    fn sample_rate(&self) -> u32 { self.send_sample_rate() }
 }
 
 // ─── Session context ─────────────────────────────────────────────────────────
@@ -333,6 +334,8 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
     tokio::spawn(async move { loop { tokio::select! { _ = cc.cancelled() => break, msg = ws_rx.recv() => { match msg { Some(m) => { if sink.send(m).await.is_err() { break; } }, None => break } } } } });
 
     let mut encoding = AudioEncoding::MulawRate8k; // default, updated on start
+    // speexdsp resampler for 8kHz→16kHz recv path (created on first use if needed)
+    let mut upsampler: Option<crate::sip::resampler::Resampler> = None;
 
     loop {
         tokio::select! {
@@ -372,6 +375,10 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                             let sc = session_cancel.clone();
                             tokio::spawn(async move {
                                 let mut iv = tokio::time::interval(Duration::from_millis(20));
+                                // speexdsp resampler for 16kHz→8kHz (if needed for this encoding)
+                                let mut downsampler = if enc.sample_rate() < 16000 {
+                                    crate::sip::resampler::Resampler::new_voip(16000, enc.sample_rate())
+                                } else { None };
                                 loop {
                                     tokio::select! { _ = sc.cancelled() => break, _ = iv.tick() => {} }
                                     if f.swap(false, Ordering::Relaxed) {
@@ -379,10 +386,10 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                                         if let Ok(mut d) = pn.0.lock() { *d = true; pn.1.notify_all(); }
                                         continue;
                                     }
-                                    if p.load(Ordering::Relaxed) { continue; } // Paused — send nothing
+                                    if p.load(Ordering::Relaxed) { continue; }
                                     match orx.try_recv() {
                                         Ok(samples) if !m.load(Ordering::Relaxed) => {
-                                            let payload = encode_for_plivo(&samples, enc);
+                                            let payload = encode_for_plivo(&samples, enc, &mut downsampler);
                                             let b64 = base64::engine::general_purpose::STANDARD.encode(&payload);
                                             let json = serde_json::to_string(&serde_json::json!({
                                                 "event": "playAudio",
@@ -418,18 +425,17 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                             if let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(&media.payload) {
                                 let pcm_16k = match encoding {
                                     AudioEncoding::L16Rate16k => {
-                                        // Native 16kHz PCM — decode LE int16 directly
                                         raw.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>()
                                     }
                                     AudioEncoding::L16Rate8k => {
-                                        // 8kHz PCM — decode LE int16, upsample to 16kHz
                                         let pcm_8k: Vec<i16> = raw.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
-                                        upsample(&pcm_8k)
+                                        if upsampler.is_none() { upsampler = crate::sip::resampler::Resampler::new_voip(8000, 16000); }
+                                        if let Some(ref mut us) = upsampler { us.process(&pcm_8k).to_vec() } else { pcm_8k }
                                     }
                                     AudioEncoding::MulawRate8k => {
-                                        // mu-law → PCM 8kHz → upsample to 16kHz
                                         let pcm_8k: Vec<i16> = raw.iter().map(|&b| decode_ulaw(b)).collect();
-                                        upsample(&pcm_8k)
+                                        if upsampler.is_none() { upsampler = crate::sip::resampler::Resampler::new_voip(8000, 16000); }
+                                        if let Some(ref mut us) = upsampler { us.process(&pcm_8k).to_vec() } else { pcm_8k }
                                     }
                                 };
                                 let n = pcm_16k.len() as u32;
@@ -476,28 +482,23 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
 }
 
 /// Encode 16kHz PCM samples for Plivo based on negotiated format.
-fn encode_for_plivo(samples: &[i16], enc: AudioEncoding) -> Vec<u8> {
+/// Uses speexdsp resampler when downsampling is needed.
+fn encode_for_plivo(samples: &[i16], enc: AudioEncoding, downsampler: &mut Option<crate::sip::resampler::Resampler>) -> Vec<u8> {
     match enc {
         AudioEncoding::L16Rate16k => {
             samples.iter().flat_map(|&s| s.to_le_bytes()).collect()
         }
         AudioEncoding::L16Rate8k => {
-            let pcm_8k: Vec<i16> = samples.iter().step_by(2).copied().collect();
+            let pcm_8k = if let Some(ref mut ds) = downsampler {
+                ds.process(samples).to_vec()
+            } else { samples.to_vec() };
             pcm_8k.iter().flat_map(|&s| s.to_le_bytes()).collect()
         }
         AudioEncoding::MulawRate8k => {
-            let pcm_8k: Vec<i16> = samples.iter().step_by(2).copied().collect();
+            let pcm_8k = if let Some(ref mut ds) = downsampler {
+                ds.process(samples).to_vec()
+            } else { samples.to_vec() };
             pcm_8k.iter().map(|&s| encode_ulaw(s)).collect()
         }
     }
-}
-
-fn upsample(s: &[i16]) -> Vec<i16> {
-    let mut o = Vec::with_capacity(s.len() * 2);
-    for i in 0..s.len() {
-        o.push(s[i]);
-        let n = if i + 1 < s.len() { s[i + 1] } else { s[i] };
-        o.push(((s[i] as i32 + n as i32) / 2) as i16);
-    }
-    o
 }

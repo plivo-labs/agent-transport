@@ -8,7 +8,7 @@ use crossbeam_channel::{Receiver, Sender};
 use tokio::net::UdpSocket;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use beep_detector::{BeepDetector, BeepDetectorConfig};
 use rsip::message::HasHeaders;
@@ -24,7 +24,7 @@ use rsipstack::EndpointBuilder;
 
 use crate::audio::AudioFrame;
 use crate::sip::call::{CallDirection, CallSession, CallState};
-use crate::config::{Codec, EndpointConfig};
+use crate::config::EndpointConfig;
 use crate::error::{EndpointError, Result};
 use crate::events::EndpointEvent;
 use crate::recorder::WavRecorder;
@@ -35,6 +35,17 @@ fn err(e: impl Display) -> EndpointError { EndpointError::Other(e.to_string()) }
 
 // ─── Per-call context ────────────────────────────────────────────────────────
 
+/// Audio buffer thresholds in samples (16kHz), matching WebRTC C++ AudioSource exactly.
+///
+/// WebRTC uses queue_size_ms=1000 (default from Python SDK):
+/// - notify_threshold = queue_size_samples = 16000 (1 second)
+/// - buffer capacity = queue_size_samples + notify_threshold = 32000 (2 seconds)
+///
+/// When buffer > notify_threshold: send_audio blocks (callback deferred in WebRTC)
+/// When buffer >= capacity: frame rejected (WebRTC returns false)
+const AUDIO_BUF_NOTIFY_THRESHOLD: usize = 16000; // 1 second at 16kHz — backpressure kicks in
+const AUDIO_BUF_CAPACITY: usize = 32000;          // 2 seconds at 16kHz — hard reject limit
+
 struct CallContext {
     session: CallSession,
     rtp: Option<Arc<RtpTransport>>,
@@ -43,8 +54,12 @@ struct CallContext {
     muted: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     flush_flag: Arc<AtomicBool>,
-    held: Arc<AtomicBool>,  // SIP hold state — suppresses media timeout
+    held: Arc<AtomicBool>,
     playout_notify: Arc<(Mutex<bool>, Condvar)>,
+    /// Shared buffer level (samples) + condvar for backpressure.
+    /// send_audio blocks when buf_level > AUDIO_BUF_LIMIT_SAMPLES.
+    /// RTP send loop notifies after draining samples.
+    buf_level: Arc<(Mutex<usize>, Condvar)>,
     beep_detector: Arc<Mutex<Option<BeepDetector>>>,
     recorder: Option<WavRecorder>,
     cancel: CancellationToken,
@@ -64,6 +79,137 @@ struct EndpointState {
     contact_uri: Option<rsip::Uri>,
     local_addr: Option<SipAddr>,
     public_addr: Option<SocketAddr>,
+}
+
+// ─── Shared helpers ──────────────────────────────────────────────────────────
+
+/// Set up RTP transport: parse remote SDP, bind socket, create RtpTransport,
+/// start send/recv loops, wire channels into the CallContext.
+async fn setup_rtp(
+    ctx: &mut CallContext,
+    remote_sdp_bytes: &[u8],
+    codecs: &[crate::config::Codec],
+    public_addr: Option<SocketAddr>,
+    local_ip_str: &str,
+    etx: &Sender<EndpointEvent>,
+    call_id: i32,
+) -> Result<(String, SocketAddr)> {
+    let answer = sdp::parse_answer(remote_sdp_bytes, codecs)?;
+    let remote_rtp = SocketAddr::new(answer.remote_ip, answer.remote_port);
+
+    let rtp_sock = UdpSocket::bind("0.0.0.0:0").await.map_err(err)?;
+    let rtp_port = rtp_sock.local_addr().unwrap().port();
+    let ip = public_addr.map(|a| a.ip())
+        .unwrap_or_else(|| local_ip_str.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into()));
+    let local_sdp = sdp::build_offer(ip, rtp_port, codecs);
+
+    let dtmf_pt = answer.dtmf_payload_type.unwrap_or(crate::sip::rtp_transport::DEFAULT_DTMF_PT);
+    debug!("Call {} negotiated: codec={:?} dtmf_pt={} ptime={}ms remote_rtp={}", call_id, answer.codec, dtmf_pt, answer.ptime_ms, remote_rtp);
+    let rtp = Arc::new(RtpTransport::new(Arc::new(rtp_sock), remote_rtp, answer.codec, ctx.cancel.clone(), dtmf_pt, answer.ptime_ms));
+
+    let (otx, orx) = crossbeam_channel::bounded(18000);
+    let (itx, irx) = crossbeam_channel::bounded(18000);
+    rtp.start_send_loop(orx, ctx.muted.clone(), ctx.paused.clone(), ctx.flush_flag.clone(), ctx.playout_notify.clone(), ctx.buf_level.clone());
+    rtp.start_recv_loop(itx, etx.clone(), call_id, ctx.beep_detector.clone(), ctx.held.clone());
+
+    ctx.rtp = Some(rtp);
+    ctx.outgoing_tx = otx;
+    ctx.incoming_rx = irx;
+    ctx.session.state = CallState::Confirmed;
+    ctx.local_sdp = Some(local_sdp.clone());
+
+    let _ = etx.try_send(EndpointEvent::CallMediaActive { call_id });
+    Ok((local_sdp, remote_rtp))
+}
+
+/// Watch dialog state for remote BYE and emit CallTerminated.
+fn spawn_dialog_watcher(
+    mut dr: DialogStateReceiver,
+    call_id: i32,
+    st: Arc<Mutex<EndpointState>>,
+    etx: Sender<EndpointEvent>,
+    cc: CancellationToken,
+) {
+    tokio::spawn(async move {
+        while let Some(ds) = dr.recv().await {
+            if let DialogState::Terminated(_, reason) = ds {
+                info!("Call {} terminated by remote: {:?}", call_id, reason);
+                let sess = st.lock().unwrap().calls.remove(&call_id).map(|c| { c.cancel.cancel(); c.session });
+                if let Some(s) = sess { let _ = etx.try_send(EndpointEvent::CallTerminated { session: s, reason: format!("{:?}", reason) }); }
+                cc.cancel();
+                break;
+            }
+        }
+    });
+}
+
+/// Start session timer refresh (periodic Re-INVITE).
+fn start_session_timer(
+    session_expires: Option<u32>,
+    call_id: i32,
+    st: Arc<Mutex<EndpointState>>,
+    cc: CancellationToken,
+) {
+    let Some(secs) = session_expires else { return; };
+    let refresh = (secs / 2).max(30) as u64;
+    info!("Session timer: {}s (refresh every {}s)", secs, refresh);
+    let handle = tokio::runtime::Handle::current();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(refresh));
+            if cc.is_cancelled() { break; }
+            let s = st.lock().unwrap();
+            let Some(ctx) = s.calls.get(&call_id) else { break; };
+            let Some(ref sdp) = ctx.local_sdp else { break; };
+            let hdrs = vec![rsip::Header::Other("Content-Type".into(), "application/sdp".into())];
+            let body = sdp.clone().into_bytes();
+            if let Some(ref d) = ctx.client_dialog {
+                let _ = handle.block_on(d.reinvite(Some(hdrs), Some(body)));
+            } else if let Some(ref d) = ctx.server_dialog {
+                let _ = handle.block_on(d.reinvite(Some(hdrs), Some(body)));
+            }
+            drop(s);
+            debug!("Session timer refresh for call {}", call_id);
+        }
+    });
+}
+
+fn new_call_context(call_id: i32, direction: CallDirection, cc: CancellationToken) -> (CallContext, CallSession) {
+    let session = CallSession::new(call_id, direction);
+    let (otx, _orx) = crossbeam_channel::bounded(18000);
+    let (_itx, irx) = crossbeam_channel::bounded(18000);
+    let ctx = CallContext {
+        session: session.clone(), rtp: None, outgoing_tx: otx, incoming_rx: irx,
+        muted: Arc::new(AtomicBool::new(false)), paused: Arc::new(AtomicBool::new(false)),
+        flush_flag: Arc::new(AtomicBool::new(false)), playout_notify: Arc::new((Mutex::new(false), Condvar::new())),
+        held: Arc::new(AtomicBool::new(false)),
+        buf_level: Arc::new((Mutex::new(0usize), Condvar::new())),
+        beep_detector: Arc::new(Mutex::new(None)), recorder: None, cancel: cc,
+        client_dialog: None, server_dialog: None, local_sdp: None,
+    };
+    (ctx, session)
+}
+
+fn extract_x_headers(resp: &rsip::Response, session: &mut CallSession) {
+    for h in resp.headers().iter() { if let rsip::Header::Other(n, v) = h { if n.starts_with("X-") || n.starts_with("x-") { session.extra_headers.insert(n.clone(), v.clone()); } } }
+    if session.call_uuid.is_none() { session.call_uuid = session.extra_headers.get("X-CallUUID").or(session.extra_headers.get("X-Plivo-CallUUID")).cloned(); }
+}
+
+fn extract_x_headers_from_request(req: &rsip::Request, session: &mut CallSession) {
+    for h in req.headers().iter() { if let rsip::Header::Other(n, v) = h { if n.starts_with("X-") || n.starts_with("x-") { session.extra_headers.insert(n.clone(), v.clone()); } } }
+    if session.call_uuid.is_none() { session.call_uuid = session.extra_headers.get("X-CallUUID").or(session.extra_headers.get("X-Plivo-CallUUID")).cloned(); }
+}
+
+/// Parse Session-Expires header from SIP response.
+fn parse_session_expires(resp: &rsip::Response) -> Option<u32> {
+    for h in resp.headers().iter() {
+        if let rsip::Header::Other(n, v) = h {
+            if n.eq_ignore_ascii_case("Session-Expires") {
+                return v.split(';').next()?.trim().parse().ok();
+            }
+        }
+    }
+    None
 }
 
 // ─── SipEndpoint ─────────────────────────────────────────────────────────────
@@ -91,8 +237,7 @@ impl SipEndpoint {
         let (st, cc, etx2, lp, ua) = (state.clone(), cancel.clone(), etx.clone(), config.local_port, config.user_agent.clone());
         rt.block_on(async {
             let addr: SocketAddr = format!("0.0.0.0:{}", lp).parse().unwrap();
-            let udp = UdpConnection::create_connection(addr, None, Some(cc.clone())).await
-                .map_err(err)?;
+            let udp = UdpConnection::create_connection(addr, None, Some(cc.clone())).await.map_err(err)?;
             let la = udp.get_addr().clone();
             let tl = TransportLayer::new(cc.clone());
             tl.add_transport(udp.into());
@@ -142,8 +287,8 @@ impl SipEndpoint {
 
             let (ch, cp) = pa.map(|a| (a.ip().to_string(), a.port())).unwrap_or((la.addr.host.to_string(), la.addr.port.map(u16::from).unwrap_or(5060)));
             let contact_uri: rsip::Uri = format!("sip:{}@{}:{}", user, ch, cp).try_into().map_err(|e| err(format!("{:?}", e)))?;
-            let contact_hp: rsip::HostWithPort = format!("{}:{}", ch, cp).try_into().map_err(|e| err(format!("{:?}", e)))?;
-            let contact = Registration::create_nat_aware_contact(&user, Some(contact_hp), &la);
+            let _contact_hp: rsip::HostWithPort = format!("{}:{}", ch, cp).try_into().map_err(|e| err(format!("{:?}", e)))?;
+            let contact = Registration::create_nat_aware_contact(&user, Some(_contact_hp), &la);
             let mut reg = Registration::new(ei, Some(cred.clone()));
             reg.contact = Some(contact);
 
@@ -151,9 +296,8 @@ impl SipEndpoint {
             let resp = reg.register(server_uri.clone(), Some(exp)).await.map_err(err)?;
 
             if resp.status_code == rsip::StatusCode::OK {
-                // Use the NAT address discovered by rsipstack from rport/received (more accurate than STUN)
                 let discovered = reg.discovered_public_address();
-                let final_contact = if let Some(ref hp) = discovered {
+                let _final_contact = if let Some(ref hp) = discovered {
                     let h = hp.host.to_string();
                     let p = hp.port.as_ref().map(|p| u16::from(p.clone())).unwrap_or(cp);
                     info!("Registered {}@{} (NAT: {}:{})", user, srv, h, p);
@@ -166,7 +310,6 @@ impl SipEndpoint {
                     { let mut s = st.lock().unwrap(); s.registered = true; s.credential = Some(cred); s.contact_uri = Some(contact_uri.clone()); s.public_addr = pa; }
                     contact_uri
                 };
-                let _ = final_contact; // used via st.lock()
                 let _ = etx.try_send(EndpointEvent::Registered);
 
                 let re = reg.expires().max(50) as u64;
@@ -199,8 +342,10 @@ impl SipEndpoint {
 
     pub fn is_registered(&self) -> bool { self.state.lock().unwrap().registered }
 
+    // ─── Outbound call ───────────────────────────────────────────────────────
+
     pub fn call(&self, dest_uri: &str, headers: Option<HashMap<String, String>>) -> Result<i32> {
-        let (dest, cfg, st, etx, _cc) = (dest_uri.to_string(), self.config.clone(), self.state.clone(), self.event_tx.clone(), self.cancel.clone());
+        let (dest, cfg, st, etx) = (dest_uri.to_string(), self.config.clone(), self.state.clone(), self.event_tx.clone());
         self.runtime.block_on(async {
             let (dl, cred, contact, la, pa) = {
                 let s = st.lock().unwrap();
@@ -210,13 +355,13 @@ impl SipEndpoint {
                  s.local_addr.clone().ok_or(EndpointError::NotInitialized)?,
                  s.public_addr)
             };
+            let la_str = la.addr.host.to_string();
 
+            // SDP offer for the INVITE
             let rtp_sock = UdpSocket::bind("0.0.0.0:0").await.map_err(err)?;
             let rtp_port = rtp_sock.local_addr().unwrap().port();
-            let sdp_ip = pa.map(|a| a.ip()).unwrap_or_else(|| la.addr.host.to_string().parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into()));
-            debug!("Call setup: contact={} sdp_ip={} rtp_local_port={} public_addr={:?}", contact, sdp_ip, rtp_port, pa);
+            let sdp_ip = pa.map(|a| a.ip()).unwrap_or_else(|| la_str.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into()));
             let offer = sdp::build_offer(sdp_ip, rtp_port, &cfg.codecs);
-            let offer_sdp = offer.clone();
 
             let custom_hdrs = headers.map(|h| h.into_iter().map(|(k, v)| rsip::Header::Other(k, v)).collect());
             let callee: rsip::Uri = dest.clone().try_into().map_err(|e| err(format!("{:?}", e)))?;
@@ -226,116 +371,74 @@ impl SipEndpoint {
             let (dialog, resp) = dl.do_invite(opt, ds).await.map_err(err)?;
             let call_id = { let mut s = st.lock().unwrap(); let id = s.next_call_id; s.next_call_id += 1; id };
 
-            let mut session = CallSession::new(call_id, CallDirection::Outbound);
-            session.remote_uri = dest;
-
             let resp = resp.ok_or_else(|| EndpointError::Other("no response".into()))?;
             let sc = resp.status_code.clone();
             if sc != rsip::StatusCode::OK {
                 let e = format!("SIP {}", sc);
-                let _ = etx.try_send(EndpointEvent::CallTerminated { session, reason: e.clone() });
+                let _ = etx.try_send(EndpointEvent::CallTerminated { session: CallSession::new(call_id, CallDirection::Outbound), reason: e.clone() });
                 return Err(EndpointError::Sip { code: u16::from(sc) as i32, message: e });
             }
 
-            let answer = sdp::parse_answer(resp.body(), &cfg.codecs)?;
-            let remote_rtp = SocketAddr::new(answer.remote_ip, answer.remote_port);
-            extract_x_headers(&resp, &mut session);
-            session.state = CallState::Confirmed;
-
             let cc = CancellationToken::new();
-            let dtmf_pt = answer.dtmf_payload_type.unwrap_or(crate::sip::rtp_transport::DEFAULT_DTMF_PT);
-            debug!("Call negotiated: codec={:?} dtmf_pt={} ptime={}ms remote_rtp={}", answer.codec, dtmf_pt, answer.ptime_ms, remote_rtp);
-            let rtp = Arc::new(RtpTransport::new(Arc::new(rtp_sock), remote_rtp, answer.codec, cc.clone(), dtmf_pt, answer.ptime_ms));
-            let (otx, orx) = crossbeam_channel::bounded(18000);
-            let (itx, irx) = crossbeam_channel::bounded(18000);
-            let (m, p, f, pn, bd) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new((Mutex::new(false), Condvar::new())), Arc::new(Mutex::new(None)));
-            let held = Arc::new(AtomicBool::new(false));
+            let (mut ctx, mut session) = new_call_context(call_id, CallDirection::Outbound, cc.clone());
+            session.remote_uri = dest;
+            extract_x_headers(&resp, &mut session);
+            ctx.session = session.clone();
+            ctx.client_dialog = Some(dialog);
 
-            rtp.start_send_loop(orx, m.clone(), p.clone(), f.clone(), pn.clone());
-            rtp.start_recv_loop(itx, etx.clone(), call_id, bd.clone(), held.clone());
-            let _ = etx.try_send(EndpointEvent::CallMediaActive { call_id });
+            // Set up RTP (shared with inbound)
+            let (_, remote_rtp) = setup_rtp(&mut ctx, resp.body(), &cfg.codecs, pa, &la_str, &etx, call_id).await?;
 
-            // Watch dialog state for remote BYE
-            let (etx2, st2, cc2) = (etx.clone(), st.clone(), cc.clone());
-            tokio::spawn(async move {
-                let mut dr = dr;
-                while let Some(ds) = dr.recv().await {
-                    debug!("Dialog state change call {}", call_id);
-                    if let DialogState::Terminated(_, reason) = ds {
-                        info!("Call {} terminated by remote: {:?}", call_id, reason);
-                        let sess = st2.lock().unwrap().calls.remove(&call_id).map(|c| { c.cancel.cancel(); c.session });
-                        if let Some(s) = sess { let _ = etx2.try_send(EndpointEvent::CallTerminated { session: s, reason: format!("{:?}", reason) }); }
-                        cc2.cancel();
-                        break;
-                    }
-                }
-            });
+            // Watch for remote BYE
+            spawn_dialog_watcher(dr, call_id, st.clone(), etx.clone(), cc.clone());
 
-            // Parse Session-Expires from 200 OK for session timer refresh
+            // Session timer
             let session_expires = parse_session_expires(&resp);
 
-            st.lock().unwrap().calls.insert(call_id, CallContext {
-                session: session.clone(), rtp: Some(rtp), outgoing_tx: otx, incoming_rx: irx,
-                muted: m, paused: p, flush_flag: f, held, playout_notify: pn, beep_detector: bd,
-                recorder: None, cancel: cc.clone(), client_dialog: Some(dialog), server_dialog: None,
-                local_sdp: Some(offer_sdp),
-            });
+            st.lock().unwrap().calls.insert(call_id, ctx);
             let _ = etx.try_send(EndpointEvent::CallStateChanged { session });
             info!("Call {} connected to {}", call_id, remote_rtp);
 
-            // Session timer: send periodic re-INVITE to keep session alive.
-            // Runs on a tokio spawn_blocking thread to avoid Send issues with MutexGuard.
-            if let Some(secs) = session_expires {
-                let refresh = (secs / 2).max(30) as u64;
-                info!("Session timer: {}s (refresh every {}s)", secs, refresh);
-                let st3 = st.clone();
-                let cc3 = cc;
-                let handle = tokio::runtime::Handle::current();
-                std::thread::spawn(move || {
-                    loop {
-                        std::thread::sleep(std::time::Duration::from_secs(refresh));
-                        if cc3.is_cancelled() { break; }
-                        let s = st3.lock().unwrap();
-                        let Some(ctx) = s.calls.get(&call_id) else { break; };
-                        let Some(ref sdp) = ctx.local_sdp else { break; };
-                        let hdrs = vec![rsip::Header::Other("Content-Type".into(), "application/sdp".into())];
-                        let body = sdp.clone().into_bytes();
-                        if let Some(ref d) = ctx.client_dialog {
-                            let _ = handle.block_on(d.reinvite(Some(hdrs), Some(body)));
-                        } else if let Some(ref d) = ctx.server_dialog {
-                            let _ = handle.block_on(d.reinvite(Some(hdrs), Some(body)));
-                        }
-                        drop(s);
-                        debug!("Session timer refresh for call {}", call_id);
-                    }
-                });
-            }
+            start_session_timer(session_expires, call_id, st.clone(), cc);
             Ok(call_id)
         })
     }
+
+    // ─── Inbound answer ──────────────────────────────────────────────────────
 
     pub fn answer(&self, call_id: i32, code: u16) -> Result<()> {
         let (cfg, st, etx) = (self.config.clone(), self.state.clone(), self.event_tx.clone());
         self.runtime.block_on(async {
             let (pa, la_str) = { let s = st.lock().unwrap(); (s.public_addr, s.local_addr.as_ref().map(|a| a.addr.host.to_string()).unwrap_or("0.0.0.0".into())) };
-            let mut s = st.lock().unwrap();
-            let ctx = s.calls.get_mut(&call_id).ok_or(EndpointError::CallNotActive(call_id))?;
-            if let Some(ref d) = ctx.server_dialog {
-                if code >= 200 && code < 300 {
-                    let rtp_sock = UdpSocket::bind("0.0.0.0:0").await.map_err(err)?;
-                    let rtp_port = rtp_sock.local_addr().unwrap().port();
-                    let ip = pa.map(|a| a.ip()).unwrap_or_else(|| la_str.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into()));
-                    let body = sdp::build_offer(ip, rtp_port, &cfg.codecs);
-                    d.accept(None, Some(body.into_bytes())).map_err(err)?;
-                    ctx.session.state = CallState::Confirmed;
-                    let _ = etx.try_send(EndpointEvent::CallMediaActive { call_id });
+
+            let cancel = {
+                let mut s = st.lock().unwrap();
+                let ctx = s.calls.get_mut(&call_id).ok_or(EndpointError::CallNotActive(call_id))?;
+
+                if ctx.server_dialog.is_none() {
+                    error!("answer: no server_dialog for call {}", call_id);
+                    None
                 } else if code >= 100 && code < 200 {
-                    d.ringing(None, None).map_err(err)?;
-                }
+                    ctx.server_dialog.as_ref().unwrap().ringing(None, None).map_err(err)?;
+                    None
+                } else if code >= 200 && code < 300 {
+                    let remote_sdp = ctx.server_dialog.as_ref().unwrap().initial_request().body().to_vec();
+                    let (local_sdp, remote_rtp) = setup_rtp(ctx, &remote_sdp, &cfg.codecs, pa, &la_str, &etx, call_id).await?;
+                    ctx.server_dialog.as_ref().unwrap().accept(None, Some(local_sdp.into_bytes())).map_err(err)?;
+                    info!("Inbound call {} connected to {}", call_id, remote_rtp);
+                    Some(ctx.cancel.clone())
+                } else { None }
+            }; // MutexGuard dropped here
+
+            // Session timer (outside the lock)
+            if let Some(cc) = cancel {
+                start_session_timer(None, call_id, st, cc);
             }
             Ok(())
         })
     }
+
+    // ─── Call control ────────────────────────────────────────────────────────
 
     pub fn reject(&self, call_id: i32, code: u16) -> Result<()> {
         let mut s = self.state.lock().unwrap();
@@ -378,14 +481,13 @@ impl SipEndpoint {
                         if let Some(ref dl) = ctx.client_dialog { let _ = dl.info(Some(hdrs), Some(body.into_bytes())).await; }
                         else if let Some(ref dl) = ctx.server_dialog { let _ = dl.info(Some(hdrs), Some(body.into_bytes())).await; }
                     }
-                    _ => { if let Some(ref rtp) = ctx.rtp { let _ = rtp.send_dtmf_event(d, 200).await; } } // 200ms duration
+                    _ => { if let Some(ref rtp) = ctx.rtp { let _ = rtp.send_dtmf_event(d, 200).await; } }
                 }
             }
             Ok(())
         })
     }
 
-    /// Send a SIP INFO message with JSON body (for OutputTransportMessageFrame support).
     pub fn send_info(&self, call_id: i32, content_type: &str, body: &str) -> Result<()> {
         let st = self.state.clone();
         let ct = content_type.to_string();
@@ -416,14 +518,12 @@ impl SipEndpoint {
         Err(EndpointError::Other("attended transfer not supported".into()))
     }
 
-    /// SIP hold — send Re-INVITE with a=sendonly SDP. Remote side stops sending.
-    /// No-op if already held.
     pub fn hold(&self, call_id: i32) -> Result<()> {
         let st = self.state.clone();
         self.runtime.block_on(async {
             let s = st.lock().unwrap();
             let ctx = s.calls.get(&call_id).ok_or(EndpointError::CallNotActive(call_id))?;
-            if ctx.held.load(Ordering::Relaxed) { return Ok(()); } // Already held
+            if ctx.held.load(Ordering::Relaxed) { return Ok(()); }
             let sdp = ctx.local_sdp.as_ref().ok_or(EndpointError::Other("no SDP".into()))?
                 .replace("a=sendrecv", "a=sendonly");
             let hdrs = vec![rsip::Header::Other("Content-Type".into(), "application/sdp".into())];
@@ -435,14 +535,12 @@ impl SipEndpoint {
         })
     }
 
-    /// SIP unhold — send Re-INVITE with a=sendrecv SDP. Resume bidirectional audio.
-    /// No-op if not held.
     pub fn unhold(&self, call_id: i32) -> Result<()> {
         let st = self.state.clone();
         self.runtime.block_on(async {
             let s = st.lock().unwrap();
             let ctx = s.calls.get(&call_id).ok_or(EndpointError::CallNotActive(call_id))?;
-            if !ctx.held.load(Ordering::Relaxed) { return Ok(()); } // Not held
+            if !ctx.held.load(Ordering::Relaxed) { return Ok(()); }
             let sdp = ctx.local_sdp.as_ref().ok_or(EndpointError::Other("no SDP".into()))?
                 .replace("a=sendonly", "a=sendrecv")
                 .replace("a=inactive", "a=sendrecv");
@@ -455,7 +553,7 @@ impl SipEndpoint {
         })
     }
 
-    // ─── Audio control (thin wrappers on atomic flags) ───────────────────────
+    // ─── Audio control ───────────────────────────────────────────────────────
 
     fn with_call<F, R>(&self, call_id: i32, f: F) -> Result<R> where F: FnOnce(&CallContext) -> R {
         let s = self.state.lock().unwrap();
@@ -471,9 +569,7 @@ impl SipEndpoint {
 
     pub fn mute(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| c.muted.store(true, Ordering::Relaxed)) }
     pub fn unmute(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| c.muted.store(false, Ordering::Relaxed)) }
-    pub fn pause(&self, call_id: i32) -> Result<()> {
-        self.with_call(call_id, |c| c.paused.store(true, Ordering::Relaxed))
-    }
+    pub fn pause(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| c.paused.store(true, Ordering::Relaxed)) }
     pub fn resume(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| c.paused.store(false, Ordering::Relaxed)) }
     pub fn flush(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| { if let Ok(mut d) = c.playout_notify.0.lock() { *d = false; } }) }
     pub fn clear_buffer(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| c.flush_flag.store(true, Ordering::Relaxed)) }
@@ -487,31 +583,66 @@ impl SipEndpoint {
     }
 
     pub fn send_audio(&self, call_id: i32, frame: &AudioFrame) -> Result<()> {
-        self.with_call(call_id, |c| c.outgoing_tx.try_send(frame.data.clone()).map_err(|_| EndpointError::Other("buffer full".into())))?
+        // Extract what we need from the state lock, then release it BEFORE blocking.
+        // This avoids deadlocking other operations (queued_frames, recv_audio, etc.)
+        // that also need the state lock.
+        let (buf_level, otx) = {
+            let s = self.state.lock().unwrap();
+            let ctx = s.calls.get(&call_id).ok_or(EndpointError::CallNotActive(call_id))?;
+            (ctx.buf_level.clone(), ctx.outgoing_tx.clone())
+        };
+
+        let (lock, cvar) = &*buf_level;
+
+        // Check hard capacity limit (WebRTC returns false = frame rejected)
+        {
+            let level = lock.lock().unwrap();
+            if *level + frame.data.len() >= AUDIO_BUF_CAPACITY {
+                return Err(EndpointError::Other("buffer full".into()));
+            }
+        }
+
+        // Backpressure: if buffer > notify_threshold, block until it drains.
+        {
+            let guard = lock.lock().unwrap();
+            if *guard > AUDIO_BUF_NOTIFY_THRESHOLD {
+                debug!("send_audio: backpressure active, buf_level={}, waiting...", *guard);
+                let _guard = cvar.wait_timeout_while(
+                    guard,
+                    std::time::Duration::from_secs(5),
+                    |level| *level > AUDIO_BUF_NOTIFY_THRESHOLD,
+                ).unwrap();
+                debug!("send_audio: backpressure released, buf_level={}", *_guard.0);
+            }
+        }
+
+        // Update buffer level with the new samples
+        {
+            let mut level = lock.lock().unwrap();
+            *level += frame.data.len();
+        }
+
+        otx.try_send(frame.data.clone())
+            .map_err(|_| EndpointError::Other("channel full".into()))
     }
 
     pub fn recv_audio(&self, call_id: i32) -> Result<Option<AudioFrame>> {
         self.with_call(call_id, |c| c.incoming_rx.try_recv().ok())
     }
 
-    /// Receive audio frame, blocking until one is available or timeout.
-    /// Use this instead of polling recv_audio() in a loop — avoids Python GIL contention.
     pub fn recv_audio_blocking(&self, call_id: i32, timeout_ms: u64) -> Result<Option<AudioFrame>> {
         let rx = self.with_call(call_id, |c| c.incoming_rx.clone())?;
         Ok(rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)).ok())
     }
 
-    /// Get the incoming audio receiver for async operations (used by Node.js async tasks).
     pub fn incoming_rx(&self, call_id: i32) -> Result<Receiver<AudioFrame>> {
         self.with_call(call_id, |c| c.incoming_rx.clone())
     }
 
-    /// Get the playout notify handle for async operations (used by Node.js async tasks).
     pub fn playout_notify(&self, call_id: i32) -> Result<Arc<(Mutex<bool>, Condvar)>> {
         self.with_call(call_id, |c| c.playout_notify.clone())
     }
 
-    /// Number of audio frames queued for sending (outgoing buffer depth).
     pub fn queued_frames(&self, call_id: i32) -> Result<usize> {
         self.with_call(call_id, |c| c.outgoing_tx.len())
     }
@@ -556,7 +687,7 @@ impl SipEndpoint {
 
 impl Drop for SipEndpoint { fn drop(&mut self) { let _ = self.shutdown(); } }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Incoming call handler ───────────────────────────────────────────────────
 
 async fn handle_incoming(dl: &Arc<DialogLayer>, st: &Arc<Mutex<EndpointState>>, etx: &Sender<EndpointEvent>, tx: rsipstack::transaction::transaction::Transaction) {
     let (ds, dr) = dl.new_dialog_state_channel();
@@ -564,57 +695,38 @@ async fn handle_incoming(dl: &Arc<DialogLayer>, st: &Arc<Mutex<EndpointState>>, 
     let contact = st.lock().unwrap().contact_uri.clone();
     let dialog = match dl.get_or_create_server_invite(&tx, ds, cred, contact) { Ok(d) => d, Err(e) => { error!("server invite: {}", e); return; } };
 
+    // Send 180 Ringing to keep the transaction alive until Python calls answer()
+    if let Err(e) = dialog.ringing(None, None) { error!("failed to send ringing: {}", e); return; }
+
     let call_id = { let mut s = st.lock().unwrap(); let id = s.next_call_id; s.next_call_id += 1; id };
-    let mut session = CallSession::new(call_id, CallDirection::Inbound);
+    let cc = CancellationToken::new();
+    let (mut ctx, mut session) = new_call_context(call_id, CallDirection::Inbound, cc.clone());
 
     let req = dialog.initial_request();
     if let Ok(from) = req.from_header() { session.remote_uri = from.to_string(); }
-    for h in req.headers().iter() { if let rsip::Header::Other(n, v) = h { if n.starts_with("X-") || n.starts_with("x-") { session.extra_headers.insert(n.clone(), v.clone()); } } }
-    if let Some(u) = session.extra_headers.get("X-CallUUID").or(session.extra_headers.get("X-Plivo-CallUUID")) { session.call_uuid = Some(u.clone()); }
+    extract_x_headers_from_request(&req, &mut session);
+    ctx.session = session.clone();
+    ctx.server_dialog = Some(dialog);
 
     info!("Incoming call {} from {} (uuid={:?})", call_id, session.remote_uri, session.call_uuid);
-    let cc = CancellationToken::new();
-    let (otx, _orx) = crossbeam_channel::bounded(18000);
-    let (_itx, irx) = crossbeam_channel::bounded(18000);
-    st.lock().unwrap().calls.insert(call_id, CallContext {
-        session: session.clone(), rtp: None, outgoing_tx: otx, incoming_rx: irx,
-        muted: Arc::new(AtomicBool::new(false)), paused: Arc::new(AtomicBool::new(false)),
-        flush_flag: Arc::new(AtomicBool::new(false)), playout_notify: Arc::new((Mutex::new(false), Condvar::new())),
-        held: Arc::new(AtomicBool::new(false)),
-        beep_detector: Arc::new(Mutex::new(None)), recorder: None, cancel: cc.clone(),
-        client_dialog: None, server_dialog: Some(dialog), local_sdp: None,
+
+    st.lock().unwrap().calls.insert(call_id, ctx);
+
+    // Spawn the transaction receive loop — keeps tu_receiver alive so
+    // dialog can send responses (180 Ringing, 200 OK) via tu_sender.
+    let cc3 = cc.clone();
+    tokio::spawn(async move {
+        let mut tx = tx;
+        loop {
+            tokio::select! {
+                msg = tx.receive() => { if msg.is_none() { break; } }
+                _ = cc3.cancelled() => { break; }
+            }
+        }
     });
+
     let _ = etx.try_send(EndpointEvent::IncomingCall { session });
 
-    // Watch dialog state for remote BYE (same as outbound call path)
-    let (etx2, st2, cc2) = (etx.clone(), st.clone(), cc);
-    tokio::spawn(async move {
-        let mut dr = dr;
-        while let Some(ds) = dr.recv().await {
-            if let DialogState::Terminated(_, reason) = ds {
-                let sess = st2.lock().unwrap().calls.remove(&call_id).map(|c| { c.cancel.cancel(); c.session });
-                if let Some(s) = sess { let _ = etx2.try_send(EndpointEvent::CallTerminated { session: s, reason: format!("{:?}", reason) }); }
-                cc2.cancel();
-                break;
-            }
-        }
-    });
-}
-
-fn extract_x_headers(resp: &rsip::Response, session: &mut CallSession) {
-    for h in resp.headers().iter() { if let rsip::Header::Other(n, v) = h { if n.starts_with("X-") || n.starts_with("x-") { session.extra_headers.insert(n.clone(), v.clone()); } } }
-    if session.call_uuid.is_none() { session.call_uuid = session.extra_headers.get("X-CallUUID").or(session.extra_headers.get("X-Plivo-CallUUID")).cloned(); }
-}
-
-/// Parse Session-Expires header from SIP response.
-/// Format: "Session-Expires: 1800" or "Session-Expires: 1800;refresher=uac"
-fn parse_session_expires(resp: &rsip::Response) -> Option<u32> {
-    for h in resp.headers().iter() {
-        if let rsip::Header::Other(n, v) = h {
-            if n.eq_ignore_ascii_case("Session-Expires") {
-                return v.split(';').next()?.trim().parse().ok();
-            }
-        }
-    }
-    None
+    // Watch dialog state for remote BYE (same helper as outbound)
+    spawn_dialog_watcher(dr, call_id, st.clone(), etx.clone(), cc);
 }

@@ -47,6 +47,9 @@ comfort-noise = []
 audio-processing = ["jitter-buffer", "plc", "comfort-noise"]
 audio-stream = ["tokio-tungstenite", "serde", "serde_json", "base64", "reqwest", "futures-util"]
 
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 tracing-subscriber = "0.3"
 anyhow.workspace = true

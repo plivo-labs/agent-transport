@@ -1,29 +1,14 @@
 # Agent Transport
 
-Transport library (SIP/RTP & Audio Streaming) for voice AI agents to be used with frameworks like [LiveKit Agents](https://docs.livekit.io/agents/) and [Pipecat](https://github.com/pipecat-ai/pipecat). 
+Transport library (SIP/RTP & Audio Streaming) for voice AI agents to be used with frameworks like [LiveKit Agents](https://github.com/livekit/agents/) and [Pipecat](https://github.com/pipecat-ai/pipecat). 
 
 Agent Transport provides signaling and media primitives that AI agent frameworks need to make and receive voice calls. The core is written in Rust for efficient, low-jitter packet processing — audio pacing, RTP handling, and jitter buffering. Framework adapters for LiveKit Agents and Pipecat are provided as drop-in plugins. Bindings in Python and TypeScript/Node.js are also available for other use cases.
 
 ## Transports
 
-### SIP/RTP
+**SIP/RTP** — Register with any SIP provider, make and receive calls over RTP. G.711 codecs (PCMU/PCMA), DTMF (RFC 2833), NAT traversal (STUN, rport), hold/unhold, call transfer. No media server required.
 
-Register with a SIP provider as an endpoint, make and receive calls, and exchange audio directly over RTP — no cloud or media server required.
-
-- SIP registration and call control (INVITE, BYE, Re-INVITE for hold/unhold)
-- Codec support: PCMU, PCMA
-- DTMF send/receive (RFC 2833)
-- NAT traversal: STUN, rport
-- Session timers and call transfer
-
-### Audio Streaming (Plivo)
-
-Receive and send audio over WebSocket audio streaming interface.
-
-- WebSocket server that connects to a telephony cloud on call start
-- Receives mu-law audio, converts to int16 PCM 16kHz mono
-- Sends audio back over the same WebSocket connection
-- Suitable for cloud telephony providers that support audio streaming like [Plivo](https://plivo.com)
+**Audio Streaming** — WebSocket server for cloud telephony providers like [Plivo](https://plivo.com) that support bidirectional audio streaming.
 
 Both transports produce and consume the same `AudioFrame` format (int16 PCM, 16kHz mono), so agent code works identically regardless of transport.
 
@@ -31,21 +16,29 @@ Both transports produce and consume the same `AudioFrame` format (int16 PCM, 16k
 
 ### LiveKit Agents
 
-Drop-in replacements for LiveKit's `RoomAudioInput` / `RoomAudioOutput`:
+Drop-in replacements for `RoomAudioInput` / `RoomAudioOutput` — no LiveKit server or WebRTC needed:
 
-- **`SipAudioInput` / `SipAudioOutput`** — connect a LiveKit `AgentSession` to a SIP call over direct RTP
-- **`PlivoAudioStreamInput` / `PlivoAudioStreamOutput`** — connect a LiveKit `AgentSession` to a Plivo audio stream
+```python
+# SIP/RTP
+session.input.audio = SipAudioInput(ep, call_id)
+session.output.audio = SipAudioOutput(ep, call_id)
 
-No LiveKit server, cloud, room, or WebRTC connection needed. Plug directly into `VoicePipelineAgent`.
+# Plivo Audio Streaming
+session.input.audio = AudioStreamInput(ep, session_id)
+session.output.audio = AudioStreamOutput(ep, session_id)
+```
 
 ### Pipecat
 
-Drop-in replacements for Pipecat's `WebsocketServerTransport`:
+Drop-in replacements for `WebsocketServerTransport`:
 
-- **`SipTransport`** — full Pipecat `BaseTransport` over SIP/RTP
-- **`PlivoAudioStreamTransport`** — full Pipecat `BaseTransport` over Plivo WebSocket
+```python
+# SIP/RTP
+transport = SipTransport(ep, call_id, params=TransportParams(...))
 
-Includes input/output processors, interruption handling, and bot speaking state — all standard Pipecat transport features. 
+# Plivo Audio Streaming
+transport = AudioStreamTransport(ep, session_id, params=TransportParams(...))
+```
 
 ## Installation
 

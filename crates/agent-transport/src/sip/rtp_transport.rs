@@ -19,6 +19,7 @@ use beep_detector::{BeepDetector, BeepDetectorResult};
 use crate::audio::AudioFrame;
 use crate::config::Codec;
 use crate::sip::dtmf;
+use crate::sip::resampler::Resampler;
 use crate::events::EndpointEvent;
 
 pub(crate) const DEFAULT_DTMF_PT: u8 = 101;
@@ -66,43 +67,103 @@ impl RtpTransport {
         Ok(())
     }
 
-    pub fn start_send_loop(self: &Arc<Self>, rx: Receiver<Vec<i16>>, muted: Arc<AtomicBool>, paused: Arc<AtomicBool>, flush: Arc<AtomicBool>, playout: Arc<(Mutex<bool>, Condvar)>) -> tokio::task::JoinHandle<()> {
+    pub fn start_send_loop(self: &Arc<Self>, rx: Receiver<Vec<i16>>, muted: Arc<AtomicBool>, paused: Arc<AtomicBool>, flush: Arc<AtomicBool>, playout: Arc<(Mutex<bool>, Condvar)>, buf_level: Arc<(Mutex<usize>, Condvar)>) -> tokio::task::JoinHandle<()> {
         let t = Arc::clone(self);
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(Duration::from_millis(t.ptime_ms as u64));
             let (sil, spf) = (t.codec.silence_byte(), t.spf());
+            // spf = samples per frame at 8kHz (160 for 20ms ptime)
+            // Input is 16kHz, so we need 2x samples per frame from the input
+            let input_spf = (spf * 2) as usize; // 320 samples at 16kHz = 20ms
             let mut first = true;
             let mut pkt_count = 0u32;
             let mut octet_count = 0u32;
             let mut rtcp_iv = tokio::time::interval(Duration::from_secs(5));
-            rtcp_iv.tick().await; // skip first tick
+            rtcp_iv.tick().await;
+            let mut downsampler = Resampler::new_voip(16000, 8000);
+
+            // Internal buffer: accumulates incoming samples (16kHz) and drains
+            // exactly input_spf (320) samples per ptime tick.
+            // This matches WebRTC C++ AudioSource's internal buffer behavior.
+            let mut pcm_buf: Vec<i16> = Vec::new();
 
             loop {
                 tokio::select! {
                     _ = t.cancel.cancelled() => break,
                     _ = rtcp_iv.tick() => {
-                        // Send RTCP Sender Report + log stats every 5 seconds
                         let ts = t.timestamp.load(Ordering::Relaxed);
                         let sr = super::rtcp::build_sender_report(t.ssrc, ts, pkt_count, octet_count);
                         let _ = t.socket.send_to(&sr, t.remote()).await;
                         let queued = rx.len();
-                        debug!("RTP TX: pkts={} octets={} queued={} codec={:?} remote={}", pkt_count, octet_count, queued, t.codec, t.remote());
+                        let buf_ms = (pcm_buf.len() as u32 * 1000) / 16000;
+                        debug!("RTP TX: pkts={} octets={} queued={} buf={}ms codec={:?} remote={}", pkt_count, octet_count, queued, buf_ms, t.codec, t.remote());
                     }
                     _ = iv.tick() => {}
                 }
+
+                // Drain incoming frames from crossbeam channel into pcm_buf
+                while let Ok(s) = rx.try_recv() {
+                    pcm_buf.extend_from_slice(&s);
+                }
+                // Update shared buffer level so send_audio can backpressure
+                {
+                    let mut level = buf_level.0.lock().unwrap();
+                    *level = pcm_buf.len();
+                    buf_level.1.notify_all(); // wake any blocked send_audio calls
+                }
+
                 let ts = t.timestamp.fetch_add(spf, Ordering::Relaxed);
-                if flush.swap(false, Ordering::Relaxed) { while rx.try_recv().is_ok() {} notify(&playout); first = true; continue; }
-                if paused.load(Ordering::Relaxed) { let _ = t.send(t.codec.payload_type(), ts, false, vec![sil; spf as usize]).await; pkt_count += 1; octet_count += spf; continue; }
-                match rx.try_recv() {
-                    Ok(s) if !muted.load(Ordering::Relaxed) => {
+
+                if flush.swap(false, Ordering::Relaxed) {
+                    pcm_buf.clear();
+                    while rx.try_recv().is_ok() {}
+                    // Reset buffer level and wake blocked senders
+                    { let mut level = buf_level.0.lock().unwrap(); *level = 0; buf_level.1.notify_all(); }
+                    notify(&playout);
+                    first = true;
+                    continue;
+                }
+
+                if paused.load(Ordering::Relaxed) {
+                    let _ = t.send(t.codec.payload_type(), ts, false, vec![sil; spf as usize]).await;
+                    pkt_count += 1; octet_count += spf;
+                    continue;
+                }
+
+                if pcm_buf.len() >= input_spf {
+                    if !muted.load(Ordering::Relaxed) {
                         let m = first; first = false;
-                        let encoded = t.codec.encode(&s.iter().step_by(2).copied().collect::<Vec<_>>());
+                        // Take exactly input_spf samples (20ms at 16kHz)
+                        let chunk: Vec<i16> = pcm_buf.drain(..input_spf).collect();
+                        // Downsample 16kHz→8kHz via speexdsp
+                        let samples_8k = if let Some(ref mut ds) = downsampler {
+                            ds.process(&chunk).to_vec()
+                        } else {
+                            chunk
+                        };
+                        let encoded = t.codec.encode(&samples_8k);
                         octet_count += encoded.len() as u32;
                         let _ = t.send(t.codec.payload_type(), ts, m, encoded).await;
                         pkt_count += 1;
+                    } else {
+                        pcm_buf.drain(..input_spf);
+                        let _ = t.send(t.codec.payload_type(), ts, false, vec![sil; spf as usize]).await;
+                        pkt_count += 1; octet_count += spf;
                     }
-                    Ok(_) => { let _ = t.send(t.codec.payload_type(), ts, false, vec![sil; spf as usize]).await; pkt_count += 1; octet_count += spf; }
-                    Err(_) => { notify(&playout); first = true; let _ = t.send(t.codec.payload_type(), ts, false, vec![sil; spf as usize]).await; pkt_count += 1; octet_count += spf; }
+                    // Update buffer level after draining — notify blocked senders
+                    {
+                        let mut level = buf_level.0.lock().unwrap();
+                        *level = pcm_buf.len();
+                        buf_level.1.notify_all();
+                    }
+                } else {
+                    // Buffer doesn't have a full frame — send silence, notify playout if channel empty
+                    if rx.is_empty() && pcm_buf.is_empty() {
+                        notify(&playout);
+                        first = true;
+                    }
+                    let _ = t.send(t.codec.payload_type(), ts, false, vec![sil; spf as usize]).await;
+                    pkt_count += 1; octet_count += spf;
                 }
             }
         })
@@ -116,6 +177,8 @@ impl RtpTransport {
             let mut ka = tokio::time::interval(NAT_KEEPALIVE);
             let (mut dtmf_ev, mut dtmf_timer): (Option<u8>, Option<Instant>) = (None, None);
             let (mut rx_pkts, mut rx_log_time) = (0u32, Instant::now());
+            // speexdsp resampler: 8kHz→16kHz (same approach as FreeSWITCH)
+            let mut upsampler = Resampler::new_voip(8000, 16000);
 
             loop {
                 tokio::select! {
@@ -165,10 +228,13 @@ impl RtpTransport {
                         if let Some(ev) = dtmf_ev { if dtmf_timer.map(|t| t.elapsed() > DTMF_END_TIMEOUT).unwrap_or(false) { if let Some(d) = dtmf::event_to_digit(ev) { warn!("DTMF END timeout: {}", d); let _ = etx.try_send(EndpointEvent::DtmfReceived { call_id: cid, digit: d, method: "rfc2833".into() }); } dtmf_ev = None; dtmf_timer = None; } }
                         if pkt.header.payload_type != t.codec.payload_type() { continue; }
 
-                        // Decode + upsample (8k->16k inline)
+                        // Decode G.711, then upsample 8kHz→16kHz via speexdsp
                         let s8 = t.codec.decode(&pkt.payload);
-                        let mut pcm = Vec::with_capacity(s8.len() * 2);
-                        for i in 0..s8.len() { pcm.push(s8[i]); let n = if i + 1 < s8.len() { s8[i + 1] } else { s8[i] }; pcm.push(((s8[i] as i32 + n as i32) / 2) as i16); }
+                        let pcm = if let Some(ref mut us) = upsampler {
+                            us.process(&s8).to_vec()
+                        } else {
+                            s8 // same rate — no resampling
+                        };
 
                         // Beep detector
                         if let Ok(mut g) = bd.lock() { if let Some(ref mut det) = *g {

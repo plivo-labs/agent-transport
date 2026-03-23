@@ -443,18 +443,20 @@ impl SipEndpoint {
         py.allow_threads(move || inner.unhold(call_id)).map_err(py_err)
     }
 
-    /// Send an audio frame.
-    fn send_audio(&self, call_id: i32, frame: &AudioFrame) -> PyResult<()> {
-        self.inner
-            .send_audio(call_id, &frame.to_rust())
+    /// Send an audio frame. Releases GIL since Rust may block for backpressure.
+    fn send_audio(&self, py: Python, call_id: i32, frame: &AudioFrame) -> PyResult<()> {
+        let inner = &self.inner;
+        let f = frame.to_rust();
+        py.allow_threads(move || inner.send_audio(call_id, &f))
             .map_err(py_err)
     }
 
     /// Send raw PCM bytes (little-endian int16) directly. No Python list conversion.
-    /// Use this from Pipecat/LiveKit adapters for zero-copy performance.
-    fn send_audio_bytes(&self, call_id: i32, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
+    /// Releases GIL since Rust may block for backpressure (matching WebRTC C++ behavior).
+    fn send_audio_bytes(&self, py: Python, call_id: i32, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
         let frame = RustAudioFrame::from_bytes(audio, sample_rate, num_channels);
-        self.inner.send_audio(call_id, &frame).map_err(py_err)
+        let inner = &self.inner;
+        py.allow_threads(move || inner.send_audio(call_id, &frame)).map_err(py_err)
     }
 
     /// Receive an audio frame (non-blocking, returns None if no frame ready).

@@ -36,3 +36,4 @@ pjproject/pjlib/include/pj/config_site.h
 .env
 .DS_Store
 audio/temp/
+testing/
