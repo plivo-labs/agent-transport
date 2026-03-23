@@ -28,7 +28,7 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     let ep = SipEndpoint::new(config)?;
-    println!("  PASS: Agent endpoint initialized");
+    println!("  PASS: Agent transport initialized");
 
     println!("--- Test 2: Register ---");
     ep.register(&username, &password)?;
