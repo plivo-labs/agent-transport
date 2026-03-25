@@ -11,9 +11,12 @@ This matches WebRTC's C++ deferred on_complete → Rust oneshot → Python callb
 """
 
 import asyncio
+import logging
 import time
 
 from livekit import rtc
+
+logger = logging.getLogger(__name__)
 
 
 class SipAudioSource:
@@ -60,6 +63,8 @@ class SipAudioSource:
 
     def clear_queue(self) -> None:
         """Clear the queue and release all pending waiters."""
+        import traceback
+        logger.info("SipAudioSource.clear_queue called from:\n%s", "".join(traceback.format_stack()[-4:-1]))
         self._ep.clear_buffer(self._id)
         self._release_waiter()
 
@@ -101,20 +106,30 @@ class SipAudioSource:
         def _on_complete():
             """Called from Rust RTP thread when buffer drains below threshold.
             Uses call_soon_threadsafe to safely resolve the Python Future."""
+            def _resolve():
+                if not capture_fut.done():
+                    capture_fut.set_result(None)
             try:
-                self._loop.call_soon_threadsafe(capture_fut.set_result, None)
+                self._loop.call_soon_threadsafe(_resolve)
             except RuntimeError:
                 pass  # event loop closed
 
         # Push audio to Rust — Rust fires _on_complete immediately if below
         # threshold, or defers it until RTP loop drains
-        self._ep.send_audio_notify(
-            self._id,
-            bytes(frame.data),
-            frame.sample_rate,
-            frame.num_channels,
-            _on_complete,
-        )
+        try:
+            self._ep.send_audio_notify(
+                self._id,
+                bytes(frame.data),
+                frame.sample_rate,
+                frame.num_channels,
+                _on_complete,
+            )
+        except Exception:
+            # Audio wasn't pushed — revert timing state to avoid drift
+            self._q_size -= frame.samples_per_channel / self.sample_rate
+            if self._q_size <= 0:
+                self._release_waiter()
+            raise
 
         # Await completion — instant if below threshold, suspends if above
         await capture_fut

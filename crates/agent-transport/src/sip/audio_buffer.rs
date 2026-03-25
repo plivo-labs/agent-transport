@@ -12,13 +12,14 @@
 //! - Immediate vs deferred on_complete callback
 //! - Only one deferred callback at a time
 
+use std::collections::VecDeque;
 use std::sync::Mutex;
 use tracing::{debug, info};
 
-/// Default queue_size_ms matching rtc.AudioSource default (1000ms).
-/// At 16kHz: notify_threshold = 16000 samples, capacity = 32000 samples.
-const DEFAULT_QUEUE_SIZE_MS: u32 = 1000;
-const SAMPLE_RATE: u32 = 16000;
+/// Default queue_size_ms matching _ParticipantAudioOutput production usage (200ms).
+/// rtc.AudioSource class default is 1000ms, but LiveKit voice agents override to 200ms
+/// for tighter backpressure and faster interrupt response.
+const DEFAULT_QUEUE_SIZE_MS: u32 = 200;
 
 /// Completion callback — called from RTP send loop thread to signal Python.
 /// This is the equivalent of WebRTC's on_complete(ctx) callback.
@@ -26,8 +27,9 @@ pub(crate) type CompletionCallback = Box<dyn FnOnce() + Send>;
 
 /// Inner state protected by mutex (matches WebRTC's mutex_-guarded fields).
 struct Inner {
-    /// PCM samples buffer (matches WebRTC's buffer_)
-    pcm: Vec<i16>,
+    /// PCM samples buffer (matches WebRTC's buffer_).
+    /// VecDeque for O(1) drain from front (WebRTC C++ uses deque-like circular buffer).
+    pcm: VecDeque<i16>,
     /// Deferred completion callback (matches WebRTC's on_complete_ + capture_userdata_)
     /// Only one at a time — WebRTC rejects capture_frame if one is already pending.
     pending_complete: Option<CompletionCallback>,
@@ -43,36 +45,41 @@ pub(crate) struct AudioBuffer {
     notify_threshold: usize,
     /// capacity = 2 * queue_size_samples (matches WebRTC C++)
     capacity: usize,
+    /// Sample rate used for debug logging
+    sample_rate: u32,
 }
 
 impl AudioBuffer {
-    /// Create with default queue_size_ms (1000ms, matching rtc.AudioSource default).
+    /// Create with default queue_size_ms (200ms, matching _ParticipantAudioOutput production).
     pub fn new() -> Self {
-        Self::with_queue_size_ms(DEFAULT_QUEUE_SIZE_MS)
+        Self::with_queue_size(DEFAULT_QUEUE_SIZE_MS, 16000)
     }
 
-    /// Create with configurable queue_size_ms (matches WebRTC C++ constructor).
+    /// Create with configurable queue_size_ms and sample_rate
+    /// (matches WebRTC C++ InternalSource constructor).
     /// - notify_threshold = queue_size_ms * sample_rate / 1000
     /// - capacity = 2 * notify_threshold
-    pub fn with_queue_size_ms(queue_size_ms: u32) -> Self {
-        let queue_size_samples = (queue_size_ms * SAMPLE_RATE / 1000) as usize;
+    pub fn with_queue_size(queue_size_ms: u32, sample_rate: u32) -> Self {
+        let queue_size_samples = (queue_size_ms as u64 * sample_rate as u64 / 1000) as usize;
         let notify_threshold = queue_size_samples;
         let capacity = queue_size_samples + notify_threshold; // 2x, same as WebRTC C++
+        info!(
+            "AudioBuffer: queue_size_ms={} sample_rate={} threshold={} capacity={}",
+            queue_size_ms, sample_rate, notify_threshold, capacity
+        );
         Self {
             inner: Mutex::new(Inner {
-                pcm: Vec::with_capacity(capacity),
+                pcm: VecDeque::with_capacity(capacity),
                 pending_complete: None,
                 flush: false,
             }),
             notify_threshold,
             capacity,
+            sample_rate,
         }
     }
 
     /// Push samples into the buffer (called from send_audio on Python thread).
-    ///
-    /// Returns true if the completion callback was fired immediately (below threshold).
-    /// Returns false if deferred (above threshold) — RTP loop will fire it later.
     ///
     /// Matches WebRTC C++ InternalSource::capture_frame exactly:
     /// 1. Check capacity → reject if full
@@ -95,7 +102,7 @@ impl AudioBuffer {
         }
 
         // Append samples
-        inner.pcm.extend_from_slice(samples);
+        inner.pcm.extend(samples.iter().copied());
 
         // Decision: immediate vs deferred (matches WebRTC threshold check)
         let buf_len = inner.pcm.len();
@@ -106,7 +113,7 @@ impl AudioBuffer {
             Ok(())
         } else {
             // Above threshold → store for deferred firing by RTP loop
-            debug!("AudioBuffer: deferred callback, buf={} samples ({}ms)", buf_len, buf_len * 1000 / SAMPLE_RATE as usize);
+            debug!("AudioBuffer: deferred callback, buf={} samples ({}ms)", buf_len, buf_len * 1000 / self.sample_rate as usize);
             inner.pending_complete = Some(on_complete);
             Ok(())
         }
@@ -148,7 +155,7 @@ impl AudioBuffer {
             let remaining = inner.pcm.len();
             let cb = inner.pending_complete.take();
             drop(inner);
-            debug!("AudioBuffer: firing deferred callback, buf={} samples ({}ms)", remaining, remaining * 1000 / SAMPLE_RATE as usize);
+            debug!("AudioBuffer: firing deferred callback, buf={} samples ({}ms)", remaining, remaining * 1000 / self.sample_rate as usize);
             if let Some(cb) = cb { cb(); }
         }
 

@@ -121,14 +121,13 @@ class AudioStreamInput(AudioInput):
 
     def on_detached(self) -> None:
         self._attached = False
-        self._closed = True
         if self._source: self._source.on_detached()
 
     async def aclose(self) -> None:
         self._closed = True
-        self._data_ch.close()
         if self._forward_task:
             await cancel_and_wait(self._forward_task)
+        self._data_ch.close()
 
     def __repr__(self) -> str:
         return f"AudioStreamInput(label={self._label!r}, source={self._source!r})"
@@ -169,7 +168,7 @@ class AudioStreamOutput(AudioOutput):
             endpoint, session_id,
             sample_rate=_sample_rate,
             num_channels=num_channels,
-            queue_size_ms=1000,  # matches rtc.AudioSource default
+            queue_size_ms=200,  # matches _ParticipantAudioOutput production (not rtc.AudioSource default of 1000)
         )
 
         self._audio_buf: Chan[rtc.AudioFrame] = Chan()
@@ -198,8 +197,6 @@ class AudioStreamOutput(AudioOutput):
         self._ready.set()
 
     async def aclose(self) -> None:
-        self._audio_buf.close()
-
         if self._flush_task:
             await cancel_and_wait(self._flush_task)
         if self._forwarding_task:
@@ -316,9 +313,6 @@ class AudioStreamOutput(AudioOutput):
             self.next_in_chain.on_attached()
 
     def on_detached(self) -> None:
-        self._audio_buf.close()
-        if self._flush_task and not self._flush_task.done():
-            self._flush_task.cancel()
         if self.next_in_chain:
             self.next_in_chain.on_detached()
 
