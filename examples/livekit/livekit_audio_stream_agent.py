@@ -28,7 +28,7 @@ import logging
 import os
 
 from agent_transport import AudioStreamEndpoint
-from agent_transport_adapters.livekit import AudioStreamInput, AudioStreamOutput
+from agent_transport.sip.livekit import AudioStreamInput, AudioStreamOutput
 
 from livekit.agents.voice import AgentSession, Agent
 from livekit.plugins import deepgram, openai

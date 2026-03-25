@@ -18,4 +18,4 @@ pipecat = ["pipecat-ai>=0.0.50"]
 all = ["agent-transport-adapters[livekit,pipecat]"]
 
 [tool.setuptools.packages.find]
-include = ["agent_transport_adapters*"]
+include = ["agent_transport*"]

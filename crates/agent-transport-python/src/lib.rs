@@ -540,10 +540,11 @@ impl SipEndpoint {
         1
     }
 
-    /// Start recording a call to a WAV file.
-    fn start_recording(&self, call_id: i32, path: &str) -> PyResult<()> {
+    /// Start recording a call to a WAV file (stereo by default: L=user, R=agent).
+    #[pyo3(signature = (call_id, path, stereo=true))]
+    fn start_recording(&self, call_id: i32, path: &str, stereo: bool) -> PyResult<()> {
         self.inner
-            .start_recording(call_id, path)
+            .start_recording(call_id, path, stereo)
             .map_err(py_err)
     }
 

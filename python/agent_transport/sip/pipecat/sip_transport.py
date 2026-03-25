@@ -10,7 +10,7 @@ Uses Pipecat's MediaSender infrastructure (via set_transport_ready) for:
 
 Usage:
     from agent_transport import SipEndpoint
-    from agent_transport_adapters.pipecat import SipTransport
+    from agent_transport.sip.pipecat import SipTransport
 
     ep = SipEndpoint(sip_server="phone.plivo.com")
     ep.register(username, password)

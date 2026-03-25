@@ -23,7 +23,7 @@ import os
 import sys
 
 from agent_transport import SipEndpoint
-from agent_transport_adapters.pipecat import SipTransport
+from agent_transport.sip.pipecat import SipTransport
 
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner

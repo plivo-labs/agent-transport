@@ -63,8 +63,6 @@ class SipAudioSource:
 
     def clear_queue(self) -> None:
         """Clear the queue and release all pending waiters."""
-        import traceback
-        logger.info("SipAudioSource.clear_queue called from:\n%s", "".join(traceback.format_stack()[-4:-1]))
         self._ep.clear_buffer(self._id)
         self._release_waiter()
 

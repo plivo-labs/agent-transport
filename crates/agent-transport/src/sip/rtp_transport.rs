@@ -18,6 +18,7 @@ use webrtc_util::marshal::{Marshal, MarshalSize, Unmarshal};
 use beep_detector::{BeepDetector, BeepDetectorResult};
 use crate::audio::AudioFrame;
 use crate::config::Codec;
+use crate::recorder::CallRecorder;
 use crate::sip::audio_buffer::AudioBuffer;
 use crate::sip::dtmf;
 use crate::sip::resampler::Resampler;
@@ -70,7 +71,7 @@ impl RtpTransport {
 
     /// Start the RTP send loop. Drains from the shared AudioBuffer every ptime_ms.
     /// Matches WebRTC C++ InternalSource::audio_task_ (10ms repeating task).
-    pub fn start_send_loop(self: &Arc<Self>, audio_buf: Arc<AudioBuffer>, muted: Arc<AtomicBool>, paused: Arc<AtomicBool>, playout: Arc<(Mutex<bool>, Condvar)>) -> tokio::task::JoinHandle<()> {
+    pub fn start_send_loop(self: &Arc<Self>, audio_buf: Arc<AudioBuffer>, muted: Arc<AtomicBool>, paused: Arc<AtomicBool>, playout: Arc<(Mutex<bool>, Condvar)>, recorder: Option<Arc<CallRecorder>>) -> tokio::task::JoinHandle<()> {
         let t = Arc::clone(self);
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(Duration::from_millis(t.ptime_ms as u64));
@@ -110,6 +111,9 @@ impl RtpTransport {
                 let samples = audio_buf.drain(input_spf);
 
                 if !samples.is_empty() {
+                    // Record agent audio (16kHz, before downsample)
+                    if let Some(ref rec) = recorder { rec.write_agent_samples(&samples); }
+
                     if !muted.load(Ordering::Relaxed) {
                         let m = first; first = false;
                         let samples_8k = if let Some(ref mut ds) = downsampler {
@@ -138,7 +142,7 @@ impl RtpTransport {
         })
     }
 
-    pub fn start_recv_loop(self: &Arc<Self>, tx: Sender<AudioFrame>, etx: Sender<EndpointEvent>, cid: i32, bd: Arc<Mutex<Option<BeepDetector>>>, held: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
+    pub fn start_recv_loop(self: &Arc<Self>, tx: Sender<AudioFrame>, etx: Sender<EndpointEvent>, cid: i32, bd: Arc<Mutex<Option<BeepDetector>>>, held: Arc<AtomicBool>, recorder: Option<Arc<CallRecorder>>) -> tokio::task::JoinHandle<()> {
         let t = Arc::clone(self);
         tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
@@ -204,6 +208,9 @@ impl RtpTransport {
                         } else {
                             s8 // same rate — no resampling
                         };
+
+                        // Record user audio (16kHz, after resample)
+                        if let Some(ref rec) = recorder { rec.write_user_samples(&pcm); }
 
                         // Beep detector
                         if let Ok(mut g) = bd.lock() { if let Some(ref mut det) = *g {

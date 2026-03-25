@@ -27,7 +27,7 @@ use crate::sip::call::{CallDirection, CallSession, CallState};
 use crate::config::EndpointConfig;
 use crate::error::{EndpointError, Result};
 use crate::events::EndpointEvent;
-use crate::recorder::WavRecorder;
+use crate::recorder::CallRecorder;
 use crate::sip::audio_buffer::AudioBuffer;
 use crate::sip::rtp_transport::RtpTransport;
 use crate::sip::sdp;
@@ -48,7 +48,7 @@ struct CallContext {
     held: Arc<AtomicBool>,
     playout_notify: Arc<(Mutex<bool>, Condvar)>,
     beep_detector: Arc<Mutex<Option<BeepDetector>>>,
-    recorder: Option<WavRecorder>,
+    recorder: Option<Arc<CallRecorder>>,
     cancel: CancellationToken,
     client_dialog: Option<rsipstack::dialog::client_dialog::ClientInviteDialog>,
     server_dialog: Option<rsipstack::dialog::server_dialog::ServerInviteDialog>,
@@ -95,8 +95,8 @@ async fn setup_rtp(
     let rtp = Arc::new(RtpTransport::new(Arc::new(rtp_sock), remote_rtp, answer.codec, ctx.cancel.clone(), dtmf_pt, answer.ptime_ms));
 
     let (itx, irx) = crossbeam_channel::bounded(100);
-    rtp.start_send_loop(ctx.audio_buf.clone(), ctx.muted.clone(), ctx.paused.clone(), ctx.playout_notify.clone());
-    rtp.start_recv_loop(itx, etx.clone(), call_id, ctx.beep_detector.clone(), ctx.held.clone());
+    rtp.start_send_loop(ctx.audio_buf.clone(), ctx.muted.clone(), ctx.paused.clone(), ctx.playout_notify.clone(), ctx.recorder.clone());
+    rtp.start_recv_loop(itx, etx.clone(), call_id, ctx.beep_detector.clone(), ctx.held.clone(), ctx.recorder.clone());
 
     ctx.rtp = Some(rtp);
     ctx.incoming_rx = irx;
@@ -617,18 +617,19 @@ impl SipEndpoint {
         self.with_call(call_id, |c| c.audio_buf.len() / 320) // convert samples to 20ms frame count
     }
 
-    pub fn start_recording(&self, call_id: i32, path: &str) -> Result<()> {
+    pub fn start_recording(&self, call_id: i32, path: &str, stereo: bool) -> Result<()> {
         let p = path.to_string();
+        let mode = if stereo { crate::recorder::RecordingMode::Stereo } else { crate::recorder::RecordingMode::Mono };
         self.with_call_mut(call_id, |c| {
-            c.recorder = Some(WavRecorder::new(&p).map_err(|e| EndpointError::Other(format!("WAV: {}", e)))?);
-            info!("Recording call {} to {}", call_id, p);
+            let rec = Arc::new(CallRecorder::new(&p, mode).map_err(|e| EndpointError::Other(format!("WAV: {}", e)))?);
+            c.recorder = Some(rec);
             Ok::<_, EndpointError>(())
         })?
     }
 
     pub fn stop_recording(&self, call_id: i32) -> Result<()> {
         self.with_call_mut(call_id, |c| {
-            if let Some(mut r) = c.recorder.take() { r.finalize(); Ok(()) }
+            if let Some(r) = c.recorder.take() { r.finalize(); Ok(()) }
             else { Err(EndpointError::Other("no recording".into())) }
         })?
     }

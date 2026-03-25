@@ -28,7 +28,7 @@ import logging
 import os
 
 from agent_transport import AudioStreamEndpoint
-from agent_transport_adapters.pipecat import AudioStreamTransport
+from agent_transport.sip.pipecat import AudioStreamTransport
 
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
