@@ -111,10 +111,11 @@ export DEEPGRAM_API_KEY=<your Deepgram key>
 export OPENAI_API_KEY=<your OpenAI key>
 ```
 
-Download model files required by the turn detector (ONNX model from Hugging Face, ~8MB one-time download):
+Download model files required by the turn detector (ONNX model + tokenizer from Hugging Face, one-time download):
 
 ```bash
-python examples/livekit/sip_agent.py download-files
+pip install transformers huggingface-hub
+python -c "from livekit.plugins.turn_detector.multilingual import _EUORunnerMultilingual; _EUORunnerMultilingual._download_files()"
 ```
 
 Run the agent:
