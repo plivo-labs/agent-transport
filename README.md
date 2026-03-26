@@ -91,6 +91,45 @@ cd crates/agent-transport-node && npm run build
 | [`pipecat/audio_stream_agent.py`](examples/pipecat/audio_stream_agent.py) | Pipecat pipeline over Plivo audio streaming |
 | [`cli/phone.py`](examples/cli/phone.py) | Interactive CLI softphone with mic/speaker, DTMF, mute, hold/unhold |
 
+### Running the LiveKit SIP Example
+
+The LiveKit adapter (`pip install -e ".[livekit]"`) installs `livekit-agents` but not the individual plugins the examples use. Install them separately:
+
+```bash
+pip install python-dotenv \
+    livekit-plugins-deepgram livekit-plugins-openai \
+    livekit-plugins-silero livekit-plugins-turn-detector
+```
+
+Set the required environment variables:
+
+```bash
+export SIP_USERNAME=<your SIP username>
+export SIP_PASSWORD=<your SIP password>
+export SIP_DOMAIN=phone.plivo.com
+export DEEPGRAM_API_KEY=<your Deepgram key>
+export OPENAI_API_KEY=<your OpenAI key>
+```
+
+Run the agent:
+
+```bash
+python examples/livekit/sip_agent.py dev
+```
+
+CLI modes: `start` (production, INFO logging), `dev` (development, DEBUG for adapters), `debug` (full debug including Rust SIP/RTP).
+
+### Running the Pipecat SIP Example
+
+```bash
+pip install python-dotenv "pipecat-ai[deepgram,openai]"
+```
+
+```bash
+SIP_USERNAME=xxx SIP_PASSWORD=yyy DEEPGRAM_API_KEY=xxx OPENAI_API_KEY=xxx \
+    python examples/pipecat/sip_agent.py
+```
+
 See also: [Feature Flags & CLI Phone docs](docs/features.md)
 
 ## License
