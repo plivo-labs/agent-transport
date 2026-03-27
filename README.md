@@ -87,7 +87,7 @@ pip install -e ".[livekit]"   # LiveKit adapter only
 pip install -e ".[pipecat]"   # Pipecat adapter only
 ```
 
-### Step 4: Install Example Dependencies
+### Step 4: Install AI Provider Packages
 
 The adapters install the core frameworks but not the individual AI service plugins. Install them:
 
