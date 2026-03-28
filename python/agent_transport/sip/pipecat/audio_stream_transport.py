@@ -137,7 +137,8 @@ class AudioStreamOutputTransport(BaseOutputTransport):
 
     async def _write_dtmf_native(self, frame):
         digit = str(frame.button.value)
-        self._ep.send_dtmf(self._sid, digit)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: self._ep.send_dtmf(self._sid, digit))
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
         try:
@@ -160,7 +161,9 @@ class AudioStreamOutputTransport(BaseOutputTransport):
             return
         try:
             msg = json.dumps(frame.message) if not isinstance(frame.message, str) else frame.message
-            self._ep.send_raw_message(self._sid, msg)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, lambda: self._ep.send_raw_message(self._sid, msg))
         except Exception as e:
             logger.warning("send_message failed: %s", e)
 
