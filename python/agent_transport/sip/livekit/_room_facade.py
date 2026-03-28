@@ -155,7 +155,7 @@ class _TransportRemoteParticipant:
         self.name = identity
         self.metadata = ""
         self.attributes: dict[str, str] = {}
-        self.kind = 4  # SIP
+        self.kind = 3  # PARTICIPANT_KIND_SIP (rtc.ParticipantKind.PARTICIPANT_KIND_SIP = 3)
         self.permissions = None
         self.disconnect_reason = None
         self.track_publications: dict = {}
