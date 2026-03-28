@@ -252,8 +252,8 @@ export class AgentServer {
 
   // ─── Event dispatcher (single reader, no race conditions) ──────
 
-  private pendingInbound = new Map<number, string>(); // callId → remoteUri
-  private pendingOutbound = new Map<number, { resolve: (ok: boolean) => void }>();
+  private pendingInbound = new Map<string, string>(); // callId → remoteUri
+  private pendingOutbound = new Map<string, { resolve: (ok: boolean) => void }>();
 
   private async sipEventLoop(): Promise<void> {
     while (true) {
@@ -304,6 +304,13 @@ export class AgentServer {
         if (active) {
           active.resolveEnded();
         }
+
+      } else if (ev.eventType === 'dtmf_received' && ev.callId) {
+        // Route DTMF to Room facade (matches Python server pattern)
+        const active = this.activeCalls.get(ev.callId);
+        if (active?.room) {
+          active.room.emitDtmf(ev.digit ?? '');
+        }
       }
     }
   }
@@ -321,9 +328,11 @@ export class AgentServer {
       direction,
       endpoint: this.ep!,
       userdata: this.userdata,
+      agentName: this.agentName,
       callEnded,
       resolveCallEnded: resolveEnded,
     });
+    callEntry.room = ctx.room;
 
     const runCall = async () => {
       this.sipCallsTotal[direction]++;
