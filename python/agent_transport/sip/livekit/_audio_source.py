@@ -151,3 +151,52 @@ class SipAudioSource:
     async def aclose(self) -> None:
         """Close the audio source."""
         self._disposed = True
+
+
+class AudioStreamAudioSource(SipAudioSource):
+    """Audio source that uses Plivo's checkpoint/playedStream for accurate playout confirmation.
+
+    Instead of the timer-based estimation used by SipAudioSource (matching rtc.AudioSource),
+    this uses Plivo's server-side confirmation:
+    - flush() sends a checkpoint to Plivo
+    - wait_for_playout() waits for Plivo's playedStream event confirming audio was played
+    - clear_queue() sends clearAudio to Plivo and clears local buffer
+
+    This gives more accurate playout tracking than the timer approach since Plivo
+    confirms when audio actually reached the caller.
+    """
+
+    async def wait_for_playout(self) -> None:
+        """Wait for Plivo server confirmation that queued audio has been played.
+
+        Sends a checkpoint and waits for playedStream event from Plivo,
+        instead of the timer-based guess used by SipAudioSource.
+        """
+        if self._join_fut is None:
+            return
+
+        # Send checkpoint to Plivo — Plivo responds with playedStream when audio finishes
+        try:
+            self._ep.flush(self._id)
+        except Exception:
+            logger.warning("AudioStreamAudioSource: flush failed for session %d — playout not confirmed", self._id, exc_info=True)
+            self._release_waiter()
+            return
+
+        # Wait for playedStream confirmation (blocking call, releases GIL)
+        loop = asyncio.get_running_loop()
+        try:
+            confirmed = await loop.run_in_executor(
+                None, self._ep.wait_for_playout, self._id, 30000
+            )
+            if not confirmed:
+                logger.warning("AudioStreamAudioSource: wait_for_playout timed out on session %d", self._id)
+        except Exception:
+            logger.warning("AudioStreamAudioSource: wait_for_playout error on session %d", self._id, exc_info=True)
+
+        self._release_waiter()
+
+    def clear_queue(self) -> None:
+        """Clear buffer — sends clearAudio to Plivo + clears local AudioBuffer."""
+        self._ep.clear_buffer(self._id)
+        self._release_waiter()

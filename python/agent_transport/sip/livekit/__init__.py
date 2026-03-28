@@ -53,9 +53,11 @@ _ensure_http_context()
 
 
 from .server import AgentServer, CallContext, run_app
+from .audio_stream_server import AudioStreamServer, AudioStreamCallContext
 
 __all__ = [
     "SipAudioInput", "SipAudioOutput",
     "AudioStreamInput", "AudioStreamOutput",
     "AgentServer", "CallContext", "run_app",
+    "AudioStreamServer", "AudioStreamCallContext",
 ]

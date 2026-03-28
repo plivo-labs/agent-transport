@@ -32,7 +32,7 @@ except ImportError:
     raise ImportError("livekit-agents is required: pip install livekit-agents")
 
 from .sip_io import _to_livekit_frame
-from ._audio_source import SipAudioSource
+from ._audio_source import AudioStreamAudioSource
 from ._channel import Chan
 from ._aio_utils import cancel_and_wait
 
@@ -89,6 +89,7 @@ class AudioStreamInput(AudioInput):
 
     async def _forward_audio(self) -> None:
         loop = asyncio.get_running_loop()
+        frame_count = 0
         try:
             while not self._closed:
                 try:
@@ -102,6 +103,11 @@ class AudioStreamInput(AudioInput):
                     ab, sr, nc = result
                     frame = _to_livekit_frame(bytes(ab), sr, nc)
                     await self._data_ch.send(frame)
+                    frame_count += 1
+                    if frame_count == 1:
+                        logger.info("AudioStreamInput: first frame received sr=%d samples=%d", sr, frame.samples_per_channel)
+                    elif frame_count % 250 == 0:  # every 5 seconds
+                        logger.info("AudioStreamInput: %d frames forwarded (%.1fs)", frame_count, frame_count * 0.02)
         finally:
             silent_samples = int(self._sample_rate * 0.5)
             silence = rtc.AudioFrame(
@@ -164,7 +170,7 @@ class AudioStreamOutput(AudioOutput):
         self._ep = endpoint
         self._sid = session_id
 
-        self._audio_source = SipAudioSource(
+        self._audio_source = AudioStreamAudioSource(
             endpoint, session_id,
             sample_rate=_sample_rate,
             num_channels=num_channels,
@@ -228,19 +234,24 @@ class AudioStreamOutput(AudioOutput):
             self._pushed_duration += f.duration
 
         if not self._pushed_duration:
+            logger.debug("flush: no pushed_duration, skipping")
             return
 
         if self._flush_task and not self._flush_task.done():
             logger.error("flush called while playback is in progress")
             self._flush_task.cancel()
 
+        logger.debug("flush: pushed_dur=%.3fs, creating _wait_for_playout task", self._pushed_duration)
         self._flush_task = asyncio.create_task(self._wait_for_playout())
 
     def clear_buffer(self) -> None:
+        logger.info("AudioStreamOutput.clear_buffer: clearing bstream, pushed_dur=%.3fs", self._pushed_duration)
         self._audio_bstream.clear()
 
         if not self._pushed_duration:
+            logger.info("AudioStreamOutput.clear_buffer: no pushed_duration, skipping interrupt")
             return
+        logger.info("AudioStreamOutput.clear_buffer: setting _interrupted_event")
         self._interrupted_event.set()
 
     def pause(self) -> None:
@@ -253,15 +264,17 @@ class AudioStreamOutput(AudioOutput):
         self._first_frame_event.clear()
 
     async def _wait_for_playout(self) -> None:
+        logger.debug("_wait_for_playout: starting (pushed=%.3fs)", self._pushed_duration)
         wait_for_interruption = asyncio.create_task(self._interrupted_event.wait())
 
         async def _wait_buffered_audio() -> None:
             while not self._audio_buf.empty():
                 if not self._playback_enabled.is_set():
                     await self._playback_enabled.wait()
-
+                logger.debug("_wait_buffered_audio: chan_qsize=%d, awaiting audio_source.wait_for_playout", self._audio_buf.qsize())
                 await self._audio_source.wait_for_playout()
                 await asyncio.sleep(0)
+            logger.debug("_wait_buffered_audio: chan empty, playout done")
 
         wait_for_playout = asyncio.create_task(_wait_buffered_audio())
         await asyncio.wait(
@@ -276,12 +289,13 @@ class AudioStreamOutput(AudioOutput):
             queued_duration = self._audio_source.queued_duration
             while not self._audio_buf.empty():
                 queued_duration += self._audio_buf.recv_nowait().duration
-
             pushed_duration = max(pushed_duration - queued_duration, 0)
             self._audio_source.clear_queue()
             wait_for_playout.cancel()
+            logger.debug("_wait_for_playout: interrupted, played=%.3fs", pushed_duration)
         else:
             wait_for_interruption.cancel()
+            logger.debug("_wait_for_playout: completed, played=%.3fs", pushed_duration)
 
         self._pushed_duration = 0
         self._interrupted_event.clear()
@@ -304,6 +318,7 @@ class AudioStreamOutput(AudioOutput):
                 self._first_frame_event.set()
                 self.on_playback_started(created_at=time.time())
             await self._audio_source.capture_frame(frame)
+        logger.debug("_forward_audio: task ended (Chan closed)")
 
     def send_raw_message(self, message: str) -> None:
         self._ep.send_raw_message(self._sid, message)

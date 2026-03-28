@@ -1,6 +1,7 @@
-"""SIP multi-agent with handoff and tool calling.
+"""Audio streaming multi-agent with handoff and tool calling.
 
-Demonstrates multiple agents that can hand off to each other:
+Demonstrates multiple agents that can hand off to each other over
+Plivo audio streaming (same pattern as sip_multi_agent.py):
 - GreeterAgent: greets the caller, gathers intent, hands off
 - SalesAgent: handles product inquiries with tool calling
 - SupportAgent: handles support issues with tool calling
@@ -8,9 +9,18 @@ Demonstrates multiple agents that can hand off to each other:
 Each agent can have its own instructions and tools. Returning an Agent
 from a function tool triggers automatic handoff.
 
+Setup:
+    Configure Plivo XML answer URL to return:
+    <Response>
+        <Stream bidirectional="true" keepCallAlive="true"
+            contentType="audio/x-mulaw;rate=8000">
+            wss://your-server:8765
+        </Stream>
+    </Response>
+
 Usage:
-    python examples/livekit/livekit_multi_agent.py start
-    python examples/livekit/livekit_multi_agent.py dev
+    python examples/livekit/audio_stream_multi_agent.py start
+    python examples/livekit/audio_stream_multi_agent.py dev
 """
 
 import logging
@@ -19,7 +29,7 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
-from agent_transport.sip.livekit import AgentServer, CallContext
+from agent_transport.sip.livekit import AudioStreamServer, AudioStreamCallContext
 
 from livekit.agents import Agent, AgentSession, RunContext, TurnHandlingOptions
 from livekit.agents.llm import function_tool
@@ -29,12 +39,12 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 load_dotenv()
 
-logger = logging.getLogger("multi-agent")
+logger = logging.getLogger("audio-stream-multi-agent")
 
-server = AgentServer(
-    sip_username=os.environ["SIP_USERNAME"],
-    sip_password=os.environ["SIP_PASSWORD"],
-    sip_server=os.environ.get("SIP_DOMAIN", "phone.plivo.com"),
+server = AudioStreamServer(
+    listen_addr=os.environ.get("AUDIO_STREAM_ADDR", "0.0.0.0:8765"),
+    plivo_auth_id=os.environ.get("PLIVO_AUTH_ID", ""),
+    plivo_auth_token=os.environ.get("PLIVO_AUTH_TOKEN", ""),
 )
 
 
@@ -230,8 +240,8 @@ class SupportAgent(Agent):
         return "Say goodbye to the user."
 
 
-@server.sip_session()
-async def entrypoint(ctx: CallContext):
+@server.audio_stream_session()
+async def entrypoint(ctx: AudioStreamCallContext):
     session = AgentSession[CallData](
         vad=ctx.userdata["vad"],
         stt=deepgram.STT(model="nova-3"),

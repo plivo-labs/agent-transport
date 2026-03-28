@@ -12,7 +12,7 @@ use std::time::Duration;
 use audio_codec_algorithms::{decode_ulaw, encode_ulaw};
 use base64::Engine;
 use crossbeam_channel::{Receiver, Sender};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio_tungstenite::tungstenite::Message;
@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 use crate::audio::AudioFrame;
 use crate::error::{EndpointError, Result};
 use crate::events::EndpointEvent;
+use crate::sip::audio_buffer::{AudioBuffer, CompletionCallback};
 use super::config::AudioStreamConfig;
 
 // ─── Plivo message types ─────────────────────────────────────────────────────
@@ -34,13 +35,15 @@ struct PlivoMessage {
     #[serde(default)] dtmf: Option<PlivoDtmf>,
     #[serde(rename = "streamId", default)] stream_id: Option<String>,
     #[serde(default)] name: Option<String>, // for playedStream
+    // extra_headers is a TOP-LEVEL field on every Plivo event (not inside start)
+    #[serde(default)] extra_headers: Option<String>,
+    #[serde(rename = "sequenceNumber", default)] sequence_number: Option<u64>,
 }
 
 #[derive(Deserialize)]
 struct PlivoStart {
     #[serde(rename = "callId")] call_id: String,
     #[serde(rename = "streamId")] stream_id: String,
-    #[serde(default, rename = "extra_headers")] extra_headers: Option<String>,
     #[serde(default, rename = "mediaFormat")] media_format: Option<PlivoMediaFormat>,
 }
 
@@ -51,10 +54,18 @@ struct PlivoMediaFormat {
 }
 
 #[derive(Deserialize)]
-struct PlivoMedia { payload: String }
+struct PlivoMedia {
+    payload: String,
+    #[serde(default)] track: Option<String>,
+    #[serde(default)] timestamp: Option<String>,
+    #[serde(default)] chunk: Option<u64>,
+}
 
 #[derive(Deserialize)]
-struct PlivoDtmf { digit: String }
+struct PlivoDtmf {
+    digit: String,
+    #[serde(default)] timestamp: Option<String>,
+}
 
 // ─── Audio encoding detected from start event ───────────────────────────────
 
@@ -90,13 +101,12 @@ struct StreamSession {
     ws_tx: tokio::sync::mpsc::UnboundedSender<Message>,
     incoming_tx: Sender<AudioFrame>,
     incoming_rx: Receiver<AudioFrame>,
-    outgoing_tx: Sender<Vec<i16>>,  // Outgoing audio queue (same as SIP)
+    audio_buf: Arc<AudioBuffer>,  // Shared audio buffer with backpressure (same as SIP)
     extra_headers: HashMap<String, String>,
     encoding: AudioEncoding,
     // Audio control flags (same as SIP RTP transport)
     muted: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
-    flush_flag: Arc<AtomicBool>,
     playout_notify: Arc<(Mutex<bool>, Condvar)>,
     // Checkpoint tracking
     checkpoint_counter: AtomicU64,
@@ -132,13 +142,24 @@ impl AudioStreamEndpoint {
         Ok(Self { config, runtime: rt, sessions, next_id: AtomicI32::new(0), event_tx: etx, event_rx: erx, cancel })
     }
 
-    /// Send audio frame — queued and paced by Rust send loop (same as SIP).
-    /// During pause, frames accumulate in the channel (same as LiveKit).
+    /// Send audio with completion callback — matches SipEndpoint::send_audio_with_callback.
+    ///
+    /// If buffer is below threshold (200ms), the callback fires immediately.
+    /// If above threshold, the callback is deferred until the send loop drains below threshold.
+    /// This is the backpressure mechanism used by SipAudioSource in the Python/Node adapters.
+    pub fn send_audio_with_callback(&self, session_id: i32, frame: &AudioFrame, on_complete: CompletionCallback) -> Result<()> {
+        let audio_buf = {
+            let s = self.sessions.lock().unwrap();
+            let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+            sess.audio_buf.clone()
+        };
+        audio_buf.push(&frame.data, on_complete)
+            .map_err(|e| EndpointError::Other(e.into()))
+    }
+
+    /// Send audio frame — simple, no backpressure callback.
     pub fn send_audio(&self, session_id: i32, frame: &AudioFrame) -> Result<()> {
-        let s = self.sessions.lock().unwrap();
-        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
-        sess.outgoing_tx.try_send(frame.data.clone())
-            .map_err(|_| EndpointError::Other("audio buffer full".into()))
+        self.send_audio_with_callback(session_id, frame, Box::new(|| {}))
     }
 
     /// Mute outgoing audio (send silence, preserve queue).
@@ -182,12 +203,12 @@ impl AudioStreamEndpoint {
         Ok(rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)).ok())
     }
 
-    /// Clear buffered audio — drains local queue AND sends clearAudio to Plivo.
+    /// Clear buffered audio — drains local AudioBuffer AND sends clearAudio to Plivo.
     pub fn clear_buffer(&self, session_id: i32) -> Result<()> {
         let s = self.sessions.lock().unwrap();
         let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
-        // Drain local queue (same as SIP flush_flag)
-        sess.flush_flag.store(true, Ordering::Relaxed);
+        // Clear local AudioBuffer (fires any pending completion callbacks)
+        sess.audio_buf.clear();
         // Send clearAudio to Plivo to clear server-side buffer
         let json = serde_json::to_string(&serde_json::json!({ "event": "clearAudio", "streamId": sess.stream_id }))
             .map_err(|e| EndpointError::Other(e.to_string()))?;
@@ -219,6 +240,7 @@ impl AudioStreamEndpoint {
     }
 
     /// Wait for the last checkpoint to be confirmed by Plivo (playedStream event).
+    /// Clears the checkpoint state after consuming so subsequent calls block correctly.
     pub fn wait_for_playout(&self, session_id: i32, timeout_ms: u64) -> Result<bool> {
         let notify = {
             let s = self.sessions.lock().unwrap();
@@ -226,9 +248,11 @@ impl AudioStreamEndpoint {
             sess.checkpoint_notify.clone()
         };
         let (lock, cvar) = &*notify;
-        let guard = lock.lock().unwrap();
-        let result = cvar.wait_timeout_while(guard, std::time::Duration::from_millis(timeout_ms), |cp| cp.is_none()).unwrap();
-        Ok(!result.1.timed_out())
+        let mut guard = lock.lock().unwrap();
+        let (ref mut guard, timeout) = cvar.wait_timeout_while(guard, std::time::Duration::from_millis(timeout_ms), |cp| cp.is_none()).unwrap();
+        // Clear checkpoint state after consuming — prevents stale data on next wait
+        **guard = None;
+        Ok(!timeout.timed_out())
     }
 
     /// Send DTMF digits via Plivo audio streaming.
@@ -285,7 +309,7 @@ impl AudioStreamEndpoint {
     pub fn queued_frames(&self, session_id: i32) -> Result<usize> {
         let s = self.sessions.lock().unwrap();
         let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
-        Ok(sess.outgoing_tx.len())
+        Ok(sess.audio_buf.len())
     }
     pub fn sample_rate(&self) -> u32 { self.config.sample_rate }
     pub fn events(&self) -> Receiver<EndpointEvent> { self.event_rx.clone() }
@@ -328,7 +352,7 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
     use futures_util::{SinkExt, StreamExt};
     let (mut sink, mut stream) = ws.split();
     let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
-    let (itx, irx) = crossbeam_channel::bounded(18000);
+    let (itx, irx) = crossbeam_channel::unbounded(); // unbounded — matches WebRTC's FfiQueue
 
     let cc = cancel.clone();
     tokio::spawn(async move { loop { tokio::select! { _ = cc.cancelled() => break, msg = ws_rx.recv() => { match msg { Some(m) => { if sink.send(m).await.is_err() { break; } }, None => break } } } } });
@@ -348,31 +372,35 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                     "start" => {
                         if let Some(start) = plivo.start {
                             encoding = start.media_format.as_ref().map(|f| AudioEncoding::from_format(f)).unwrap_or(AudioEncoding::MulawRate8k);
+                            // extra_headers is a TOP-LEVEL field per Plivo protocol
                             let mut headers = HashMap::new();
-                            if let Some(ref h) = start.extra_headers {
+                            if let Some(ref h) = plivo.extra_headers {
                                 if h.starts_with('{') {
                                     if let Ok(p) = serde_json::from_str::<HashMap<String, String>>(h) { headers = p; }
                                 } else {
-                                    for part in h.split(',') {
+                                    // Plivo uses semicolon-delimited key=value pairs
+                                    for part in h.split(';') {
                                         if let Some((k, v)) = part.split_once('=') { headers.insert(k.trim().to_string(), v.trim().to_string()); }
                                     }
                                 }
                             }
 
-                            // Create outgoing queue + control flags (same as SIP)
-                            let (otx, orx): (Sender<Vec<i16>>, Receiver<Vec<i16>>) = crossbeam_channel::bounded(18000);
+                            // Create AudioBuffer + control flags (same pattern as SIP)
+                            let audio_buf = Arc::new(AudioBuffer::new());
                             let muted = Arc::new(AtomicBool::new(false));
                             let paused = Arc::new(AtomicBool::new(false));
-                            let flush_flag = Arc::new(AtomicBool::new(false));
                             let playout_notify = Arc::new((Mutex::new(false), Condvar::new()));
                             let cp_notify = Arc::new((Mutex::new(None), Condvar::new()));
                             let session_cancel = CancellationToken::new();
 
                             // Spawn send loop — paces outgoing audio at 20ms intervals
+                            // Uses AudioBuffer.drain() matching SIP's RTP send loop pattern
                             let enc = encoding;
                             let wstx = ws_tx.clone();
-                            let (m, p, f, pn) = (muted.clone(), paused.clone(), flush_flag.clone(), playout_notify.clone());
+                            let ab = audio_buf.clone();
+                            let (m, p, pn) = (muted.clone(), paused.clone(), playout_notify.clone());
                             let sc = session_cancel.clone();
+                            let input_spf: usize = 320; // 16kHz × 20ms = 320 samples per frame
                             tokio::spawn(async move {
                                 let mut iv = tokio::time::interval(Duration::from_millis(20));
                                 // speexdsp resampler for 16kHz→8kHz (if needed for this encoding)
@@ -381,14 +409,15 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                                 } else { None };
                                 loop {
                                     tokio::select! { _ = sc.cancelled() => break, _ = iv.tick() => {} }
-                                    if f.swap(false, Ordering::Relaxed) {
-                                        while orx.try_recv().is_ok() {}
-                                        if let Ok(mut d) = pn.0.lock() { *d = true; pn.1.notify_all(); }
-                                        continue;
-                                    }
                                     if p.load(Ordering::Relaxed) { continue; }
-                                    match orx.try_recv() {
-                                        Ok(samples) if !m.load(Ordering::Relaxed) => {
+
+                                    // Drain exactly input_spf samples from AudioBuffer.
+                                    // This also fires any deferred completion callbacks if buffer
+                                    // dropped below threshold (matching SIP's RTP send loop).
+                                    let samples = ab.drain(input_spf);
+
+                                    if !samples.is_empty() {
+                                        if !m.load(Ordering::Relaxed) {
                                             let payload = encode_for_plivo(&samples, enc, &mut downsampler);
                                             let b64 = base64::engine::general_purpose::STANDARD.encode(&payload);
                                             let json = serde_json::to_string(&serde_json::json!({
@@ -397,8 +426,12 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                                             })).unwrap_or_default();
                                             let _ = wstx.send(Message::Text(json));
                                         }
-                                        Ok(_) => {} // Muted — consume frame but don't send
-                                        Err(_) => { if let Ok(mut d) = pn.0.lock() { *d = true; pn.1.notify_all(); } } // Queue empty
+                                        // Muted — frame consumed by drain but not sent
+                                    } else {
+                                        // No audio — notify playout completion
+                                        if ab.is_empty() {
+                                            if let Ok(mut d) = pn.0.lock() { *d = true; pn.1.notify_all(); }
+                                        }
                                     }
                                 }
                             });
@@ -406,14 +439,16 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                             sessions.lock().unwrap().insert(sid, StreamSession {
                                 call_id: start.call_id.clone(), stream_id: start.stream_id.clone(),
                                 ws_tx: ws_tx.clone(), incoming_tx: itx.clone(), incoming_rx: irx.clone(),
-                                outgoing_tx: otx, extra_headers: headers.clone(), encoding,
-                                muted, paused, flush_flag, playout_notify,
+                                audio_buf, extra_headers: headers.clone(), encoding,
+                                muted, paused, playout_notify,
                                 checkpoint_counter: AtomicU64::new(0), checkpoint_notify: cp_notify,
                                 cancel: session_cancel,
                             });
 
                             let mut session = crate::sip::call::CallSession::new(sid, crate::sip::call::CallDirection::Inbound);
+                            session.call_uuid = Some(start.call_id.clone());
                             session.remote_uri = start.call_id;
+                            session.local_uri = start.stream_id.clone();
                             session.extra_headers = headers;
                             let _ = etx.try_send(EndpointEvent::IncomingCall { session });
                             let _ = etx.try_send(EndpointEvent::CallMediaActive { call_id: sid });
@@ -478,6 +513,16 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                 }
             }
         }
+    }
+
+    // Cleanup on WS disconnect (handles abrupt disconnects without "stop" event)
+    // If session still exists, it means we broke out of the loop without a "stop" event
+    // (e.g., caller hung up, network drop, Plivo closed WS without sending "stop")
+    if let Some(sess) = sessions.lock().unwrap().remove(&sid) {
+        sess.cancel.cancel();
+        let session = crate::sip::call::CallSession::new(sid, crate::sip::call::CallDirection::Inbound);
+        let _ = etx.try_send(EndpointEvent::CallTerminated { session, reason: "ws disconnected".into() });
+        info!("Session {} cleaned up (WS disconnected)", sid);
     }
 }
 

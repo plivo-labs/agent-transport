@@ -712,6 +712,24 @@ impl AudioStreamEndpoint {
         self.inner.send_audio(session_id, &frame).map_err(py_err)
     }
 
+    /// Pushes audio into the shared buffer with backpressure callback.
+    /// If buffer is below threshold, `notify_fn` fires immediately.
+    /// If above threshold, `notify_fn` fires when buffer drains.
+    /// Matches SipEndpoint.send_audio_notify — used by SipAudioSource.
+    fn send_audio_notify(&self, py: Python, session_id: i32, audio: &[u8], sample_rate: u32, num_channels: u32, notify_fn: Py<PyAny>) -> PyResult<()> {
+        let frame = RustAudioFrame::from_bytes(audio, sample_rate, num_channels);
+        let callback: Box<dyn FnOnce() + Send> = Box::new(move || {
+            Python::with_gil(|py| {
+                if let Err(e) = notify_fn.call0(py) {
+                    e.print(py);
+                }
+            });
+        });
+        let inner = &self.inner;
+        py.allow_threads(move || inner.send_audio_with_callback(session_id, &frame, callback))
+            .map_err(py_err)
+    }
+
     fn recv_audio(&self, session_id: i32) -> PyResult<Option<AudioFrame>> {
         self.inner.recv_audio(session_id).map(|opt| opt.map(AudioFrame::from_rust)).map_err(py_err)
     }

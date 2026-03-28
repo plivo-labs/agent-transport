@@ -1,98 +1,143 @@
-#!/usr/bin/env python3
-"""LiveKit voice agent over Plivo audio streaming.
+"""Audio streaming voice agent with tool calling and DTMF support.
 
-Starts a WebSocket server that Plivo connects to. Runs a LiveKit
-VoicePipelineAgent (STT → LLM → TTS) over the Plivo audio stream.
+Plivo connects to your WebSocket server and streams audio bidirectionally.
+No SIP credentials needed — configure Plivo XML to point to your server.
 
-No LiveKit server or WebRTC needed — audio flows over Plivo WebSocket.
-
-Prerequisites:
-    cd crates/agent-transport-python && maturin develop --features audio-stream
-    cd python && pip install -e ".[livekit]"
-    pip install livekit-agents livekit-plugins-deepgram livekit-plugins-openai
+Uses the same LiveKit Agents patterns as WebRTC — get_job_context().room works,
+DTMF events come through room.on("sip_dtmf_received"), built-in tools like
+send_dtmf_events work out of the box.
 
 Setup:
     Configure Plivo XML answer URL to return:
     <Response>
-        <Stream bidirectional="true" url="ws://your-server:8080" />
+        <Stream bidirectional="true" keepCallAlive="true"
+            contentType="audio/x-mulaw;rate=8000">
+            wss://your-server:8765
+        </Stream>
     </Response>
 
 Usage:
-    PLIVO_AUTH_ID=xxx PLIVO_AUTH_TOKEN=yyy \
-    DEEPGRAM_API_KEY=xxx OPENAI_API_KEY=xxx \
-    python examples/livekit_audio_stream_agent.py
+    python examples/livekit/audio_stream_agent.py start       # production
+    python examples/livekit/audio_stream_agent.py dev         # dev mode
+    python examples/livekit/audio_stream_agent.py debug       # full debug
 """
 
-import asyncio
 import logging
 import os
 
-from agent_transport import AudioStreamEndpoint
-from agent_transport.sip.livekit import AudioStreamInput, AudioStreamOutput
+from dotenv import load_dotenv
 
-from livekit.agents.voice import AgentSession, Agent
-from livekit.plugins import deepgram, openai
+from agent_transport.sip.livekit import AudioStreamServer, AudioStreamCallContext
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from livekit.agents import Agent, AgentSession, RunContext, TurnHandlingOptions
+from livekit.agents.llm import function_tool
+from livekit.agents.job import get_job_context
+from livekit.agents.beta.tools import send_dtmf_events
+from livekit.plugins import deepgram, openai, silero
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+load_dotenv()
+
+logger = logging.getLogger("audio-stream-agent")
+
+server = AudioStreamServer(
+    listen_addr=os.environ.get("AUDIO_STREAM_ADDR", "0.0.0.0:8765"),
+    plivo_auth_id=os.environ.get("PLIVO_AUTH_ID", ""),
+    plivo_auth_token=os.environ.get("PLIVO_AUTH_TOKEN", ""),
+)
 
 
-class PhoneAgent(Agent):
-    def __init__(self):
+@server.setup()
+def prewarm():
+    return {
+        "vad": silero.VAD.load(),
+        "turn_detector": MultilingualModel(),
+    }
+
+
+class Assistant(Agent):
+    """Voice agent with tool calling and DTMF support.
+
+    Same Agent class works with both SIP and audio streaming —
+    just swap AudioStreamServer for AgentServer.
+    """
+
+    def __init__(self) -> None:
         super().__init__(
-            instructions="You are a helpful phone assistant. Keep responses brief and natural.",
+            instructions=(
+                "You are a helpful phone assistant. "
+                "Keep responses concise and conversational. "
+                "Do not use emojis, asterisks, markdown, or special formatting."
+            ),
+            # LiveKit's built-in send_dtmf_events tool — works via Room facade
+            tools=[send_dtmf_events],
         )
 
+    async def on_enter(self) -> None:
+        # DTMF handling — same pattern as LiveKit WebRTC:
+        # get_job_context().room.on("sip_dtmf_received", handler)
+        job_ctx = get_job_context()
+        job_ctx.room.on("sip_dtmf_received", self._on_dtmf)
 
-async def handle_session(ep, session_id: int):
-    """Run the voice pipeline for a single audio stream session."""
-    audio_input = AudioStreamInput(ep, session_id)
-    audio_output = AudioStreamOutput(ep, session_id)
+        self.session.generate_reply(
+            instructions="Greet the user and ask how you can help."
+        )
 
+    def _on_dtmf(self, ev) -> None:
+        """Handle incoming DTMF digits — same as LiveKit WebRTC pattern."""
+        logger.info("DTMF received: digit=%s code=%d", ev.digit, ev.code)
+
+    @function_tool
+    async def lookup_weather(
+        self, context: RunContext, location: str, latitude: str, longitude: str
+    ) -> str:
+        """Called when the user asks for weather related information.
+        Ensure the user's location (city or region) is provided.
+        When given a location, please estimate the latitude and longitude
+        and do not ask the user for them.
+
+        Args:
+            location: The location they are asking for
+            latitude: The latitude of the location, do not ask user for it
+            longitude: The longitude of the location, do not ask user for it
+        """
+        logger.info("Looking up weather for %s", location)
+        return f"The weather in {location} is sunny with a temperature of 72 degrees."
+
+    @function_tool
+    async def end_call(self, context: RunContext) -> str:
+        """Ends the current call and disconnects.
+
+        Call when:
+        - The user clearly indicates they are done (e.g., "that's all, bye")
+        - The conversation is complete and should end
+
+        Do not call when:
+        - The user asks to pause, hold, or transfer
+        - Intent is unclear
+        """
+        logger.info("End call requested")
+        context.session.shutdown()
+        return "Say goodbye to the user."
+
+
+@server.audio_stream_session()
+async def entrypoint(ctx: AudioStreamCallContext):
     session = AgentSession(
-        stt=deepgram.STT(),
-        llm=openai.LLM(model="gpt-4o-mini"),
+        vad=ctx.userdata["vad"],
+        stt=deepgram.STT(model="nova-3"),
+        llm=openai.LLM(model="gpt-4.1-mini"),
         tts=openai.TTS(voice="alloy"),
+        turn_handling=TurnHandlingOptions(
+            turn_detection=ctx.userdata["turn_detector"],
+        ),
+        preemptive_generation=True,
+        aec_warmup_duration=3.0,
+        tts_text_transforms=["filter_emoji", "filter_markdown"],
     )
-
-    session.input.audio = audio_input
-    session.output.audio = audio_output
-
-    logger.info("Starting voice pipeline for session %d", session_id)
-    await session.start(agent=PhoneAgent(), capture_run=True)
-    logger.info("Session %d ended", session_id)
-
-
-async def main():
-    ep = AudioStreamEndpoint(
-        listen_addr="0.0.0.0:8080",
-        plivo_auth_id=os.environ.get("PLIVO_AUTH_ID", ""),
-        plivo_auth_token=os.environ.get("PLIVO_AUTH_TOKEN", ""),
-    )
-    logger.info("WebSocket server listening on 0.0.0.0:8080")
-
-    loop = asyncio.get_running_loop()
-
-    try:
-        while True:
-            logger.info("Waiting for Plivo to connect...")
-            event = await loop.run_in_executor(None, lambda: ep.wait_for_event(timeout_ms=0))
-            if not event or event["type"] != "incoming_call":
-                continue
-
-            session_id = event["session"]["call_id"]
-            logger.info("Plivo connected — session %d", session_id)
-
-            # Wait for media active
-            await loop.run_in_executor(None, lambda: ep.wait_for_event(timeout_ms=5000))
-
-            # Run pipeline (blocks until stream ends)
-            await handle_session(ep, session_id)
-    except KeyboardInterrupt:
-        pass
-
-    ep.shutdown()
+    # Same pattern as LiveKit WebRTC: session.start(agent=, room=ctx.room)
+    await ctx.start(session, agent=Assistant())
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    server.run()

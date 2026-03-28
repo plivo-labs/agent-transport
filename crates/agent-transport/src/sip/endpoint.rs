@@ -94,7 +94,7 @@ async fn setup_rtp(
     debug!("Call {} negotiated: codec={:?} dtmf_pt={} ptime={}ms remote_rtp={}", call_id, answer.codec, dtmf_pt, answer.ptime_ms, remote_rtp);
     let rtp = Arc::new(RtpTransport::new(Arc::new(rtp_sock), remote_rtp, answer.codec, ctx.cancel.clone(), dtmf_pt, answer.ptime_ms));
 
-    let (itx, irx) = crossbeam_channel::bounded(100);
+    let (itx, irx) = crossbeam_channel::unbounded();
     rtp.start_send_loop(ctx.audio_buf.clone(), ctx.muted.clone(), ctx.paused.clone(), ctx.playout_notify.clone(), ctx.recorder.clone());
     rtp.start_recv_loop(itx, etx.clone(), call_id, ctx.beep_detector.clone(), ctx.held.clone(), ctx.recorder.clone());
 
@@ -161,7 +161,7 @@ fn start_session_timer(
 
 fn new_call_context(call_id: i32, direction: CallDirection, cc: CancellationToken) -> (CallContext, CallSession) {
     let session = CallSession::new(call_id, direction);
-    let (_itx, irx) = crossbeam_channel::bounded(100);
+    let (_itx, irx) = crossbeam_channel::unbounded();
     let ctx = CallContext {
         session: session.clone(), rtp: None,
         audio_buf: Arc::new(AudioBuffer::new()),

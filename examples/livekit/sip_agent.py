@@ -1,12 +1,16 @@
-"""SIP voice agent with tool calling — handles inbound and outbound calls.
+"""SIP voice agent with tool calling and DTMF support.
 
-Inbound:  SIP INVITE arrives → agent answers and starts conversation
+Inbound:  SIP INVITE arrives -> agent answers and starts conversation
 Outbound: POST /call {"to": "sip:+15551234567@provider.com"}
 
+Uses the same LiveKit Agents patterns as WebRTC — get_job_context().room works,
+DTMF events come through room.on("sip_dtmf_received"), built-in tools like
+send_dtmf_events work out of the box.
+
 Usage:
-    python examples/livekit/livekit_sip_agent.py start       # production
-    python examples/livekit/livekit_sip_agent.py dev         # dev mode
-    python examples/livekit/livekit_sip_agent.py debug       # full debug
+    python examples/livekit/sip_agent.py start       # production
+    python examples/livekit/sip_agent.py dev         # dev mode
+    python examples/livekit/sip_agent.py debug       # full debug
 """
 
 import logging
@@ -18,6 +22,8 @@ from agent_transport.sip.livekit import AgentServer, CallContext
 
 from livekit.agents import Agent, AgentSession, RunContext, TurnHandlingOptions
 from livekit.agents.llm import function_tool
+from livekit.agents.job import get_job_context
+from livekit.agents.beta.tools import send_dtmf_events
 from livekit.plugins import deepgram, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
@@ -41,6 +47,12 @@ def prewarm():
 
 
 class Assistant(Agent):
+    """Voice agent with tool calling and DTMF support.
+
+    Same Agent class works with both SIP and audio streaming —
+    just swap AgentServer for AudioStreamServer.
+    """
+
     def __init__(self) -> None:
         super().__init__(
             instructions=(
@@ -48,12 +60,23 @@ class Assistant(Agent):
                 "Keep responses concise and conversational. "
                 "Do not use emojis, asterisks, markdown, or special formatting."
             ),
+            # LiveKit's built-in send_dtmf_events tool — works via Room facade
+            tools=[send_dtmf_events],
         )
 
     async def on_enter(self) -> None:
+        # DTMF handling — same pattern as LiveKit WebRTC:
+        # get_job_context().room.on("sip_dtmf_received", handler)
+        job_ctx = get_job_context()
+        job_ctx.room.on("sip_dtmf_received", self._on_dtmf)
+
         self.session.generate_reply(
             instructions="Greet the user and ask how you can help."
         )
+
+    def _on_dtmf(self, ev) -> None:
+        """Handle incoming DTMF digits — same as LiveKit WebRTC pattern."""
+        logger.info("DTMF received: digit=%s code=%d", ev.digit, ev.code)
 
     @function_tool
     async def lookup_weather(

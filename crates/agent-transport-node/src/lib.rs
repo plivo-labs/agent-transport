@@ -503,6 +503,22 @@ impl SipEndpoint {
         self.inner.send_audio(call_id, &frame).map_err(napi_err)
     }
 
+    /// Send raw PCM bytes with async completion notification (backpressure).
+    /// The callback fires when the buffer drains below threshold.
+    /// Matches Python's send_audio_notify pattern.
+    #[napi(ts_args_type = "callId: number, audio: Buffer, sampleRate: number, numChannels: number, notifyFn: () => void")]
+    pub fn send_audio_notify(&self, call_id: i32, audio: Vec<u8>, sample_rate: u32, num_channels: u32, notify_fn: JsFunction) -> Result<()> {
+        let frame = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
+        let tsfn: ThreadsafeFunction<(), ErrorStrategy::CalleeHandled> =
+            notify_fn.create_threadsafe_function(0, |ctx: ThreadSafeCallContext<()>| {
+                Ok(vec![ctx.env.get_undefined()?])
+            })?;
+        let callback: Box<dyn FnOnce() + Send> = Box::new(move || {
+            tsfn.call(Ok(()), ThreadsafeFunctionCallMode::NonBlocking);
+        });
+        self.inner.send_audio_with_callback(call_id, &frame, callback).map_err(napi_err)
+    }
+
     /// Receive audio frame, blocking until available or timeout (ms).
     #[napi]
     pub fn recv_audio_blocking(&self, call_id: i32, timeout_ms: Option<u32>) -> Result<Option<AudioFrame>> {
@@ -553,10 +569,12 @@ impl SipEndpoint {
         1
     }
 
+    /// Start recording a call to a stereo WAV file (L=user, R=agent).
+    /// Set stereo=false for mono (mixed).
     #[napi]
-    pub fn start_recording(&self, call_id: i32, path: String) -> Result<()> {
+    pub fn start_recording(&self, call_id: i32, path: String, stereo: Option<bool>) -> Result<()> {
         self.inner
-            .start_recording(call_id, &path)
+            .start_recording(call_id, &path, stereo.unwrap_or(true))
             .map_err(napi_err)
     }
 
@@ -723,6 +741,21 @@ impl AudioStreamEndpoint {
     pub fn send_audio_bytes(&self, session_id: i32, audio: Vec<u8>, sample_rate: u32, num_channels: u32) -> Result<()> {
         let f = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
         self.inner.send_audio(session_id, &f).map_err(napi_err)
+    }
+
+    /// Send raw PCM bytes with async completion notification (backpressure).
+    /// Matches SipEndpoint.send_audio_notify — used by SipAudioSource adapters.
+    #[napi(ts_args_type = "sessionId: number, audio: Buffer, sampleRate: number, numChannels: number, notifyFn: () => void")]
+    pub fn send_audio_notify(&self, session_id: i32, audio: Vec<u8>, sample_rate: u32, num_channels: u32, notify_fn: JsFunction) -> Result<()> {
+        let frame = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
+        let tsfn: ThreadsafeFunction<(), ErrorStrategy::CalleeHandled> =
+            notify_fn.create_threadsafe_function(0, |ctx: ThreadSafeCallContext<()>| {
+                Ok(vec![ctx.env.get_undefined()?])
+            })?;
+        let callback: Box<dyn FnOnce() + Send> = Box::new(move || {
+            tsfn.call(Ok(()), ThreadsafeFunctionCallMode::NonBlocking);
+        });
+        self.inner.send_audio_with_callback(session_id, &frame, callback).map_err(napi_err)
     }
 
     #[napi]
