@@ -349,7 +349,29 @@ export class AgentServer {
       }
 
       try {
-        await this.entrypointFn!(ctx);
+        // Wrap in runWithJobContext so getJobContext().room works inside handler
+        // (matches LiveKit WebRTC where entrypoint runs inside job context)
+        let agents: any;
+        try { agents = await import('@livekit/agents'); } catch {}
+
+        const stub = {
+          room: ctx.room,
+          job: { id: `job-${callId}`, agentName: this.agentName, enableRecording: false },
+          _primaryAgentSession: null as any,
+          sessionDirectory: '/tmp',
+          proc: { executorType: null },
+          inferenceExecutor: this.inferenceExecutor,
+          initRecording: () => {},
+          connect: async () => {},
+          addShutdownCallback: () => {},
+          shutdown: () => {},
+        };
+
+        if (agents?.runWithJobContext) {
+          await agents.runWithJobContext(stub, () => this.entrypointFn!(ctx));
+        } else {
+          await this.entrypointFn!(ctx);
+        }
       } catch (e) {
         console.error(`Call ${callId} handler failed:`, e);
       } finally {
