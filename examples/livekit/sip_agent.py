@@ -137,7 +137,8 @@ async def entrypoint(ctx: CallContext):
         aec_warmup_duration=3.0,
         tts_text_transforms=["filter_emoji", "filter_markdown"],
     )
-    await ctx.start(session, agent=Assistant())
+    ctx.session = session
+    await session.start(agent=Assistant(), room=ctx.room)
 
 
 if __name__ == "__main__":

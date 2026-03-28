@@ -1,11 +1,16 @@
 /**
  * CallContext — equivalent of LiveKit's JobContext for SIP/AudioStream calls.
  *
- * Creates a TransportRoom facade so get_job_context().room works,
- * enabling DTMF (GetDtmfTask), background audio, transcription, etc.
+ * Matches LiveKit's standard pattern exactly:
+ *   server.sipSession(async (ctx) => {
+ *     const session = new voice.AgentSession({ ... });
+ *     ctx.session = session;
+ *     await session.start({ agent, room: ctx.room });
+ *   });
  *
- * Matches LiveKit WebRTC pattern:
- *   await session.start({ agent, room: ctx.room })
+ * Setting ctx.session automatically wires SIP audio I/O and registers
+ * the close handler. Then session.start({ room: ctx.room }) works exactly
+ * like LiveKit WebRTC.
  */
 
 import type { SipEndpoint } from 'agent-transport';
@@ -45,7 +50,7 @@ export class CallContext {
     this._callEnded = opts.callEnded;
     this._resolveCallEnded = opts.resolveCallEnded;
 
-    // Create Room facade — matches Python's ctx._room
+    // Create Room facade
     this.room = new TransportRoom(opts.endpoint as any, opts.callId, {
       agentName: opts.agentName ?? 'sip-agent',
       callerIdentity: opts.remoteUri,
@@ -57,39 +62,28 @@ export class CallContext {
   }
 
   /**
-   * Wire SIP audio I/O, start the agent session, and wait for call to end.
+   * Set the agent session — automatically wires SIP audio I/O.
    *
-   * Creates Room facade so LiveKit features (DTMF, background audio) work.
-   * Matches LiveKit WebRTC: await session.start({ agent, room: ctx.room })
+   * After setting ctx.session, call session.start({ agent, room: ctx.room })
+   * directly — matches LiveKit WebRTC pattern exactly.
    */
-  async start(session: any, opts: { agent: any }): Promise<void> {
-    const input = new SipAudioInput(this.endpoint, this.callId);
-    const output = new SipAudioOutput(this.endpoint, this.callId);
-
-    session.input.audio = input;
-    session.output.audio = output;
+  set session(session: any) {
     this._session = session;
 
+    // Wire SIP audio I/O before session.start() is called
+    session.input.audio = new SipAudioInput(this.endpoint, this.callId);
+    session.output.audio = new SipAudioOutput(this.endpoint, this.callId);
+
     // Listen to session close event — handles agent-initiated shutdown
-    // (matches Python's @session.on("close") pattern and LiveKit WebRTC's
-    // RoomIO._on_agent_session_close)
     session.on('close', () => {
       console.log(`Call ${this.callId} session closed`);
       this._resolveCallEnded();
-      // Send BYE to remote if agent initiated hangup
       try { this.endpoint.hangup(this.callId); } catch {}
     });
+  }
 
-    try {
-      // Pass room= so AgentSession creates RoomIO (audio disabled since I/O already set)
-      await session.start({ agent: opts.agent, room: this.room });
-
-      // Wait for call to end (resolved by either call_terminated event or session close)
-      await this._callEnded;
-    } finally {
-      // Room cleanup — only emit disconnected, not participant_disconnected
-      // (participant_disconnected already emitted by server event loop on call_terminated)
-      this.room._onSessionEnded();
-    }
+  /** @internal Wait for call to end — called by server after entrypoint returns */
+  get callEnded(): Promise<void> {
+    return this._callEnded;
   }
 }

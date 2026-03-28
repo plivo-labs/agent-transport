@@ -97,7 +97,8 @@ server.sipSession(async (ctx: CallContext) => {
     metrics.logMetrics(ev.metrics);
   });
 
-  await ctx.start(session, { agent });
+  ctx.session = session;
+  await session.start({ agent, room: ctx.room });
 
   // Greet the user once the session is started
   session.say('Hello, how can I help you today?');

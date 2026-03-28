@@ -372,6 +372,9 @@ export class AgentServer {
         } else {
           await this.entrypointFn!(ctx);
         }
+        // Entrypoint returned — session.start() is non-blocking,
+        // so wait for call to actually end (BYE or agent shutdown)
+        await ctx.callEnded;
       } catch (e) {
         console.error(`Call ${callId} handler failed:`, e);
       } finally {

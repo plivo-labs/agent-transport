@@ -234,7 +234,8 @@ server.sipSession(async (ctx: CallContext) => {
     metrics.logMetrics(ev.metrics);
   });
 
-  await ctx.start(session, { agent: GreeterAgent.create() });
+  ctx.session = session;
+  await session.start({ agent: GreeterAgent.create(), room: ctx.room });
 });
 
 server.run();

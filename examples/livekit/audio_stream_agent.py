@@ -136,7 +136,8 @@ async def entrypoint(ctx: AudioStreamCallContext):
         tts_text_transforms=["filter_emoji", "filter_markdown"],
     )
     # Same pattern as LiveKit WebRTC: session.start(agent=, room=ctx.room)
-    await ctx.start(session, agent=Assistant())
+    ctx.session = session
+    await session.start(agent=Assistant(), room=ctx.room)
 
 
 if __name__ == "__main__":

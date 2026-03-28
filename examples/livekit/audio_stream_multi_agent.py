@@ -255,7 +255,8 @@ async def entrypoint(ctx: AudioStreamCallContext):
         aec_warmup_duration=3.0,
         tts_text_transforms=["filter_emoji", "filter_markdown"],
     )
-    await ctx.start(session, agent=GreeterAgent())
+    ctx.session = session
+    await session.start(agent=GreeterAgent(), room=ctx.room)
 
 
 if __name__ == "__main__":

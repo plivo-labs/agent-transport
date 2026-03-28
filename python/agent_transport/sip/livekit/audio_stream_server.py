@@ -153,12 +153,20 @@ class _LoadMonitor:
 class AudioStreamCallContext:
     """Context passed to the @audio_stream_session handler.
 
-    Use ctx.start(session, agent=) to wire audio I/O and start the agent.
+    Matches LiveKit's standard pattern exactly:
+        @server.audio_stream_session()
+        async def entrypoint(ctx: AudioStreamCallContext):
+            session = AgentSession(vad=..., stt=..., llm=..., tts=...)
+            ctx.session = session
+            await session.start(agent=Assistant(), room=ctx.room)
+
+    Setting ctx.session automatically wires audio stream I/O and registers
+    the close handler. Then session.start(room=ctx.room) works exactly
+    like LiveKit WebRTC.
 
     DTMF events (equivalent of room.on("sip_dtmf_received") in WebRTC):
-        @ctx.on("dtmf_received")
-        def handle_dtmf(digit: str):
-            print(f"DTMF: {digit}")
+        job_ctx = get_job_context()
+        job_ctx.room.on("sip_dtmf_received", handler)
     """
 
     session_id: str
@@ -177,49 +185,22 @@ class AudioStreamCallContext:
     _job_ctx_token: Any = field(default=None, repr=False)
     _event_listeners: dict = field(default_factory=dict, repr=False)
 
-    def on(self, event_name: str, callback: Callable | None = None) -> Callable:
-        """Register an event listener. Can be used as a decorator.
-
-        Equivalent of room.on("sip_dtmf_received", handler) in WebRTC.
-
-        Events:
-            - "dtmf_received": Called with (digit: str) when DTMF is received
-        """
-        def decorator(fn):
-            self._event_listeners.setdefault(event_name, []).append(fn)
-            return fn
-        if callback is not None:
-            return decorator(callback)
-        return decorator
-
-    def _emit(self, event_name: str, *args, **kwargs) -> None:
-        for listener in self._event_listeners.get(event_name, []):
-            try:
-                listener(*args, **kwargs)
-            except Exception:
-                logger.exception("Error in %s listener", event_name)
-
     @property
-    def room(self):
-        """Room facade — use with session.start(room=ctx.room) like LiveKit WebRTC."""
-        return self._room
+    def session(self):
+        return self._session
 
-    async def start(self, session: Any, *, agent: Any, **kwargs) -> None:
-        """Wire audio stream I/O, start the agent session, and wait for stream to end.
+    @session.setter
+    def session(self, session: Any) -> None:
+        """Set the agent session — automatically wires audio stream I/O.
 
-        Matches LiveKit's standard pattern:
-            await session.start(agent=MyAgent(), room=ctx.room)
-
-        The Room facade is created automatically, and get_job_context().room works
-        for DTMF, background audio, transcription, etc.
-
-        Blocks until the Plivo audio stream is terminated.
+        This replaces the manual ctx.start() pattern. After setting ctx.session,
+        call session.start(agent=, room=ctx.room) directly.
         """
-        # Wire audio I/O BEFORE session.start — AgentSession will skip
-        # RoomIO audio when it sees these are already set (lines 664-676)
+        self._session = session
+
+        # Wire audio stream I/O before session.start() is called
         session.input.audio = AudioStreamInput(self.endpoint, self.session_id)
         session.output.audio = AudioStreamOutput(self.endpoint, self.session_id)
-        self._session = session
 
         # Listen to session close event — handles agent-initiated shutdown
         @session.on("close")
@@ -240,19 +221,26 @@ class AudioStreamCallContext:
             def _on_user_state(ev):
                 logger.info("Session %s user: %s -> %s", self.session_id, ev.old_state, ev.new_state)
 
-        try:
-            # Pass room=self._room so AgentSession creates RoomIO with audio disabled
-            # but text/transcription enabled — same as LiveKit WebRTC pattern
-            await session.start(agent=agent, room=self._room, **kwargs)
+    def on(self, event_name: str, callback: Callable | None = None) -> Callable:
+        """Register an event listener. Can be used as a decorator."""
+        def decorator(fn):
+            self._event_listeners.setdefault(event_name, []).append(fn)
+            return fn
+        if callback is not None:
+            return decorator(callback)
+        return decorator
 
-            if self._call_ended is not None:
-                await self._call_ended.wait()
-        finally:
-            from livekit.agents.job import _JobContextVar
+    def _emit(self, event_name: str, *args, **kwargs) -> None:
+        for listener in self._event_listeners.get(event_name, []):
             try:
-                _JobContextVar.reset(self._job_ctx_token)
-            except ValueError:
-                pass
+                listener(*args, **kwargs)
+            except Exception:
+                logger.exception("Error in %s listener", event_name)
+
+    @property
+    def room(self):
+        """Room facade — use with session.start(room=ctx.room) like LiveKit WebRTC."""
+        return self._room
 
 
 # ─── AudioStreamServer ───────────────────────────────────────────────────────
@@ -613,6 +601,10 @@ class AudioStreamServer:
 
             try:
                 await self._entrypoint_fnc(ctx)
+                # Entrypoint returned — session.start() is non-blocking,
+                # so wait for stream to actually end (Plivo stop or agent shutdown)
+                if session_ended and not session_ended.is_set():
+                    await session_ended.wait()
             except Exception:
                 logger.exception("Session %s handler failed", session_id)
             finally:

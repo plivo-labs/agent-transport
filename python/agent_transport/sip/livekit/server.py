@@ -157,12 +157,20 @@ class _LoadMonitor:
 class CallContext:
     """Context passed to the @sip_session handler — equivalent of LiveKit's JobContext.
 
-    Use ctx.start(session, agent=) to wire SIP audio and start the agent.
+    Matches LiveKit's standard pattern exactly:
+        @server.sip_session()
+        async def entrypoint(ctx: CallContext):
+            session = AgentSession(vad=..., stt=..., llm=..., tts=...)
+            ctx.session = session
+            await session.start(agent=Assistant(), room=ctx.room)
+
+    Setting ctx.session automatically wires SIP audio I/O and registers
+    the close handler. Then session.start(room=ctx.room) works exactly
+    like LiveKit WebRTC.
 
     DTMF events (equivalent of room.on("sip_dtmf_received") in WebRTC):
-        @ctx.on("dtmf_received")
-        def handle_dtmf(digit: str):
-            print(f"DTMF: {digit}")
+        job_ctx = get_job_context()
+        job_ctx.room.on("sip_dtmf_received", handler)
     """
 
     call_id: str
@@ -179,14 +187,44 @@ class CallContext:
     _job_ctx_token: Any = field(default=None, repr=False)
     _event_listeners: dict = field(default_factory=dict, repr=False)
 
-    def on(self, event_name: str, callback: Callable | None = None) -> Callable:
-        """Register an event listener. Can be used as a decorator.
+    @property
+    def session(self):
+        return self._session
 
-        Equivalent of room.on("sip_dtmf_received", handler) in WebRTC.
+    @session.setter
+    def session(self, session: Any) -> None:
+        """Set the agent session — automatically wires SIP audio I/O.
 
-        Events:
-            - "dtmf_received": Called with (digit: str) when DTMF is received
+        This replaces the manual ctx.start() pattern. After setting ctx.session,
+        call session.start(agent=, room=ctx.room) directly.
         """
+        self._session = session
+
+        # Wire SIP audio I/O before session.start() is called
+        session.input.audio = SipAudioInput(self.endpoint, self.call_id)
+        session.output.audio = SipAudioOutput(self.endpoint, self.call_id)
+
+        # Listen to session close event — handles agent-initiated shutdown
+        @session.on("close")
+        def _on_session_close(ev):
+            logger.info("Call %s session closed (reason=%s)", self.call_id, getattr(ev, 'reason', 'unknown'))
+            if self._call_ended is not None and not self._call_ended.is_set():
+                self._call_ended.set()
+            try:
+                self.endpoint.hangup(self.call_id)
+            except Exception:
+                pass
+
+        if logging.getLogger("agent_transport.sip").isEnabledFor(logging.DEBUG):
+            @session.on("agent_state_changed")
+            def _on_agent_state(ev):
+                logger.info("Call %s agent: %s -> %s", self.call_id, ev.old_state, ev.new_state)
+            @session.on("user_state_changed")
+            def _on_user_state(ev):
+                logger.info("Call %s user: %s -> %s", self.call_id, ev.old_state, ev.new_state)
+
+    def on(self, event_name: str, callback: Callable | None = None) -> Callable:
+        """Register an event listener. Can be used as a decorator."""
         def decorator(fn):
             self._event_listeners.setdefault(event_name, []).append(fn)
             return fn
@@ -205,54 +243,6 @@ class CallContext:
     def room(self):
         """Room facade — use with session.start(room=ctx.room) like LiveKit WebRTC."""
         return self._room
-
-    async def start(self, session: Any, *, agent: Any, **kwargs) -> None:
-        """Wire SIP audio I/O, start the agent session, and wait for call to end.
-
-        Matches LiveKit's standard pattern:
-            await session.start(agent=MyAgent(), room=ctx.room)
-
-        Blocks until the SIP call is terminated (BYE received).
-        """
-        session.input.audio = SipAudioInput(self.endpoint, self.call_id)
-        session.output.audio = SipAudioOutput(self.endpoint, self.call_id)
-        self._session = session
-
-        # Listen to session close event — handles agent-initiated shutdown
-        # (e.g., agent tool calls session.shutdown())
-        # Without this, ctx.start() blocks forever waiting for _call_ended
-        @session.on("close")
-        def _on_session_close(ev):
-            logger.info("Call %s session closed (reason=%s)", self.call_id, getattr(ev, 'reason', 'unknown'))
-            if self._call_ended is not None and not self._call_ended.is_set():
-                self._call_ended.set()
-            # Send BYE to remote if agent initiated hangup
-            try:
-                self.endpoint.hangup(self.call_id)
-            except Exception:
-                pass
-
-        if logging.getLogger("agent_transport.sip").isEnabledFor(logging.DEBUG):
-            @session.on("agent_state_changed")
-            def _on_agent_state(ev):
-                logger.info("Call %s agent: %s -> %s", self.call_id, ev.old_state, ev.new_state)
-            @session.on("user_state_changed")
-            def _on_user_state(ev):
-                logger.info("Call %s user: %s -> %s", self.call_id, ev.old_state, ev.new_state)
-
-        try:
-            await session.start(agent=agent, room=self._room, **kwargs)
-
-            if self._call_ended is not None:
-                await self._call_ended.wait()
-        finally:
-            # Don't emit participant_disconnected here — already emitted by event loop
-            # on call_terminated. RoomIO.aclose() runs inside session._aclose_impl().
-            from livekit.agents.job import _JobContextVar
-            try:
-                _JobContextVar.reset(self._job_ctx_token)
-            except ValueError:
-                pass
 
 
 class AgentServer:
@@ -693,6 +683,10 @@ class AgentServer:
 
             try:
                 await self._entrypoint_fnc(ctx)
+                # Entrypoint returned — session.start() is non-blocking,
+                # so wait for call to actually end (BYE or agent shutdown)
+                if call_ended and not call_ended.is_set():
+                    await call_ended.wait()
             except Exception:
                 logger.exception("Call %s handler failed", call_id)
             finally:

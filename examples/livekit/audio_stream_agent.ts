@@ -103,7 +103,8 @@ server.sipSession(async (ctx: CallContext) => {
     metrics.logMetrics(ev.metrics);
   });
 
-  await ctx.start(session, { agent });
+  ctx.session = session;
+  await session.start({ agent, room: ctx.room });
 
   session.say('Hello, how can I help you today?');
 });
