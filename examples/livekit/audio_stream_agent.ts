@@ -89,15 +89,12 @@ server.sipSession(async (ctx: JobContext) => {
     ttsTextTransforms: ['filterEmoji', 'filterMarkdown'],
   });
 
-  // DTMF handling — same pattern as LiveKit WebRTC
   try {
     const jobCtx = getJobContext();
     jobCtx.room.on('sip_dtmf_received', (ev: any) => {
       console.log(`DTMF received: digit=${ev.digit} code=${ev.code}`);
     });
-  } catch {
-    // getJobContext() not available outside job context
-  }
+  } catch {}
 
   session.on(voice.AgentSessionEventTypes.MetricsCollected, (ev) => {
     metrics.logMetrics(ev.metrics);

@@ -74,17 +74,17 @@ class Assistant(Agent):
         )
 
     async def on_enter(self) -> None:
-        # DTMF handling — same pattern as LiveKit WebRTC:
-        # get_job_context().room.on("sip_dtmf_received", handler)
         job_ctx = get_job_context()
         job_ctx.room.on("sip_dtmf_received", self._on_dtmf)
-
         self.session.generate_reply(
             instructions="Greet the user and ask how you can help."
         )
 
+    async def on_exit(self) -> None:
+        job_ctx = get_job_context()
+        job_ctx.room.off("sip_dtmf_received", self._on_dtmf)
+
     def _on_dtmf(self, ev) -> None:
-        """Handle incoming DTMF digits — same as LiveKit WebRTC pattern."""
         logger.info("DTMF received: digit=%s code=%d", ev.digit, ev.code)
 
     @function_tool

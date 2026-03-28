@@ -41,27 +41,35 @@ server.setup(() => ({
 // ─── Agents (class-based, matching LiveKit TS pattern) ───────────
 
 class GreeterAgent extends voice.Agent<CallData> {
+  private _dtmfHandler = (ev: any) => {
+    console.log(`DTMF received: ${ev.digit}`);
+    if (ev.digit === '1') {
+      this.session.generateReply({
+        instructions: 'The caller pressed 1 for sales. Ask for their name and route them.',
+      });
+    } else if (ev.digit === '2') {
+      this.session.generateReply({
+        instructions: 'The caller pressed 2 for support. Ask for their name and route them.',
+      });
+    }
+  };
+
   async onEnter() {
-    // DTMF handling — same pattern as LiveKit WebRTC
     try {
       const jobCtx = getJobContext();
-      jobCtx.room.on('sip_dtmf_received', (ev: any) => {
-        console.log(`DTMF received: ${ev.digit}`);
-        if (ev.digit === '1') {
-          this.session.generateReply({
-            instructions: 'The caller pressed 1 for sales. Ask for their name and route them.',
-          });
-        } else if (ev.digit === '2') {
-          this.session.generateReply({
-            instructions: 'The caller pressed 2 for support. Ask for their name and route them.',
-          });
-        }
-      });
+      jobCtx.room.on('sip_dtmf_received', this._dtmfHandler);
     } catch {}
 
     this.session.generateReply({
       instructions: 'Greet the caller and ask how you can help. Let them know they can press 1 for sales or 2 for support.',
     });
+  }
+
+  async onExit() {
+    try {
+      const jobCtx = getJobContext();
+      jobCtx.room.off('sip_dtmf_received', this._dtmfHandler);
+    } catch {}
   }
 
   static create() {

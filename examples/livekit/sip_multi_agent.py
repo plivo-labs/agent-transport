@@ -66,17 +66,18 @@ class GreeterAgent(Agent):
         )
 
     async def on_enter(self) -> None:
-        # DTMF handling — same pattern as LiveKit WebRTC
         job_ctx = get_job_context()
         job_ctx.room.on("sip_dtmf_received", self._on_dtmf)
-
         self.session.generate_reply(
             instructions="Greet the caller and ask how you can help them today. "
             "Let them know they can press 1 for sales or 2 for support."
         )
 
+    async def on_exit(self) -> None:
+        job_ctx = get_job_context()
+        job_ctx.room.off("sip_dtmf_received", self._on_dtmf)
+
     def _on_dtmf(self, ev) -> None:
-        """Handle DTMF — press 1 for sales, 2 for support."""
         logger.info("DTMF received: %s", ev.digit)
         if ev.digit == "1":
             self.session.generate_reply(
