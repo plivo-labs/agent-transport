@@ -71,7 +71,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         if media_active {
-            while let Ok(Some(frame)) = ep.recv_audio(call_id) {
+            while let Ok(Some(frame)) = ep.recv_audio(&call_id) {
                 sample_rate = frame.sample_rate;
                 num_channels = frame.num_channels;
                 all_samples.extend_from_slice(&frame.data);
@@ -80,7 +80,7 @@ fn main() -> anyhow::Result<()> {
 
         if call_start.elapsed() > Duration::from_secs(12) {
             println!("Hanging up after 12s.");
-            ep.hangup(call_id)?;
+            ep.hangup(&call_id)?;
         }
     }
 

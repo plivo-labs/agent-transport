@@ -80,7 +80,7 @@ fn main() -> anyhow::Result<()> {
 
         // Poll for received audio frames
         if media_active {
-            while let Ok(Some(frame)) = ep.recv_audio(call_id) {
+            while let Ok(Some(frame)) = ep.recv_audio(&call_id) {
                 frames_received += 1;
                 if last_stats.elapsed() >= Duration::from_secs(2) {
                     println!(
@@ -98,7 +98,7 @@ fn main() -> anyhow::Result<()> {
         // Auto-hangup after 15 seconds
         if call_start.elapsed() > Duration::from_secs(15) {
             println!("=== Auto-hanging up after 15s ===");
-            ep.hangup(call_id)?;
+            ep.hangup(&call_id)?;
         }
     }
 

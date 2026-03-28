@@ -44,7 +44,7 @@ except ImportError:
 class AudioStreamInputTransport(BaseInputTransport):
     """Receives audio + DTMF from Plivo audio stream."""
 
-    def __init__(self, endpoint, session_id: int, params: Optional[TransportParams] = None, **kwargs):
+    def __init__(self, endpoint, session_id: str, params: Optional[TransportParams] = None, **kwargs):
         if params is None:
             params = TransportParams(
                 audio_in_enabled=True,
@@ -119,7 +119,7 @@ class AudioStreamOutputTransport(BaseOutputTransport):
     - Proper interruption handling (task cancellation + restart)
     """
 
-    def __init__(self, endpoint, session_id: int, params: Optional[TransportParams] = None, **kwargs):
+    def __init__(self, endpoint, session_id: str, params: Optional[TransportParams] = None, **kwargs):
         if params is None:
             params = TransportParams(
                 audio_out_enabled=True,
@@ -188,7 +188,7 @@ class AudioStreamOutputTransport(BaseOutputTransport):
 class AudioStreamTransport(BaseTransport):
     """Pipecat transport for Plivo audio streaming via agent-transport."""
 
-    def __init__(self, endpoint, session_id: int, *, name: Optional[str] = None,
+    def __init__(self, endpoint, session_id: str, *, name: Optional[str] = None,
                  params: Optional[TransportParams] = None, **kwargs):
         super().__init__(name=name or "AudioStreamTransport", **kwargs)
         self._ep = endpoint

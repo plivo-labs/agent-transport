@@ -19,7 +19,7 @@
 //! let ep = SipEndpoint::new(config).unwrap();
 //! ep.register("user", "pass").unwrap();
 //! let call_id = ep.call("sip:+15551234567@phone.plivo.com", None).unwrap();
-//! ep.hangup(call_id).unwrap();
+//! ep.hangup(&call_id).unwrap();
 //! ep.shutdown().unwrap();
 //! ```
 

@@ -94,7 +94,7 @@ impl AudioFrame {
 #[derive(Clone)]
 struct CallSession {
     #[pyo3(get)]
-    call_id: i32,
+    call_id: String,
     #[pyo3(get)]
     call_uuid: Option<String>,
     #[pyo3(get)]
@@ -360,7 +360,7 @@ impl SipEndpoint {
 
     /// Make an outbound call. Returns call_id. Releases GIL (blocks on SIP signaling).
     #[pyo3(signature = (dest_uri, headers=None))]
-    fn call(&self, py: Python, dest_uri: &str, headers: Option<HashMap<String, String>>) -> PyResult<i32> {
+    fn call(&self, py: Python, dest_uri: &str, headers: Option<HashMap<String, String>>) -> PyResult<String> {
         let inner = &self.inner;
         let uri = dest_uri.to_string();
         py.allow_threads(move || inner.call(&uri, headers)).map_err(py_err)
@@ -368,27 +368,27 @@ impl SipEndpoint {
 
     /// Answer an incoming call. Releases GIL.
     #[pyo3(signature = (call_id, code=200))]
-    fn answer(&self, py: Python, call_id: i32, code: u16) -> PyResult<()> {
+    fn answer(&self, py: Python, call_id: &str, code: u16) -> PyResult<()> {
         let inner = &self.inner;
         py.allow_threads(move || inner.answer(call_id, code)).map_err(py_err)
     }
 
     /// Reject an incoming call. Releases GIL.
     #[pyo3(signature = (call_id, code=486))]
-    fn reject(&self, py: Python, call_id: i32, code: u16) -> PyResult<()> {
+    fn reject(&self, py: Python, call_id: &str, code: u16) -> PyResult<()> {
         let inner = &self.inner;
         py.allow_threads(move || inner.reject(call_id, code)).map_err(py_err)
     }
 
     /// Hang up an active call. Releases GIL.
-    fn hangup(&self, py: Python, call_id: i32) -> PyResult<()> {
+    fn hangup(&self, py: Python, call_id: &str) -> PyResult<()> {
         let inner = &self.inner;
         py.allow_threads(move || inner.hangup(call_id)).map_err(py_err)
     }
 
     /// Send DTMF digits. Releases GIL.
     #[pyo3(signature = (call_id, digits, method="rfc2833"))]
-    fn send_dtmf(&self, py: Python, call_id: i32, digits: &str, method: &str) -> PyResult<()> {
+    fn send_dtmf(&self, py: Python, call_id: &str, digits: &str, method: &str) -> PyResult<()> {
         let inner = &self.inner;
         let d = digits.to_string();
         let m = method.to_string();
@@ -396,21 +396,21 @@ impl SipEndpoint {
     }
 
     /// Blind transfer via SIP REFER. Releases GIL.
-    fn transfer(&self, py: Python, call_id: i32, dest_uri: &str) -> PyResult<()> {
+    fn transfer(&self, py: Python, call_id: &str, dest_uri: &str) -> PyResult<()> {
         let inner = &self.inner;
         let uri = dest_uri.to_string();
         py.allow_threads(move || inner.transfer(call_id, &uri)).map_err(py_err)
     }
 
     /// Attended transfer (connect two calls). Releases GIL.
-    fn transfer_attended(&self, py: Python, call_id: i32, target_call_id: i32) -> PyResult<()> {
+    fn transfer_attended(&self, py: Python, call_id: &str, target_call_id: &str) -> PyResult<()> {
         let inner = &self.inner;
-        py.allow_threads(move || inner.transfer_attended(call_id, target_call_id)).map_err(py_err)
+        { let c = call_id.to_string(); let t = target_call_id.to_string(); py.allow_threads(move || inner.transfer_attended(&c, &t)).map_err(py_err) }
     }
 
     /// Send a SIP INFO message. Releases GIL.
     #[pyo3(signature = (call_id, content_type="application/json", body=""))]
-    fn send_info(&self, py: Python, call_id: i32, content_type: &str, body: &str) -> PyResult<()> {
+    fn send_info(&self, py: Python, call_id: &str, content_type: &str, body: &str) -> PyResult<()> {
         let inner = &self.inner;
         let ct = content_type.to_string();
         let b = body.to_string();
@@ -418,33 +418,33 @@ impl SipEndpoint {
     }
 
     /// Mute outgoing audio.
-    fn mute(&self, call_id: i32) -> PyResult<()> {
+    fn mute(&self, call_id: &str) -> PyResult<()> {
         self.inner
             .mute(call_id)
             .map_err(py_err)
     }
 
     /// Unmute outgoing audio.
-    fn unmute(&self, call_id: i32) -> PyResult<()> {
+    fn unmute(&self, call_id: &str) -> PyResult<()> {
         self.inner
             .unmute(call_id)
             .map_err(py_err)
     }
 
     /// SIP hold — send Re-INVITE with a=sendonly. Releases GIL.
-    fn hold(&self, py: Python, call_id: i32) -> PyResult<()> {
+    fn hold(&self, py: Python, call_id: &str) -> PyResult<()> {
         let inner = &self.inner;
         py.allow_threads(move || inner.hold(call_id)).map_err(py_err)
     }
 
     /// SIP unhold — send Re-INVITE with a=sendrecv. Releases GIL.
-    fn unhold(&self, py: Python, call_id: i32) -> PyResult<()> {
+    fn unhold(&self, py: Python, call_id: &str) -> PyResult<()> {
         let inner = &self.inner;
         py.allow_threads(move || inner.unhold(call_id)).map_err(py_err)
     }
 
     /// Send an audio frame (simple, no backpressure callback). Releases GIL during mutex ops.
-    fn send_audio(&self, py: Python, call_id: i32, frame: &AudioFrame) -> PyResult<()> {
+    fn send_audio(&self, py: Python, call_id: &str, frame: &AudioFrame) -> PyResult<()> {
         let f = frame.to_rust();
         let inner = &self.inner;
         py.allow_threads(move || inner.send_audio(call_id, &f)).map_err(py_err)
@@ -458,7 +458,7 @@ impl SipEndpoint {
     ///
     /// Python should pass `lambda: loop.call_soon_threadsafe(future.set_result, None)`
     /// as `notify_fn`. This matches WebRTC's deferred on_complete callback pattern.
-    fn send_audio_notify(&self, py: Python, call_id: i32, audio: &[u8], sample_rate: u32, num_channels: u32, notify_fn: Py<PyAny>) -> PyResult<()> {
+    fn send_audio_notify(&self, py: Python, call_id: &str, audio: &[u8], sample_rate: u32, num_channels: u32, notify_fn: Py<PyAny>) -> PyResult<()> {
         // Copy audio data while GIL is held (audio borrows from Python memory)
         let frame = RustAudioFrame::from_bytes(audio, sample_rate, num_channels);
         let callback: Box<dyn FnOnce() + Send> = Box::new(move || {
@@ -475,20 +475,20 @@ impl SipEndpoint {
     }
 
     /// Send raw PCM bytes (simple, no backpressure callback). Releases GIL during mutex ops.
-    fn send_audio_bytes(&self, py: Python, call_id: i32, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
+    fn send_audio_bytes(&self, py: Python, call_id: &str, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
         let frame = RustAudioFrame::from_bytes(audio, sample_rate, num_channels);
         let inner = &self.inner;
         py.allow_threads(move || inner.send_audio(call_id, &frame)).map_err(py_err)
     }
 
     /// Send background audio to be mixed with agent voice in the RTP send loop.
-    fn send_background_audio(&self, call_id: i32, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
+    fn send_background_audio(&self, call_id: &str, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
         let frame = RustAudioFrame::from_bytes(audio, sample_rate, num_channels);
         self.inner.send_background_audio(call_id, &frame).map_err(py_err)
     }
 
     /// Receive an audio frame (non-blocking, returns None if no frame ready).
-    fn recv_audio(&self, call_id: i32) -> PyResult<Option<AudioFrame>> {
+    fn recv_audio(&self, call_id: &str) -> PyResult<Option<AudioFrame>> {
         self.inner
             .recv_audio(call_id)
             .map(|opt| opt.map(AudioFrame::from_rust))
@@ -497,7 +497,7 @@ impl SipEndpoint {
 
     /// Receive audio as raw PCM bytes (little-endian int16). No Python list conversion.
     /// Returns (bytes, sample_rate, num_channels) or None.
-    fn recv_audio_bytes(&self, call_id: i32) -> PyResult<Option<(Vec<u8>, u32, u32)>> {
+    fn recv_audio_bytes(&self, call_id: &str) -> PyResult<Option<(Vec<u8>, u32, u32)>> {
         self.inner
             .recv_audio(call_id)
             .map(|opt| opt.map(|f| (f.as_bytes(), f.sample_rate, f.num_channels)))
@@ -508,7 +508,7 @@ impl SipEndpoint {
     /// Releases the GIL while waiting — safe for high concurrency.
     /// Use this instead of polling recv_audio() in a loop.
     #[pyo3(signature = (call_id, timeout_ms=20))]
-    fn recv_audio_blocking(&self, py: Python, call_id: i32, timeout_ms: u64) -> PyResult<Option<AudioFrame>> {
+    fn recv_audio_blocking(&self, py: Python, call_id: &str, timeout_ms: u64) -> PyResult<Option<AudioFrame>> {
         let inner = &self.inner;
         py.allow_threads(|| {
             inner.recv_audio_blocking(call_id, timeout_ms)
@@ -520,7 +520,7 @@ impl SipEndpoint {
     /// Returns (bytes, sample_rate, num_channels) or None.
     /// This is the fastest path for Pipecat/LiveKit adapters.
     #[pyo3(signature = (call_id, timeout_ms=20))]
-    fn recv_audio_bytes_blocking(&self, py: Python, call_id: i32, timeout_ms: u64) -> PyResult<Option<(Vec<u8>, u32, u32)>> {
+    fn recv_audio_bytes_blocking(&self, py: Python, call_id: &str, timeout_ms: u64) -> PyResult<Option<(Vec<u8>, u32, u32)>> {
         let inner = &self.inner;
         py.allow_threads(|| {
             inner.recv_audio_blocking(call_id, timeout_ms)
@@ -530,7 +530,7 @@ impl SipEndpoint {
 
     /// Number of audio frames queued for sending (outgoing buffer depth).
     /// Multiply by 0.02 to get queued duration in seconds (each frame = 20ms).
-    fn queued_frames(&self, call_id: i32) -> PyResult<usize> {
+    fn queued_frames(&self, call_id: &str) -> PyResult<usize> {
         self.inner.queued_frames(call_id).map_err(py_err)
     }
 
@@ -548,14 +548,14 @@ impl SipEndpoint {
 
     /// Start recording a call to a WAV file (stereo by default: L=user, R=agent).
     #[pyo3(signature = (call_id, path, stereo=true))]
-    fn start_recording(&self, call_id: i32, path: &str, stereo: bool) -> PyResult<()> {
+    fn start_recording(&self, call_id: &str, path: &str, stereo: bool) -> PyResult<()> {
         self.inner
             .start_recording(call_id, path, stereo)
             .map_err(py_err)
     }
 
     /// Stop recording a call.
-    fn stop_recording(&self, call_id: i32) -> PyResult<()> {
+    fn stop_recording(&self, call_id: &str) -> PyResult<()> {
         self.inner
             .stop_recording(call_id)
             .map_err(py_err)
@@ -565,7 +565,7 @@ impl SipEndpoint {
     #[pyo3(signature = (call_id, timeout_ms=30000, min_duration_ms=80, max_duration_ms=5000))]
     fn detect_beep(
         &self,
-        call_id: i32,
+        call_id: String,
         timeout_ms: u32,
         min_duration_ms: u32,
         max_duration_ms: u32,
@@ -578,26 +578,26 @@ impl SipEndpoint {
             ..Default::default()
         };
         self.inner
-            .detect_beep(call_id, config)
+            .detect_beep(&call_id, config)
             .map_err(py_err)
     }
 
     /// Cancel beep detection on a call.
-    fn cancel_beep_detection(&self, call_id: i32) -> PyResult<()> {
+    fn cancel_beep_detection(&self, call_id: &str) -> PyResult<()> {
         self.inner
             .cancel_beep_detection(call_id)
             .map_err(py_err)
     }
 
     /// Mark the current playback segment as complete.
-    fn flush(&self, call_id: i32) -> PyResult<()> {
+    fn flush(&self, call_id: &str) -> PyResult<()> {
         self.inner
             .flush(call_id)
             .map_err(py_err)
     }
 
     /// Clear all queued outgoing audio immediately (barge-in / interruption).
-    fn clear_buffer(&self, call_id: i32) -> PyResult<()> {
+    fn clear_buffer(&self, call_id: &str) -> PyResult<()> {
         self.inner
             .clear_buffer(call_id)
             .map_err(py_err)
@@ -605,20 +605,20 @@ impl SipEndpoint {
 
     /// Block until all queued audio finishes playing. Releases GIL.
     #[pyo3(signature = (call_id, timeout_ms=5000))]
-    fn wait_for_playout(&self, py: Python, call_id: i32, timeout_ms: u64) -> PyResult<bool> {
+    fn wait_for_playout(&self, py: Python, call_id: &str, timeout_ms: u64) -> PyResult<bool> {
         let inner = &self.inner;
         py.allow_threads(|| inner.wait_for_playout(call_id, timeout_ms)).map_err(py_err)
     }
 
     /// Pause audio playback.
-    fn pause(&self, call_id: i32) -> PyResult<()> {
+    fn pause(&self, call_id: &str) -> PyResult<()> {
         self.inner
             .pause(call_id)
             .map_err(py_err)
     }
 
     /// Resume audio playback.
-    fn resume(&self, call_id: i32) -> PyResult<()> {
+    fn resume(&self, call_id: &str) -> PyResult<()> {
         self.inner
             .resume(call_id)
             .map_err(py_err)
@@ -709,11 +709,11 @@ impl AudioStreamEndpoint {
         Ok(Self { inner })
     }
 
-    fn send_audio(&self, session_id: i32, frame: &AudioFrame) -> PyResult<()> {
+    fn send_audio(&self, session_id: &str, frame: &AudioFrame) -> PyResult<()> {
         self.inner.send_audio(session_id, &frame.to_rust()).map_err(py_err)
     }
 
-    fn send_audio_bytes(&self, session_id: i32, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
+    fn send_audio_bytes(&self, session_id: &str, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
         let frame = RustAudioFrame::from_bytes(audio, sample_rate, num_channels);
         self.inner.send_audio(session_id, &frame).map_err(py_err)
     }
@@ -722,7 +722,7 @@ impl AudioStreamEndpoint {
     /// If buffer is below threshold, `notify_fn` fires immediately.
     /// If above threshold, `notify_fn` fires when buffer drains.
     /// Matches SipEndpoint.send_audio_notify — used by SipAudioSource.
-    fn send_audio_notify(&self, py: Python, session_id: i32, audio: &[u8], sample_rate: u32, num_channels: u32, notify_fn: Py<PyAny>) -> PyResult<()> {
+    fn send_audio_notify(&self, py: Python, session_id: &str, audio: &[u8], sample_rate: u32, num_channels: u32, notify_fn: Py<PyAny>) -> PyResult<()> {
         let frame = RustAudioFrame::from_bytes(audio, sample_rate, num_channels);
         let callback: Box<dyn FnOnce() + Send> = Box::new(move || {
             Python::with_gil(|py| {
@@ -738,86 +738,86 @@ impl AudioStreamEndpoint {
 
     /// Send background audio to be mixed with agent voice in the send loop.
     /// Used internally by publish_track (background audio, hold music).
-    fn send_background_audio(&self, session_id: i32, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
+    fn send_background_audio(&self, session_id: &str, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
         let frame = RustAudioFrame::from_bytes(audio, sample_rate, num_channels);
         self.inner.send_background_audio(session_id, &frame).map_err(py_err)
     }
 
-    fn recv_audio(&self, session_id: i32) -> PyResult<Option<AudioFrame>> {
+    fn recv_audio(&self, session_id: &str) -> PyResult<Option<AudioFrame>> {
         self.inner.recv_audio(session_id).map(|opt| opt.map(AudioFrame::from_rust)).map_err(py_err)
     }
 
-    fn recv_audio_bytes(&self, session_id: i32) -> PyResult<Option<(Vec<u8>, u32, u32)>> {
+    fn recv_audio_bytes(&self, session_id: &str) -> PyResult<Option<(Vec<u8>, u32, u32)>> {
         self.inner.recv_audio(session_id).map(|opt| opt.map(|f| (f.as_bytes(), f.sample_rate, f.num_channels))).map_err(py_err)
     }
 
     #[pyo3(signature = (session_id, timeout_ms=20))]
-    fn recv_audio_blocking(&self, py: Python, session_id: i32, timeout_ms: u64) -> PyResult<Option<AudioFrame>> {
+    fn recv_audio_blocking(&self, py: Python, session_id: &str, timeout_ms: u64) -> PyResult<Option<AudioFrame>> {
         let inner = &self.inner;
         py.allow_threads(|| inner.recv_audio_blocking(session_id, timeout_ms).map(|opt| opt.map(AudioFrame::from_rust))).map_err(py_err)
     }
 
     #[pyo3(signature = (session_id, timeout_ms=20))]
-    fn recv_audio_bytes_blocking(&self, py: Python, session_id: i32, timeout_ms: u64) -> PyResult<Option<(Vec<u8>, u32, u32)>> {
+    fn recv_audio_bytes_blocking(&self, py: Python, session_id: &str, timeout_ms: u64) -> PyResult<Option<(Vec<u8>, u32, u32)>> {
         let inner = &self.inner;
         py.allow_threads(|| inner.recv_audio_blocking(session_id, timeout_ms).map(|opt| opt.map(|f| (f.as_bytes(), f.sample_rate, f.num_channels)))).map_err(py_err)
     }
 
-    fn mute(&self, session_id: i32) -> PyResult<()> {
+    fn mute(&self, session_id: &str) -> PyResult<()> {
         self.inner.mute(session_id).map_err(py_err)
     }
 
-    fn unmute(&self, session_id: i32) -> PyResult<()> {
+    fn unmute(&self, session_id: &str) -> PyResult<()> {
         self.inner.unmute(session_id).map_err(py_err)
     }
 
-    fn pause(&self, session_id: i32) -> PyResult<()> {
+    fn pause(&self, session_id: &str) -> PyResult<()> {
         self.inner.pause(session_id).map_err(py_err)
     }
 
-    fn resume(&self, session_id: i32) -> PyResult<()> {
+    fn resume(&self, session_id: &str) -> PyResult<()> {
         self.inner.resume(session_id).map_err(py_err)
     }
 
-    fn clear_buffer(&self, session_id: i32) -> PyResult<()> {
+    fn clear_buffer(&self, session_id: &str) -> PyResult<()> {
         self.inner.clear_buffer(session_id).map_err(py_err)
     }
 
     /// Send checkpoint — Plivo responds with playedStream when audio finishes.
     #[pyo3(signature = (session_id, name=None))]
-    fn checkpoint(&self, session_id: i32, name: Option<&str>) -> PyResult<String> {
+    fn checkpoint(&self, session_id: &str, name: Option<&str>) -> PyResult<String> {
         self.inner.checkpoint(session_id, name).map_err(py_err)
     }
 
     /// Flush: send checkpoint and mark segment complete.
-    fn flush(&self, session_id: i32) -> PyResult<()> {
+    fn flush(&self, session_id: &str) -> PyResult<()> {
         self.inner.flush(session_id).map_err(py_err)
     }
 
     /// Wait for last checkpoint to be confirmed (playedStream event from Plivo).
     #[pyo3(signature = (session_id, timeout_ms=5000))]
-    fn wait_for_playout(&self, py: Python, session_id: i32, timeout_ms: u64) -> PyResult<bool> {
+    fn wait_for_playout(&self, py: Python, session_id: &str, timeout_ms: u64) -> PyResult<bool> {
         let inner = &self.inner;
         py.allow_threads(|| inner.wait_for_playout(session_id, timeout_ms)).map_err(py_err)
     }
 
-    fn queued_frames(&self, session_id: i32) -> PyResult<usize> {
+    fn queued_frames(&self, session_id: &str) -> PyResult<usize> {
         self.inner.queued_frames(session_id).map_err(py_err)
     }
 
     /// Send DTMF digits via Plivo audio streaming.
-    fn send_dtmf(&self, session_id: i32, digits: &str) -> PyResult<()> {
+    fn send_dtmf(&self, session_id: &str, digits: &str) -> PyResult<()> {
         self.inner.send_dtmf(session_id, digits).map_err(py_err)
     }
 
     /// Hang up via Plivo REST API. Releases GIL (blocks on HTTP request).
-    fn hangup(&self, py: Python, session_id: i32) -> PyResult<()> {
+    fn hangup(&self, py: Python, session_id: &str) -> PyResult<()> {
         let inner = &self.inner;
         py.allow_threads(move || inner.hangup(session_id)).map_err(py_err)
     }
 
     /// Send a raw text message over the WebSocket.
-    fn send_raw_message(&self, session_id: i32, message: &str) -> PyResult<()> {
+    fn send_raw_message(&self, session_id: &str, message: &str) -> PyResult<()> {
         self.inner.send_raw_message(session_id, message).map_err(py_err)
     }
 

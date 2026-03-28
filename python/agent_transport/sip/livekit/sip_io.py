@@ -58,7 +58,7 @@ class SipAudioInput(AudioInput):
     - On stream end, pushes 0.5s silence to flush STT, then closes Chan
     """
 
-    def __init__(self, endpoint, call_id: int, *, label: str = "sip-audio-input", source=None, **kwargs):
+    def __init__(self, endpoint, call_id: str, *, label: str = "sip-audio-input", source=None, **kwargs):
         try:
             super().__init__(label=label, source=source)
         except TypeError:
@@ -178,7 +178,7 @@ class SipAudioOutput(AudioOutput):
     def __init__(
         self,
         endpoint,
-        call_id: int,
+        call_id: str,
         *,
         label: str = "sip-audio-output",
         sample_rate: Optional[int] = None,

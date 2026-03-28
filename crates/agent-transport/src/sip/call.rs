@@ -37,7 +37,7 @@ impl CallState {
 #[derive(Debug, Clone)]
 pub struct CallSession {
     /// Internal call ID
-    pub call_id: i32,
+    pub call_id: String,
 
     /// Plivo's X-CallUUID if present
     pub call_uuid: Option<String>,
@@ -59,7 +59,7 @@ pub struct CallSession {
 }
 
 impl CallSession {
-    pub(crate) fn new(call_id: i32, direction: CallDirection) -> Self {
+    pub(crate) fn new(call_id: String, direction: CallDirection) -> Self {
         Self {
             call_id,
             call_uuid: None,
@@ -81,10 +81,10 @@ mod tests {
 
     #[test]
     fn test_new_outbound_call() {
-        let session = CallSession::new(0, CallDirection::Outbound);
+        let session = CallSession::new("call-0".into(), CallDirection::Outbound);
         assert_eq!(session.state, CallState::Calling);
         assert_eq!(session.direction, CallDirection::Outbound);
-        assert_eq!(session.call_id, 0);
+        assert_eq!(session.call_id, "call-0");
         assert!(session.call_uuid.is_none());
         assert!(session.extra_headers.is_empty());
         assert!(session.remote_uri.is_empty());
@@ -92,10 +92,10 @@ mod tests {
 
     #[test]
     fn test_new_inbound_call() {
-        let session = CallSession::new(1, CallDirection::Inbound);
+        let session = CallSession::new("call-1".into(), CallDirection::Inbound);
         assert_eq!(session.state, CallState::Incoming);
         assert_eq!(session.direction, CallDirection::Inbound);
-        assert_eq!(session.call_id, 1);
+        assert_eq!(session.call_id, "call-1");
     }
 
     #[test]

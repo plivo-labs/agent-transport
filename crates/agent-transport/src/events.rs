@@ -19,7 +19,7 @@ pub enum EndpointEvent {
     CallStateChanged { session: CallSession },
 
     /// Call media (audio) is now active.
-    CallMediaActive { call_id: i32 },
+    CallMediaActive { call_id: String },
 
     /// Call has been terminated.
     CallTerminated {
@@ -29,7 +29,7 @@ pub enum EndpointEvent {
 
     /// A DTMF digit was received.
     DtmfReceived {
-        call_id: i32,
+        call_id: String,
         digit: char,
         /// "rfc2833" or "sip_info"
         method: String,
@@ -37,14 +37,14 @@ pub enum EndpointEvent {
 
     /// A voicemail beep was detected on the call.
     BeepDetected {
-        call_id: i32,
+        call_id: String,
         frequency_hz: f64,
         duration_ms: u32,
     },
 
     /// Beep detection timed out — no beep was found.
     BeepTimeout {
-        call_id: i32,
+        call_id: String,
     },
 }
 
@@ -82,7 +82,7 @@ mod tests {
             "registration_failed"
         );
         assert_eq!(EndpointEvent::Unregistered.callback_name(), "unregistered");
-        let session = CallSession::new(0, CallDirection::Inbound);
+        let session = CallSession::new("test-0".into(), CallDirection::Inbound);
         assert_eq!(
             EndpointEvent::IncomingCall {
                 session: session.clone()
@@ -98,7 +98,7 @@ mod tests {
             "call_state"
         );
         assert_eq!(
-            EndpointEvent::CallMediaActive { call_id: 0 }.callback_name(),
+            EndpointEvent::CallMediaActive { call_id: "0".into() }.callback_name(),
             "call_media_active"
         );
         assert_eq!(
@@ -111,7 +111,7 @@ mod tests {
         );
         assert_eq!(
             EndpointEvent::DtmfReceived {
-                call_id: 0,
+                call_id: "0".into(),
                 digit: '1',
                 method: "rfc2833".into()
             }
@@ -120,7 +120,7 @@ mod tests {
         );
         assert_eq!(
             EndpointEvent::BeepDetected {
-                call_id: 0,
+                call_id: "0".into(),
                 frequency_hz: 1000.0,
                 duration_ms: 100
             }
@@ -128,7 +128,7 @@ mod tests {
             "beep_detected"
         );
         assert_eq!(
-            EndpointEvent::BeepTimeout { call_id: 0 }.callback_name(),
+            EndpointEvent::BeepTimeout { call_id: "0".into() }.callback_name(),
             "beep_timeout"
         );
     }

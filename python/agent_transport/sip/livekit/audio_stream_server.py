@@ -161,7 +161,7 @@ class AudioStreamCallContext:
             print(f"DTMF: {digit}")
     """
 
-    session_id: int
+    session_id: str
     call_id: str              # Plivo Call UUID
     stream_id: str            # Plivo Stream UUID
     direction: str            # Always "inbound" for audio streams
@@ -518,7 +518,7 @@ class AudioStreamServer:
 
             if ev_type == "incoming_call":
                 session = ev["session"]
-                session_id = session.call_id  # internal int ID
+                session_id = session.call_id  # internal session ID
                 call_id = session.remote_uri  # Plivo Call UUID
                 stream_id = session.local_uri if hasattr(session, "local_uri") else ""
                 extra_headers = session.extra_headers if hasattr(session, "extra_headers") else {}
@@ -552,7 +552,7 @@ class AudioStreamServer:
                                           participant=ctx._room._remote)
                         ctx._room.emit("sip_dtmf_received", dtmf_ev)
 
-    async def _start_session(self, session_id: int, call_id: str, stream_id: str, extra_headers: dict) -> None:
+    async def _start_session(self, session_id: str, call_id: str, stream_id: str, extra_headers: dict) -> None:
         session_ended = asyncio.Event()
         self._session_ended_events[session_id] = session_ended
 

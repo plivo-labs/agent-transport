@@ -60,8 +60,7 @@ struct CallContext {
 
 struct EndpointState {
     registered: bool,
-    calls: HashMap<i32, CallContext>,
-    next_call_id: i32,
+    calls: HashMap<String, CallContext>,
     dialog_layer: Option<Arc<DialogLayer>>,
     credential: Option<Credential>,
     contact_uri: Option<rsip::Uri>,
@@ -80,7 +79,7 @@ async fn setup_rtp(
     public_addr: Option<SocketAddr>,
     local_ip_str: &str,
     etx: &Sender<EndpointEvent>,
-    call_id: i32,
+    call_id: &str,
 ) -> Result<(String, SocketAddr)> {
     let answer = sdp::parse_answer(remote_sdp_bytes, codecs)?;
     let remote_rtp = SocketAddr::new(answer.remote_ip, answer.remote_port);
@@ -97,21 +96,21 @@ async fn setup_rtp(
 
     let (itx, irx) = crossbeam_channel::unbounded();
     rtp.start_send_loop(ctx.audio_buf.clone(), ctx.bg_audio_buf.clone(), ctx.muted.clone(), ctx.paused.clone(), ctx.playout_notify.clone(), ctx.recorder.clone());
-    rtp.start_recv_loop(itx, etx.clone(), call_id, ctx.beep_detector.clone(), ctx.held.clone(), ctx.recorder.clone());
+    rtp.start_recv_loop(itx, etx.clone(), call_id.to_string(), ctx.beep_detector.clone(), ctx.held.clone(), ctx.recorder.clone());
 
     ctx.rtp = Some(rtp);
     ctx.incoming_rx = irx;
     ctx.session.state = CallState::Confirmed;
     ctx.local_sdp = Some(local_sdp.clone());
 
-    let _ = etx.try_send(EndpointEvent::CallMediaActive { call_id });
+    let _ = etx.try_send(EndpointEvent::CallMediaActive { call_id: call_id.to_string() });
     Ok((local_sdp, remote_rtp))
 }
 
 /// Watch dialog state for remote BYE and emit CallTerminated.
 fn spawn_dialog_watcher(
     mut dr: DialogStateReceiver,
-    call_id: i32,
+    call_id: String,
     st: Arc<Mutex<EndpointState>>,
     etx: Sender<EndpointEvent>,
     cc: CancellationToken,
@@ -132,7 +131,7 @@ fn spawn_dialog_watcher(
 /// Start session timer refresh (periodic Re-INVITE).
 fn start_session_timer(
     session_expires: Option<u32>,
-    call_id: i32,
+    call_id: String,
     st: Arc<Mutex<EndpointState>>,
     cc: CancellationToken,
 ) {
@@ -160,8 +159,8 @@ fn start_session_timer(
     });
 }
 
-fn new_call_context(call_id: i32, direction: CallDirection, cc: CancellationToken) -> (CallContext, CallSession) {
-    let session = CallSession::new(call_id, direction);
+fn new_call_context(call_id: &str, direction: CallDirection, cc: CancellationToken) -> (CallContext, CallSession) {
+    let session = CallSession::new(call_id.to_string(), direction);
     let (_itx, irx) = crossbeam_channel::unbounded();
     let ctx = CallContext {
         session: session.clone(), rtp: None,
@@ -216,7 +215,7 @@ impl SipEndpoint {
         let (etx, erx) = crossbeam_channel::unbounded();
         let cancel = CancellationToken::new();
         let state = Arc::new(Mutex::new(EndpointState {
-            registered: false, calls: HashMap::new(), next_call_id: 0,
+            registered: false, calls: HashMap::new(),
             dialog_layer: None, credential: None, contact_uri: None,
             local_addr: None, public_addr: None,
         }));
@@ -331,7 +330,7 @@ impl SipEndpoint {
 
     // ─── Outbound call ───────────────────────────────────────────────────────
 
-    pub fn call(&self, dest_uri: &str, headers: Option<HashMap<String, String>>) -> Result<i32> {
+    pub fn call(&self, dest_uri: &str, headers: Option<HashMap<String, String>>) -> Result<String> {
         let (dest, cfg, st, etx) = (dest_uri.to_string(), self.config.clone(), self.state.clone(), self.event_tx.clone());
         self.runtime.block_on(async {
             let (dl, cred, contact, la, pa) = {
@@ -356,7 +355,7 @@ impl SipEndpoint {
 
             let (ds, dr) = dl.new_dialog_state_channel();
             let (dialog, resp) = dl.do_invite(opt, ds).await.map_err(err)?;
-            let call_id = { let mut s = st.lock().unwrap(); let id = s.next_call_id; s.next_call_id += 1; id };
+            let call_id = format!("call-{:016x}", rand::random::<u64>());
 
             let resp = resp.ok_or_else(|| EndpointError::Other("no response".into()))?;
             let sc = resp.status_code.clone();
@@ -367,40 +366,40 @@ impl SipEndpoint {
             }
 
             let cc = CancellationToken::new();
-            let (mut ctx, mut session) = new_call_context(call_id, CallDirection::Outbound, cc.clone());
+            let (mut ctx, mut session) = new_call_context(&call_id, CallDirection::Outbound, cc.clone());
             session.remote_uri = dest;
             extract_x_headers(&resp, &mut session);
             ctx.session = session.clone();
             ctx.client_dialog = Some(dialog);
 
             // Set up RTP (shared with inbound)
-            let (_, remote_rtp) = setup_rtp(&mut ctx, resp.body(), &cfg.codecs, pa, &la_str, &etx, call_id).await?;
+            let (_, remote_rtp) = setup_rtp(&mut ctx, resp.body(), &cfg.codecs, pa, &la_str, &etx, &call_id).await?;
 
             // Watch for remote BYE
-            spawn_dialog_watcher(dr, call_id, st.clone(), etx.clone(), cc.clone());
+            spawn_dialog_watcher(dr, call_id.clone(), st.clone(), etx.clone(), cc.clone());
 
             // Session timer
             let session_expires = parse_session_expires(&resp);
 
-            st.lock().unwrap().calls.insert(call_id, ctx);
+            st.lock().unwrap().calls.insert(call_id.clone(), ctx);
             let _ = etx.try_send(EndpointEvent::CallStateChanged { session });
             info!("Call {} connected to {}", call_id, remote_rtp);
 
-            start_session_timer(session_expires, call_id, st.clone(), cc);
+            start_session_timer(session_expires, call_id.clone(), st.clone(), cc);
             Ok(call_id)
         })
     }
 
     // ─── Inbound answer ──────────────────────────────────────────────────────
 
-    pub fn answer(&self, call_id: i32, code: u16) -> Result<()> {
+    pub fn answer(&self, call_id: &str, code: u16) -> Result<()> {
         let (cfg, st, etx) = (self.config.clone(), self.state.clone(), self.event_tx.clone());
         self.runtime.block_on(async {
             let (pa, la_str) = { let s = st.lock().unwrap(); (s.public_addr, s.local_addr.as_ref().map(|a| a.addr.host.to_string()).unwrap_or("0.0.0.0".into())) };
 
             let cancel = {
                 let mut s = st.lock().unwrap();
-                let ctx = s.calls.get_mut(&call_id).ok_or(EndpointError::CallNotActive(call_id))?;
+                let ctx = s.calls.get_mut(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
 
                 if ctx.server_dialog.is_none() {
                     error!("answer: no server_dialog for call {}", call_id);
@@ -410,7 +409,7 @@ impl SipEndpoint {
                     None
                 } else if code >= 200 && code < 300 {
                     let remote_sdp = ctx.server_dialog.as_ref().unwrap().initial_request().body().to_vec();
-                    let (local_sdp, remote_rtp) = setup_rtp(ctx, &remote_sdp, &cfg.codecs, pa, &la_str, &etx, call_id).await?;
+                    let (local_sdp, remote_rtp) = setup_rtp(ctx, &remote_sdp, &cfg.codecs, pa, &la_str, &etx, &call_id).await?;
                     ctx.server_dialog.as_ref().unwrap().accept(None, Some(local_sdp.into_bytes())).map_err(err)?;
                     info!("Inbound call {} connected to {}", call_id, remote_rtp);
                     Some(ctx.cancel.clone())
@@ -419,7 +418,7 @@ impl SipEndpoint {
 
             // Session timer (outside the lock)
             if let Some(cc) = cancel {
-                start_session_timer(None, call_id, st, cc);
+                start_session_timer(None, call_id.to_string(), st, cc);
             }
             Ok(())
         })
@@ -427,20 +426,20 @@ impl SipEndpoint {
 
     // ─── Call control ────────────────────────────────────────────────────────
 
-    pub fn reject(&self, call_id: i32, code: u16) -> Result<()> {
+    pub fn reject(&self, call_id: &str, code: u16) -> Result<()> {
         let mut s = self.state.lock().unwrap();
-        let ctx = s.calls.get(&call_id).ok_or(EndpointError::CallNotActive(call_id))?;
+        let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
         if let Some(ref d) = ctx.server_dialog { let _ = d.reject(Some(rsip::StatusCode::from(code)), None); }
-        if let Some(ctx) = s.calls.remove(&call_id) {
+        if let Some(ctx) = s.calls.remove(call_id) {
             let _ = self.event_tx.try_send(EndpointEvent::CallTerminated { session: ctx.session, reason: format!("Rejected {}", code) });
         }
         Ok(())
     }
 
-    pub fn hangup(&self, call_id: i32) -> Result<()> {
+    pub fn hangup(&self, call_id: &str) -> Result<()> {
         let (st, etx) = (self.state.clone(), self.event_tx.clone());
         self.runtime.block_on(async {
-            let ctx = st.lock().unwrap().calls.remove(&call_id);
+            let ctx = st.lock().unwrap().calls.remove(call_id);
             if let Some(ctx) = ctx {
                 ctx.cancel.cancel();
                 if let Some(ref d) = ctx.client_dialog { let _ = d.hangup().await; }
@@ -451,15 +450,15 @@ impl SipEndpoint {
         })
     }
 
-    pub fn send_dtmf(&self, call_id: i32, digits: &str) -> Result<()> { self.send_dtmf_with_method(call_id, digits, "rfc2833") }
+    pub fn send_dtmf(&self, call_id: &str, digits: &str) -> Result<()> { self.send_dtmf_with_method(call_id, digits, "rfc2833") }
 
-    pub fn send_dtmf_with_method(&self, call_id: i32, digits: &str, method: &str) -> Result<()> {
+    pub fn send_dtmf_with_method(&self, call_id: &str, digits: &str, method: &str) -> Result<()> {
         let st = self.state.clone();
         let digits = digits.to_string();
         let method = method.to_string();
         self.runtime.block_on(async {
             let s = st.lock().unwrap();
-            let ctx = s.calls.get(&call_id).ok_or(EndpointError::CallNotActive(call_id))?;
+            let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
             for d in digits.chars() {
                 match method.as_str() {
                     "sip_info" | "info" => {
@@ -475,13 +474,13 @@ impl SipEndpoint {
         })
     }
 
-    pub fn send_info(&self, call_id: i32, content_type: &str, body: &str) -> Result<()> {
+    pub fn send_info(&self, call_id: &str, content_type: &str, body: &str) -> Result<()> {
         let st = self.state.clone();
         let ct = content_type.to_string();
         let b = body.to_string();
         self.runtime.block_on(async {
             let s = st.lock().unwrap();
-            let ctx = s.calls.get(&call_id).ok_or(EndpointError::CallNotActive(call_id))?;
+            let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
             let hdrs = vec![rsip::Header::Other("Content-Type".into(), ct)];
             if let Some(ref d) = ctx.client_dialog { d.info(Some(hdrs), Some(b.into_bytes())).await.map_err(err)?; }
             else if let Some(ref d) = ctx.server_dialog { d.info(Some(hdrs), Some(b.into_bytes())).await.map_err(err)?; }
@@ -489,11 +488,11 @@ impl SipEndpoint {
         })
     }
 
-    pub fn transfer(&self, call_id: i32, dest_uri: &str) -> Result<()> {
+    pub fn transfer(&self, call_id: &str, dest_uri: &str) -> Result<()> {
         let (st, dest) = (self.state.clone(), dest_uri.to_string());
         self.runtime.block_on(async {
             let s = st.lock().unwrap();
-            let ctx = s.calls.get(&call_id).ok_or(EndpointError::CallNotActive(call_id))?;
+            let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
             let uri: rsip::Uri = dest.try_into().map_err(|e| err(format!("{:?}", e)))?;
             if let Some(ref d) = ctx.client_dialog { d.refer(uri, None, None).await.map_err(err)?; }
             else if let Some(ref d) = ctx.server_dialog { d.refer(uri, None, None).await.map_err(err)?; }
@@ -501,15 +500,15 @@ impl SipEndpoint {
         })
     }
 
-    pub fn transfer_attended(&self, _: i32, _: i32) -> Result<()> {
+    pub fn transfer_attended(&self, _: &str, _: &str) -> Result<()> {
         Err(EndpointError::Other("attended transfer not supported".into()))
     }
 
-    pub fn hold(&self, call_id: i32) -> Result<()> {
+    pub fn hold(&self, call_id: &str) -> Result<()> {
         let st = self.state.clone();
         self.runtime.block_on(async {
             let s = st.lock().unwrap();
-            let ctx = s.calls.get(&call_id).ok_or(EndpointError::CallNotActive(call_id))?;
+            let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
             if ctx.held.load(Ordering::Relaxed) { return Ok(()); }
             let sdp = ctx.local_sdp.as_ref().ok_or(EndpointError::Other("no SDP".into()))?
                 .replace("a=sendrecv", "a=sendonly");
@@ -522,11 +521,11 @@ impl SipEndpoint {
         })
     }
 
-    pub fn unhold(&self, call_id: i32) -> Result<()> {
+    pub fn unhold(&self, call_id: &str) -> Result<()> {
         let st = self.state.clone();
         self.runtime.block_on(async {
             let s = st.lock().unwrap();
-            let ctx = s.calls.get(&call_id).ok_or(EndpointError::CallNotActive(call_id))?;
+            let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
             if !ctx.held.load(Ordering::Relaxed) { return Ok(()); }
             let sdp = ctx.local_sdp.as_ref().ok_or(EndpointError::Other("no SDP".into()))?
                 .replace("a=sendonly", "a=sendrecv")
@@ -542,29 +541,29 @@ impl SipEndpoint {
 
     // ─── Audio control ───────────────────────────────────────────────────────
 
-    fn with_call<F, R>(&self, call_id: i32, f: F) -> Result<R> where F: FnOnce(&CallContext) -> R {
+    fn with_call<F, R>(&self, call_id: &str, f: F) -> Result<R> where F: FnOnce(&CallContext) -> R {
         let s = self.state.lock().unwrap();
-        let ctx = s.calls.get(&call_id).ok_or(EndpointError::CallNotActive(call_id))?;
+        let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
         Ok(f(ctx))
     }
 
-    fn with_call_mut<F, R>(&self, call_id: i32, f: F) -> Result<R> where F: FnOnce(&mut CallContext) -> R {
+    fn with_call_mut<F, R>(&self, call_id: &str, f: F) -> Result<R> where F: FnOnce(&mut CallContext) -> R {
         let mut s = self.state.lock().unwrap();
-        let ctx = s.calls.get_mut(&call_id).ok_or(EndpointError::CallNotActive(call_id))?;
+        let ctx = s.calls.get_mut(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
         Ok(f(ctx))
     }
 
-    pub fn mute(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| c.muted.store(true, Ordering::Relaxed)) }
-    pub fn unmute(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| c.muted.store(false, Ordering::Relaxed)) }
-    pub fn pause(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| c.paused.store(true, Ordering::Relaxed)) }
-    pub fn resume(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| c.paused.store(false, Ordering::Relaxed)) }
-    pub fn flush(&self, call_id: i32) -> Result<()> { self.with_call(call_id, |c| { if let Ok(mut d) = c.playout_notify.0.lock() { *d = false; } }) }
-    pub fn clear_buffer(&self, call_id: i32) -> Result<()> {
+    pub fn mute(&self, call_id: &str) -> Result<()> { self.with_call(call_id, |c| c.muted.store(true, Ordering::Relaxed)) }
+    pub fn unmute(&self, call_id: &str) -> Result<()> { self.with_call(call_id, |c| c.muted.store(false, Ordering::Relaxed)) }
+    pub fn pause(&self, call_id: &str) -> Result<()> { self.with_call(call_id, |c| c.paused.store(true, Ordering::Relaxed)) }
+    pub fn resume(&self, call_id: &str) -> Result<()> { self.with_call(call_id, |c| c.paused.store(false, Ordering::Relaxed)) }
+    pub fn flush(&self, call_id: &str) -> Result<()> { self.with_call(call_id, |c| { if let Ok(mut d) = c.playout_notify.0.lock() { *d = false; } }) }
+    pub fn clear_buffer(&self, call_id: &str) -> Result<()> {
         info!("clear_buffer: call={} clearing audio buffer", call_id);
         self.with_call(call_id, |c| c.audio_buf.clear())
     }
 
-    pub fn wait_for_playout(&self, call_id: i32, timeout_ms: u64) -> Result<bool> {
+    pub fn wait_for_playout(&self, call_id: &str, timeout_ms: u64) -> Result<bool> {
         self.with_call(call_id, |c| {
             let (lock, cvar) = &*c.playout_notify;
             let guard = lock.lock().unwrap();
@@ -582,10 +581,10 @@ impl SipEndpoint {
     /// It should use loop.call_soon_threadsafe to signal Python asynchronously.
     ///
     /// Matches WebRTC C++ InternalSource::capture_frame exactly.
-    pub fn send_audio_with_callback(&self, call_id: i32, frame: &AudioFrame, on_complete: crate::sip::audio_buffer::CompletionCallback) -> Result<()> {
+    pub fn send_audio_with_callback(&self, call_id: &str, frame: &AudioFrame, on_complete: crate::sip::audio_buffer::CompletionCallback) -> Result<()> {
         let audio_buf = {
             let s = self.state.lock().unwrap();
-            let ctx = s.calls.get(&call_id).ok_or(EndpointError::CallNotActive(call_id))?;
+            let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
             ctx.audio_buf.clone()
         };
         audio_buf.push(&frame.data, on_complete)
@@ -593,40 +592,40 @@ impl SipEndpoint {
     }
 
     /// Simple send_audio without callback — for backward compatibility.
-    pub fn send_audio(&self, call_id: i32, frame: &AudioFrame) -> Result<()> {
+    pub fn send_audio(&self, call_id: &str, frame: &AudioFrame) -> Result<()> {
         self.send_audio_with_callback(call_id, frame, Box::new(|| {}))
     }
 
     /// Send background audio to be mixed with agent voice in the RTP send loop.
     /// Used by publish_track (background audio, hold music, etc.).
-    pub fn send_background_audio(&self, call_id: i32, frame: &AudioFrame) -> Result<()> {
+    pub fn send_background_audio(&self, call_id: &str, frame: &AudioFrame) -> Result<()> {
         let bg_buf = self.with_call(call_id, |c| c.bg_audio_buf.clone())?;
         bg_buf.push(&frame.data, Box::new(|| {}))
             .map_err(|e| EndpointError::Other(e.into()))
     }
 
-    pub fn recv_audio(&self, call_id: i32) -> Result<Option<AudioFrame>> {
+    pub fn recv_audio(&self, call_id: &str) -> Result<Option<AudioFrame>> {
         self.with_call(call_id, |c| c.incoming_rx.try_recv().ok())
     }
 
-    pub fn recv_audio_blocking(&self, call_id: i32, timeout_ms: u64) -> Result<Option<AudioFrame>> {
+    pub fn recv_audio_blocking(&self, call_id: &str, timeout_ms: u64) -> Result<Option<AudioFrame>> {
         let rx = self.with_call(call_id, |c| c.incoming_rx.clone())?;
         Ok(rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)).ok())
     }
 
-    pub fn incoming_rx(&self, call_id: i32) -> Result<Receiver<AudioFrame>> {
+    pub fn incoming_rx(&self, call_id: &str) -> Result<Receiver<AudioFrame>> {
         self.with_call(call_id, |c| c.incoming_rx.clone())
     }
 
-    pub fn playout_notify(&self, call_id: i32) -> Result<Arc<(Mutex<bool>, Condvar)>> {
+    pub fn playout_notify(&self, call_id: &str) -> Result<Arc<(Mutex<bool>, Condvar)>> {
         self.with_call(call_id, |c| c.playout_notify.clone())
     }
 
-    pub fn queued_frames(&self, call_id: i32) -> Result<usize> {
+    pub fn queued_frames(&self, call_id: &str) -> Result<usize> {
         self.with_call(call_id, |c| c.audio_buf.len() / 320) // convert samples to 20ms frame count
     }
 
-    pub fn start_recording(&self, call_id: i32, path: &str, stereo: bool) -> Result<()> {
+    pub fn start_recording(&self, call_id: &str, path: &str, stereo: bool) -> Result<()> {
         let p = path.to_string();
         let mode = if stereo { crate::recorder::RecordingMode::Stereo } else { crate::recorder::RecordingMode::Mono };
         self.with_call_mut(call_id, |c| {
@@ -636,18 +635,18 @@ impl SipEndpoint {
         })?
     }
 
-    pub fn stop_recording(&self, call_id: i32) -> Result<()> {
+    pub fn stop_recording(&self, call_id: &str) -> Result<()> {
         self.with_call_mut(call_id, |c| {
             if let Some(r) = c.recorder.take() { r.finalize(); Ok(()) }
             else { Err(EndpointError::Other("no recording".into())) }
         })?
     }
 
-    pub fn detect_beep(&self, call_id: i32, config: BeepDetectorConfig) -> Result<()> {
+    pub fn detect_beep(&self, call_id: &str, config: BeepDetectorConfig) -> Result<()> {
         self.with_call(call_id, |c| *c.beep_detector.lock().unwrap() = Some(BeepDetector::new(config)))
     }
 
-    pub fn cancel_beep_detection(&self, call_id: i32) -> Result<()> {
+    pub fn cancel_beep_detection(&self, call_id: &str) -> Result<()> {
         self.with_call(call_id, |c| {
             if c.beep_detector.lock().unwrap().take().is_some() { Ok(()) }
             else { Err(EndpointError::Other("no beep detection".into())) }
@@ -658,8 +657,8 @@ impl SipEndpoint {
 
     pub fn shutdown(&self) -> Result<()> {
         self.cancel.cancel();
-        let ids: Vec<i32> = self.state.lock().unwrap().calls.keys().copied().collect();
-        for id in ids { let _ = self.hangup(id); }
+        let ids: Vec<String> = self.state.lock().unwrap().calls.keys().cloned().collect();
+        for id in ids { let _ = self.hangup(&id); }
         info!("Agent transport shut down");
         Ok(())
     }
@@ -678,9 +677,9 @@ async fn handle_incoming(dl: &Arc<DialogLayer>, st: &Arc<Mutex<EndpointState>>, 
     // Send 180 Ringing to keep the transaction alive until Python calls answer()
     if let Err(e) = dialog.ringing(None, None) { error!("failed to send ringing: {}", e); return; }
 
-    let call_id = { let mut s = st.lock().unwrap(); let id = s.next_call_id; s.next_call_id += 1; id };
+    let call_id = format!("call-{:016x}", rand::random::<u64>());
     let cc = CancellationToken::new();
-    let (mut ctx, mut session) = new_call_context(call_id, CallDirection::Inbound, cc.clone());
+    let (mut ctx, mut session) = new_call_context(&call_id, CallDirection::Inbound, cc.clone());
 
     let req = dialog.initial_request();
     if let Ok(from) = req.from_header() { session.remote_uri = from.to_string(); }
@@ -690,7 +689,7 @@ async fn handle_incoming(dl: &Arc<DialogLayer>, st: &Arc<Mutex<EndpointState>>, 
 
     info!("Incoming call {} from {} (uuid={:?})", call_id, session.remote_uri, session.call_uuid);
 
-    st.lock().unwrap().calls.insert(call_id, ctx);
+    st.lock().unwrap().calls.insert(call_id.clone(), ctx);
 
     // Spawn the transaction receive loop — keeps tu_receiver alive so
     // dialog can send responses (180 Ringing, 200 OK) via tu_sender.
@@ -708,5 +707,5 @@ async fn handle_incoming(dl: &Arc<DialogLayer>, st: &Arc<Mutex<EndpointState>>, 
     let _ = etx.try_send(EndpointEvent::IncomingCall { session });
 
     // Watch dialog state for remote BYE (same helper as outbound)
-    spawn_dialog_watcher(dr, call_id, st.clone(), etx.clone(), cc);
+    spawn_dialog_watcher(dr, call_id.clone(), st.clone(), etx.clone(), cc);
 }

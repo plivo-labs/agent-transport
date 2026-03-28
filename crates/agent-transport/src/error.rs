@@ -14,10 +14,10 @@ pub enum EndpointError {
     NotRegistered,
 
     #[error("invalid call ID: {0}")]
-    InvalidCallId(i32),
+    InvalidCallId(String),
 
     #[error("call not active: {0}")]
-    CallNotActive(i32),
+    CallNotActive(String),
 
     #[error("no audio available")]
     NoAudio,

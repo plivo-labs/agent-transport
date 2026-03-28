@@ -50,19 +50,19 @@ export interface SipDTMF {
 
 // Transport endpoint interface (matches our Rust binding)
 export interface TransportEndpoint {
-  sendAudioBytes(sessionId: number, audio: Uint8Array, sampleRate: number, numChannels: number): void;
-  sendBackgroundAudio(sessionId: number, audio: Uint8Array, sampleRate: number, numChannels: number): void;
-  sendDtmf(sessionId: number, digits: string): void;
-  sendRawMessage(sessionId: number, message: string): void;
-  recvAudioBytesBlocking(sessionId: number, timeoutMs?: number): Uint8Array | null;
-  recvAudioBytesAsync(sessionId: number, timeoutMs?: number): Promise<Uint8Array | null>;
-  flush(sessionId: number): void;
-  clearBuffer(sessionId: number): void;
-  pause(sessionId: number): void;
-  resume(sessionId: number): void;
-  queuedFrames(sessionId: number): number;
-  waitForPlayout(sessionId: number, timeoutMs?: number): boolean;
-  waitForPlayoutAsync(sessionId: number, timeoutMs?: number): Promise<boolean>;
+  sendAudioBytes(sessionId: string, audio: Uint8Array, sampleRate: number, numChannels: number): void;
+  sendBackgroundAudio(sessionId: string, audio: Uint8Array, sampleRate: number, numChannels: number): void;
+  sendDtmf(sessionId: string, digits: string): void;
+  sendRawMessage(sessionId: string, message: string): void;
+  recvAudioBytesBlocking(sessionId: string, timeoutMs?: number): Uint8Array | null;
+  recvAudioBytesAsync(sessionId: string, timeoutMs?: number): Promise<Uint8Array | null>;
+  flush(sessionId: string): void;
+  clearBuffer(sessionId: string): void;
+  pause(sessionId: string): void;
+  resume(sessionId: string): void;
+  queuedFrames(sessionId: string): number;
+  waitForPlayout(sessionId: string, timeoutMs?: number): boolean;
+  waitForPlayoutAsync(sessionId: string, timeoutMs?: number): Promise<boolean>;
   sampleRate: number;
 }
 
@@ -132,7 +132,7 @@ export class TransportRemoteParticipant {
 
 export class TransportLocalParticipant {
   private _endpoint: TransportEndpoint;
-  private _sessionId: number;
+  private _sessionId: string;
   private _forwardAborts: Map<string, AbortController> = new Map();
 
   sid: string;
@@ -143,7 +143,7 @@ export class TransportLocalParticipant {
   kind = 0; // STANDARD
   trackPublications: Record<string, StubTrackPublication> = {};
 
-  constructor(endpoint: TransportEndpoint, sessionId: number, agentName: string) {
+  constructor(endpoint: TransportEndpoint, sessionId: string, agentName: string) {
     this._endpoint = endpoint;
     this._sessionId = sessionId;
     this.sid = `PA_${sessionId}`;
@@ -219,7 +219,7 @@ export class TransportLocalParticipant {
 
 export class TransportRoom extends EventEmitter {
   private _endpoint: TransportEndpoint;
-  private _sessionId: number;
+  private _sessionId: string;
   private _connected = true;
   private _creationTime = new Date();
   private _textStreamHandlers: Map<string, any> = new Map();
@@ -230,7 +230,7 @@ export class TransportRoom extends EventEmitter {
 
   constructor(
     endpoint: TransportEndpoint,
-    sessionId: number,
+    sessionId: string,
     opts: { agentName: string; callerIdentity: string },
   ) {
     super();
@@ -298,11 +298,11 @@ export class TransportRoom extends EventEmitter {
 
 export class SipAudioInput {
   private _endpoint: TransportEndpoint;
-  private _sessionId: number;
+  private _sessionId: string;
   private _closed = false;
   readonly label: string;
 
-  constructor(endpoint: TransportEndpoint, sessionId: number, label = 'sip-audio-input') {
+  constructor(endpoint: TransportEndpoint, sessionId: string, label = 'sip-audio-input') {
     this._endpoint = endpoint;
     this._sessionId = sessionId;
     this.label = label;
@@ -330,7 +330,7 @@ export class SipAudioInput {
 
 export class SipAudioOutput extends EventEmitter {
   private _endpoint: TransportEndpoint;
-  private _sessionId: number;
+  private _sessionId: string;
   private _capturing = false;
   private _segmentCount = 0;
   private _finishedCount = 0;
@@ -345,7 +345,7 @@ export class SipAudioOutput extends EventEmitter {
 
   constructor(
     endpoint: TransportEndpoint,
-    sessionId: number,
+    sessionId: string,
     options?: {
       label?: string;
       capabilities?: AudioOutputCapabilities;
@@ -466,7 +466,7 @@ export class SipAudioOutput extends EventEmitter {
 
 // Aliases for audio streaming
 export class AudioStreamInput extends SipAudioInput {
-  constructor(endpoint: TransportEndpoint, sessionId: number, label = 'audio-stream-input') {
+  constructor(endpoint: TransportEndpoint, sessionId: string, label = 'audio-stream-input') {
     super(endpoint, sessionId, label);
   }
 }
@@ -474,7 +474,7 @@ export class AudioStreamInput extends SipAudioInput {
 export class AudioStreamOutput extends SipAudioOutput {
   constructor(
     endpoint: TransportEndpoint,
-    sessionId: number,
+    sessionId: string,
     options?: {
       label?: string;
       capabilities?: AudioOutputCapabilities;

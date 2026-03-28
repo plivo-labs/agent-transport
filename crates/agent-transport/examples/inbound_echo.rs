@@ -39,7 +39,7 @@ fn main() -> anyhow::Result<()> {
             EndpointEvent::IncomingCall { session } => {
                 println!("Incoming call from: {}", session.remote_uri);
                 // Auto-answer with 200 OK
-                ep.answer(session.call_id, 200)?;
+                ep.answer(&session.call_id, 200)?;
                 println!("Call answered (call_id={})", session.call_id);
             }
             EndpointEvent::CallMediaActive { call_id } => {
@@ -51,7 +51,7 @@ fn main() -> anyhow::Result<()> {
                 println!("DTMF on call {}: {}", call_id, digit);
                 if digit == '#' {
                     println!("# received, hanging up.");
-                    ep.hangup(call_id)?;
+                    ep.hangup(&call_id)?;
                 }
             }
             EndpointEvent::CallTerminated { session, reason } => {

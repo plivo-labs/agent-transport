@@ -45,7 +45,7 @@ except ImportError:
 class SipInputTransport(BaseInputTransport):
     """Receives audio from SIP call. Uses Rust blocking recv (GIL released)."""
 
-    def __init__(self, endpoint, call_id: int, params: Optional[TransportParams] = None, **kwargs):
+    def __init__(self, endpoint, call_id: str, params: Optional[TransportParams] = None, **kwargs):
         if params is None:
             params = TransportParams(
                 audio_in_enabled=True,
@@ -117,7 +117,7 @@ class SipOutputTransport(BaseOutputTransport):
     bot speaking state, and interruption handling.
     """
 
-    def __init__(self, endpoint, call_id: int, params: Optional[TransportParams] = None, **kwargs):
+    def __init__(self, endpoint, call_id: str, params: Optional[TransportParams] = None, **kwargs):
         if params is None:
             params = TransportParams(
                 audio_out_enabled=True,
@@ -186,7 +186,7 @@ class SipOutputTransport(BaseOutputTransport):
 class SipTransport(BaseTransport):
     """Pipecat transport for SIP calls via agent-transport."""
 
-    def __init__(self, endpoint, call_id: int, *, name: Optional[str] = None,
+    def __init__(self, endpoint, call_id: str, *, name: Optional[str] = None,
                  params: Optional[TransportParams] = None, **kwargs):
         super().__init__(name=name or "SipTransport", **kwargs)
         self._ep = endpoint

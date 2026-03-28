@@ -5,7 +5,7 @@
 //! Receives: start, media, dtmf, stop, playedStream, clearedAudio events.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -120,8 +120,7 @@ struct StreamSession {
 pub struct AudioStreamEndpoint {
     config: AudioStreamConfig,
     runtime: Runtime,
-    sessions: Arc<Mutex<HashMap<i32, StreamSession>>>,
-    next_id: AtomicI32,
+    sessions: Arc<Mutex<HashMap<String, StreamSession>>>,
     event_tx: Sender<EndpointEvent>,
     event_rx: Receiver<EndpointEvent>,
     cancel: CancellationToken,
@@ -140,7 +139,7 @@ impl AudioStreamEndpoint {
         });
 
         info!("Audio streaming endpoint on {}", config.listen_addr);
-        Ok(Self { config, runtime: rt, sessions, next_id: AtomicI32::new(0), event_tx: etx, event_rx: erx, cancel })
+        Ok(Self { config, runtime: rt, sessions, event_tx: etx, event_rx: erx, cancel })
     }
 
     /// Send audio with completion callback — matches SipEndpoint::send_audio_with_callback.
@@ -148,10 +147,10 @@ impl AudioStreamEndpoint {
     /// If buffer is below threshold (200ms), the callback fires immediately.
     /// If above threshold, the callback is deferred until the send loop drains below threshold.
     /// This is the backpressure mechanism used by SipAudioSource in the Python/Node adapters.
-    pub fn send_audio_with_callback(&self, session_id: i32, frame: &AudioFrame, on_complete: CompletionCallback) -> Result<()> {
+    pub fn send_audio_with_callback(&self, session_id: &str, frame: &AudioFrame, on_complete: CompletionCallback) -> Result<()> {
         let audio_buf = {
             let s = self.sessions.lock().unwrap();
-            let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+            let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
             sess.audio_buf.clone()
         };
         audio_buf.push(&frame.data, on_complete)
@@ -159,17 +158,17 @@ impl AudioStreamEndpoint {
     }
 
     /// Send audio frame — simple, no backpressure callback.
-    pub fn send_audio(&self, session_id: i32, frame: &AudioFrame) -> Result<()> {
+    pub fn send_audio(&self, session_id: &str, frame: &AudioFrame) -> Result<()> {
         self.send_audio_with_callback(session_id, frame, Box::new(|| {}))
     }
 
     /// Send background audio to be mixed with agent voice in the send loop.
     /// Used by publish_track (background audio, hold music, etc.).
     /// No backpressure — background audio is best-effort.
-    pub fn send_background_audio(&self, session_id: i32, frame: &AudioFrame) -> Result<()> {
+    pub fn send_background_audio(&self, session_id: &str, frame: &AudioFrame) -> Result<()> {
         let bg_buf = {
             let s = self.sessions.lock().unwrap();
-            let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+            let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
             sess.bg_audio_buf.clone()
         };
         bg_buf.push(&frame.data, Box::new(|| {}))
@@ -177,50 +176,50 @@ impl AudioStreamEndpoint {
     }
 
     /// Mute outgoing audio (send silence, preserve queue).
-    pub fn mute(&self, session_id: i32) -> Result<()> {
+    pub fn mute(&self, session_id: &str) -> Result<()> {
         let s = self.sessions.lock().unwrap();
-        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         sess.muted.store(true, Ordering::Relaxed); Ok(())
     }
 
     /// Unmute outgoing audio.
-    pub fn unmute(&self, session_id: i32) -> Result<()> {
+    pub fn unmute(&self, session_id: &str) -> Result<()> {
         let s = self.sessions.lock().unwrap();
-        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         sess.muted.store(false, Ordering::Relaxed); Ok(())
     }
 
     /// Pause audio playback — send loop outputs nothing, queue preserved.
     /// Frames accumulate in the channel during pause (same as LiveKit).
-    pub fn pause(&self, session_id: i32) -> Result<()> {
+    pub fn pause(&self, session_id: &str) -> Result<()> {
         let s = self.sessions.lock().unwrap();
-        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         sess.paused.store(true, Ordering::Relaxed);
         Ok(())
     }
 
     /// Resume audio playback.
-    pub fn resume(&self, session_id: i32) -> Result<()> {
+    pub fn resume(&self, session_id: &str) -> Result<()> {
         let s = self.sessions.lock().unwrap();
-        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         sess.paused.store(false, Ordering::Relaxed); Ok(())
     }
 
-    pub fn recv_audio(&self, session_id: i32) -> Result<Option<AudioFrame>> {
+    pub fn recv_audio(&self, session_id: &str) -> Result<Option<AudioFrame>> {
         let s = self.sessions.lock().unwrap();
-        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         Ok(sess.incoming_rx.try_recv().ok())
     }
 
-    pub fn recv_audio_blocking(&self, session_id: i32, timeout_ms: u64) -> Result<Option<AudioFrame>> {
-        let rx = { let s = self.sessions.lock().unwrap(); s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?.incoming_rx.clone() };
+    pub fn recv_audio_blocking(&self, session_id: &str, timeout_ms: u64) -> Result<Option<AudioFrame>> {
+        let rx = { let s = self.sessions.lock().unwrap(); s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?.incoming_rx.clone() };
         Ok(rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)).ok())
     }
 
     /// Clear buffered audio — drains local AudioBuffer AND sends clearAudio to Plivo.
-    pub fn clear_buffer(&self, session_id: i32) -> Result<()> {
+    pub fn clear_buffer(&self, session_id: &str) -> Result<()> {
         let s = self.sessions.lock().unwrap();
-        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         // Clear local AudioBuffer (fires any pending completion callbacks)
         sess.audio_buf.clear();
         // Send clearAudio to Plivo to clear server-side buffer
@@ -231,9 +230,9 @@ impl AudioStreamEndpoint {
 
     /// Send a checkpoint — Plivo will respond with playedStream when all audio up to this point has played.
     /// Returns the checkpoint name for tracking.
-    pub fn checkpoint(&self, session_id: i32, name: Option<&str>) -> Result<String> {
+    pub fn checkpoint(&self, session_id: &str, name: Option<&str>) -> Result<String> {
         let s = self.sessions.lock().unwrap();
-        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         let cp_name = name.map(String::from).unwrap_or_else(|| {
             format!("cp-{}", sess.checkpoint_counter.fetch_add(1, Ordering::Relaxed))
         });
@@ -246,7 +245,7 @@ impl AudioStreamEndpoint {
 
     /// Flush: send checkpoint and wait for playedStream confirmation.
     /// This is the audio streaming equivalent of SIP's flush + wait_for_playout.
-    pub fn flush(&self, session_id: i32) -> Result<()> {
+    pub fn flush(&self, session_id: &str) -> Result<()> {
         let cp_name = self.checkpoint(session_id, None)?;
         debug!("Flush: waiting for checkpoint '{}' on session {}", cp_name, session_id);
         // Don't block here — just mark the checkpoint. wait_for_playout blocks.
@@ -255,10 +254,10 @@ impl AudioStreamEndpoint {
 
     /// Wait for the last checkpoint to be confirmed by Plivo (playedStream event).
     /// Clears the checkpoint state after consuming so subsequent calls block correctly.
-    pub fn wait_for_playout(&self, session_id: i32, timeout_ms: u64) -> Result<bool> {
+    pub fn wait_for_playout(&self, session_id: &str, timeout_ms: u64) -> Result<bool> {
         let notify = {
             let s = self.sessions.lock().unwrap();
-            let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+            let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
             sess.checkpoint_notify.clone()
         };
         let (lock, cvar) = &*notify;
@@ -270,9 +269,9 @@ impl AudioStreamEndpoint {
     }
 
     /// Send DTMF digits via Plivo audio streaming.
-    pub fn send_dtmf(&self, session_id: i32, digits: &str) -> Result<()> {
+    pub fn send_dtmf(&self, session_id: &str, digits: &str) -> Result<()> {
         let s = self.sessions.lock().unwrap();
-        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         let json = serde_json::to_string(&serde_json::json!({ "event": "sendDTMF", "dtmf": digits }))
             .map_err(|e| EndpointError::Other(e.to_string()))?;
         sess.ws_tx.send(Message::Text(json)).map_err(|_| EndpointError::Other("WS send failed".into()))?;
@@ -281,17 +280,17 @@ impl AudioStreamEndpoint {
     }
 
     /// Hangup via Plivo REST API. Idempotent.
-    pub fn hangup(&self, session_id: i32) -> Result<()> {
-        let call_id = {
-            let sess = self.sessions.lock().unwrap().remove(&session_id);
-            match sess { Some(s) => { s.cancel.cancel(); s.call_id }, None => return Ok(()) }
+    pub fn hangup(&self, session_id: &str) -> Result<()> {
+        let plivo_call_id = {
+            let sess = self.sessions.lock().unwrap().remove(session_id);
+            match sess { Some(s) => { s.cancel.cancel(); s.call_id.clone() }, None => return Ok(()) }
         };
         let (auth_id, auth_token) = (self.config.plivo_auth_id.clone(), self.config.plivo_auth_token.clone());
         if auth_id.is_empty() { return Ok(()); }
         self.runtime.block_on(async {
-            let url = format!("https://api.plivo.com/v1/Account/{}/Call/{}/", auth_id, call_id);
+            let url = format!("https://api.plivo.com/v1/Account/{}/Call/{}/", auth_id, plivo_call_id);
             match reqwest::Client::new().delete(&url).basic_auth(&auth_id, Some(&auth_token)).send().await {
-                Ok(r) if r.status().is_success() || r.status().as_u16() == 404 => info!("Call {} hung up", call_id),
+                Ok(r) if r.status().is_success() || r.status().as_u16() == 404 => info!("Call {} hung up", plivo_call_id),
                 Ok(r) => warn!("Hangup: {} {}", r.status(), r.text().await.unwrap_or_default()),
                 Err(e) => warn!("Hangup: {}", e),
             }
@@ -300,29 +299,29 @@ impl AudioStreamEndpoint {
     }
 
     /// Send a raw text message over the WebSocket (e.g. for OutputTransportMessageFrame pass-through).
-    pub fn send_raw_message(&self, session_id: i32, message: &str) -> Result<()> {
+    pub fn send_raw_message(&self, session_id: &str, message: &str) -> Result<()> {
         let s = self.sessions.lock().unwrap();
-        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         sess.ws_tx.send(Message::Text(message.to_string())).map_err(|_| EndpointError::Other("WS send failed".into()))
     }
 
     /// Get the incoming audio receiver for async operations (used by Node.js async tasks).
-    pub fn incoming_rx(&self, session_id: i32) -> Result<Receiver<AudioFrame>> {
+    pub fn incoming_rx(&self, session_id: &str) -> Result<Receiver<AudioFrame>> {
         let s = self.sessions.lock().unwrap();
-        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         Ok(sess.incoming_rx.clone())
     }
 
     /// Get the checkpoint notify handle for async operations (used by Node.js async tasks).
-    pub fn checkpoint_notify(&self, session_id: i32) -> Result<Arc<(Mutex<Option<String>>, Condvar)>> {
+    pub fn checkpoint_notify(&self, session_id: &str) -> Result<Arc<(Mutex<Option<String>>, Condvar)>> {
         let s = self.sessions.lock().unwrap();
-        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         Ok(sess.checkpoint_notify.clone())
     }
 
-    pub fn queued_frames(&self, session_id: i32) -> Result<usize> {
+    pub fn queued_frames(&self, session_id: &str) -> Result<usize> {
         let s = self.sessions.lock().unwrap();
-        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         Ok(sess.audio_buf.len())
     }
     pub fn sample_rate(&self) -> u32 { self.config.sample_rate }
@@ -331,8 +330,8 @@ impl AudioStreamEndpoint {
     pub fn shutdown(&self) -> Result<()> {
         self.cancel.cancel();
         if self.config.auto_hangup {
-            let ids: Vec<i32> = self.sessions.lock().unwrap().keys().copied().collect();
-            for id in ids { let _ = self.hangup(id); }
+            let ids: Vec<String> = self.sessions.lock().unwrap().keys().cloned().collect();
+            for id in ids { let _ = self.hangup(&id); }
         }
         info!("Audio streaming shut down");
         Ok(())
@@ -343,9 +342,8 @@ impl Drop for AudioStreamEndpoint { fn drop(&mut self) { let _ = self.shutdown()
 
 // ─── WebSocket server ────────────────────────────────────────────────────────
 
-async fn run_ws_server(addr: &str, sessions: Arc<Mutex<HashMap<i32, StreamSession>>>, etx: Sender<EndpointEvent>, cancel: CancellationToken) -> std::result::Result<(), Box<dyn std::error::Error>> {
+async fn run_ws_server(addr: &str, sessions: Arc<Mutex<HashMap<String, StreamSession>>>, etx: Sender<EndpointEvent>, cancel: CancellationToken) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
-    let next_id = AtomicI32::new(0);
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -353,7 +351,7 @@ async fn run_ws_server(addr: &str, sessions: Arc<Mutex<HashMap<i32, StreamSessio
                 let (stream, peer) = result?;
                 info!("WS connection from {}", peer);
                 let ws = tokio_tungstenite::accept_async(stream).await?;
-                let sid = next_id.fetch_add(1, Ordering::Relaxed);
+                let sid = format!("ws-{:016x}", rand::random::<u64>());
                 let (s, e, c) = (sessions.clone(), etx.clone(), cancel.clone());
                 tokio::spawn(async move { handle_ws(ws, sid, s, e, c).await; });
             }
@@ -362,7 +360,7 @@ async fn run_ws_server(addr: &str, sessions: Arc<Mutex<HashMap<i32, StreamSessio
     Ok(())
 }
 
-async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>, sid: i32, sessions: Arc<Mutex<HashMap<i32, StreamSession>>>, etx: Sender<EndpointEvent>, cancel: CancellationToken) {
+async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>, sid: String, sessions: Arc<Mutex<HashMap<String, StreamSession>>>, etx: Sender<EndpointEvent>, cancel: CancellationToken) {
     use futures_util::{SinkExt, StreamExt};
     let (mut sink, mut stream) = ws.split();
     let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
@@ -470,7 +468,7 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                                 }
                             });
 
-                            sessions.lock().unwrap().insert(sid, StreamSession {
+                            sessions.lock().unwrap().insert(sid.clone(), StreamSession {
                                 call_id: start.call_id.clone(), stream_id: start.stream_id.clone(),
                                 ws_tx: ws_tx.clone(), incoming_tx: itx.clone(), incoming_rx: irx.clone(),
                                 audio_buf, bg_audio_buf, extra_headers: headers.clone(), encoding,
@@ -479,13 +477,13 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                                 cancel: session_cancel,
                             });
 
-                            let mut session = crate::sip::call::CallSession::new(sid, crate::sip::call::CallDirection::Inbound);
+                            let mut session = crate::sip::call::CallSession::new(sid.clone(), crate::sip::call::CallDirection::Inbound);
                             session.call_uuid = Some(start.call_id.clone());
                             session.remote_uri = start.call_id;
                             session.local_uri = start.stream_id.clone();
                             session.extra_headers = headers;
                             let _ = etx.try_send(EndpointEvent::IncomingCall { session });
-                            let _ = etx.try_send(EndpointEvent::CallMediaActive { call_id: sid });
+                            let _ = etx.try_send(EndpointEvent::CallMediaActive { call_id: sid.clone() });
                             info!("Session {} started (encoding={:?})", sid, encoding);
                         }
                     }
@@ -515,7 +513,7 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                     "dtmf" => {
                         if let Some(dtmf) = plivo.dtmf {
                             if let Some(d) = dtmf.digit.chars().next() {
-                                let _ = etx.try_send(EndpointEvent::DtmfReceived { call_id: sid, digit: d, method: "plivo_ws".into() });
+                                let _ = etx.try_send(EndpointEvent::DtmfReceived { call_id: sid.clone(), digit: d, method: "plivo_ws".into() });
                             }
                         }
                     }
@@ -523,7 +521,7 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                         // Checkpoint confirmation — audio up to this checkpoint has played
                         if let Some(name) = plivo.name {
                             debug!("playedStream: checkpoint '{}' on session {}", name, sid);
-                            if let Some(sess) = sessions.lock().unwrap().get(&sid) {
+                            if let Some(sess) = sessions.lock().unwrap().get(sid.as_str()) {
                                 let (lock, cvar) = &*sess.checkpoint_notify;
                                 *lock.lock().unwrap() = Some(name);
                                 cvar.notify_all();
@@ -538,7 +536,7 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                         info!("Session {} stopped", sid);
                         if let Some(sess) = sessions.lock().unwrap().remove(&sid) {
                             sess.cancel.cancel(); // Stop the send loop task
-                            let session = crate::sip::call::CallSession::new(sid, crate::sip::call::CallDirection::Inbound);
+                            let session = crate::sip::call::CallSession::new(sid.clone(), crate::sip::call::CallDirection::Inbound);
                             let _ = etx.try_send(EndpointEvent::CallTerminated { session, reason: "stream stopped".into() });
                         }
                         break;
@@ -554,7 +552,7 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
     // (e.g., caller hung up, network drop, Plivo closed WS without sending "stop")
     if let Some(sess) = sessions.lock().unwrap().remove(&sid) {
         sess.cancel.cancel();
-        let session = crate::sip::call::CallSession::new(sid, crate::sip::call::CallDirection::Inbound);
+        let session = crate::sip::call::CallSession::new(sid.clone(), crate::sip::call::CallDirection::Inbound);
         let _ = etx.try_send(EndpointEvent::CallTerminated { session, reason: "ws disconnected".into() });
         info!("Session {} cleaned up (WS disconnected)", sid);
     }

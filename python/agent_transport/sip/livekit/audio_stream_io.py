@@ -50,7 +50,7 @@ class AudioStreamInput(AudioInput):
     - On stream end, pushes 0.5s silence to flush STT, then closes Chan
     """
 
-    def __init__(self, endpoint, session_id: int, *, label: str = "audio-stream-input", source=None, **kwargs):
+    def __init__(self, endpoint, session_id: str, *, label: str = "audio-stream-input", source=None, **kwargs):
         try:
             super().__init__(label=label, source=source)
         except TypeError:
@@ -150,7 +150,7 @@ class AudioStreamOutput(AudioOutput):
     def __init__(
         self,
         endpoint,
-        session_id: int,
+        session_id: str,
         *,
         label: str = "audio-stream-output",
         sample_rate: Optional[int] = None,

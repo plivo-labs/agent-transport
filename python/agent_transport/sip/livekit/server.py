@@ -165,7 +165,7 @@ class CallContext:
             print(f"DTMF: {digit}")
     """
 
-    call_id: int
+    call_id: str
     remote_uri: str
     direction: str  # "inbound" or "outbound"
     endpoint: SipEndpoint
@@ -626,7 +626,7 @@ class AgentServer:
                                           participant=ctx._room._remote)
                         ctx._room.emit("sip_dtmf_received", dtmf_ev)
 
-    async def _start_call(self, call_id: int, remote_uri: str, direction: str) -> None:
+    async def _start_call(self, call_id: str, remote_uri: str, direction: str) -> None:
         call_ended = asyncio.Event()
         self._call_ended_events[call_id] = call_ended
 

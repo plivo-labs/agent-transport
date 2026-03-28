@@ -158,7 +158,7 @@ impl RtpTransport {
         })
     }
 
-    pub fn start_recv_loop(self: &Arc<Self>, tx: Sender<AudioFrame>, etx: Sender<EndpointEvent>, cid: i32, bd: Arc<Mutex<Option<BeepDetector>>>, held: Arc<AtomicBool>, recorder: Option<Arc<CallRecorder>>) -> tokio::task::JoinHandle<()> {
+    pub fn start_recv_loop(self: &Arc<Self>, tx: Sender<AudioFrame>, etx: Sender<EndpointEvent>, cid: String, bd: Arc<Mutex<Option<BeepDetector>>>, held: Arc<AtomicBool>, recorder: Option<Arc<CallRecorder>>) -> tokio::task::JoinHandle<()> {
         let t = Arc::clone(self);
         tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
@@ -196,7 +196,7 @@ impl RtpTransport {
                                     if dtmf_ev.is_some() {
                                         if let Some(d) = dtmf::event_to_digit(ev) {
                                             debug!("DTMF digit: {}", d);
-                                            let _ = etx.try_send(EndpointEvent::DtmfReceived { call_id: cid, digit: d, method: "rfc2833".into() });
+                                            let _ = etx.try_send(EndpointEvent::DtmfReceived { call_id: cid.clone(), digit: d, method: "rfc2833".into() });
                                         }
                                         dtmf_ev = None;
                                         dtmf_timer = None;
@@ -214,7 +214,7 @@ impl RtpTransport {
                             debug!("RTP unexpected PT={} (expected {} or {})", pkt.header.payload_type, t.codec.payload_type(), t.dtmf_pt);
                         }
                         // DTMF END timeout
-                        if let Some(ev) = dtmf_ev { if dtmf_timer.map(|t| t.elapsed() > DTMF_END_TIMEOUT).unwrap_or(false) { if let Some(d) = dtmf::event_to_digit(ev) { warn!("DTMF END timeout: {}", d); let _ = etx.try_send(EndpointEvent::DtmfReceived { call_id: cid, digit: d, method: "rfc2833".into() }); } dtmf_ev = None; dtmf_timer = None; } }
+                        if let Some(ev) = dtmf_ev { if dtmf_timer.map(|t| t.elapsed() > DTMF_END_TIMEOUT).unwrap_or(false) { if let Some(d) = dtmf::event_to_digit(ev) { warn!("DTMF END timeout: {}", d); let _ = etx.try_send(EndpointEvent::DtmfReceived { call_id: cid.clone(), digit: d, method: "rfc2833".into() }); } dtmf_ev = None; dtmf_timer = None; } }
                         if pkt.header.payload_type != t.codec.payload_type() { continue; }
 
                         // Decode G.711, then upsample 8kHz→16kHz via speexdsp
@@ -231,8 +231,8 @@ impl RtpTransport {
                         // Beep detector
                         if let Ok(mut g) = bd.lock() { if let Some(ref mut det) = *g {
                             match det.process_frame(&pcm) {
-                                BeepDetectorResult::Detected(e) => { let _ = etx.try_send(EndpointEvent::BeepDetected { call_id: cid, frequency_hz: e.frequency_hz, duration_ms: e.duration_ms }); *g = None; }
-                                BeepDetectorResult::Timeout => { let _ = etx.try_send(EndpointEvent::BeepTimeout { call_id: cid }); *g = None; }
+                                BeepDetectorResult::Detected(e) => { let _ = etx.try_send(EndpointEvent::BeepDetected { call_id: cid.clone(), frequency_hz: e.frequency_hz, duration_ms: e.duration_ms }); *g = None; }
+                                BeepDetectorResult::Timeout => { let _ = etx.try_send(EndpointEvent::BeepTimeout { call_id: cid.clone() }); *g = None; }
                                 _ => {}
                             }
                         }}

@@ -79,7 +79,7 @@ fn main() -> anyhow::Result<()> {
     let recv_start = Instant::now();
     let mut frame_count = 0u32;
     while recv_start.elapsed() < Duration::from_secs(3) {
-        match ep.recv_audio(call_id) {
+        match ep.recv_audio(&call_id) {
             Ok(Some(frame)) => {
                 sample_rate = frame.sample_rate;
                 all_samples.extend_from_slice(&frame.data);
@@ -116,7 +116,7 @@ fn main() -> anyhow::Result<()> {
     // Send 10 frames (200ms of tone)
     let mut send_ok = 0;
     for _ in 0..10 {
-        match ep.send_audio(call_id, &tone_frame) {
+        match ep.send_audio(&call_id, &tone_frame) {
             Ok(()) => send_ok += 1,
             Err(e) => println!("  send_audio error: {}", e),
         }
@@ -127,18 +127,18 @@ fn main() -> anyhow::Result<()> {
     println!("  PASS: send_audio working");
 
     println!("--- Test 6: send_dtmf ---");
-    match ep.send_dtmf(call_id, "1") {
+    match ep.send_dtmf(&call_id, "1") {
         Ok(()) => println!("  PASS: DTMF '1' sent"),
         Err(e) => println!("  FAIL: send_dtmf error: {}", e),
     }
 
     println!("--- Test 7: mute/unmute ---");
-    match ep.mute(call_id) {
+    match ep.mute(&call_id) {
         Ok(()) => println!("  PASS: mute"),
         Err(e) => println!("  FAIL: mute error: {}", e),
     }
     std::thread::sleep(Duration::from_millis(200));
-    match ep.unmute(call_id) {
+    match ep.unmute(&call_id) {
         Ok(()) => println!("  PASS: unmute"),
         Err(e) => println!("  FAIL: unmute error: {}", e),
     }
@@ -146,7 +146,7 @@ fn main() -> anyhow::Result<()> {
     // Collect a bit more audio for the WAV file
     let recv2_start = Instant::now();
     while recv2_start.elapsed() < Duration::from_secs(2) {
-        if let Ok(Some(frame)) = ep.recv_audio(call_id) {
+        if let Ok(Some(frame)) = ep.recv_audio(&call_id) {
             all_samples.extend_from_slice(&frame.data);
         } else {
             std::thread::sleep(Duration::from_millis(5));
@@ -154,7 +154,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!("--- Test 8: hangup ---");
-    ep.hangup(call_id)?;
+    ep.hangup(&call_id)?;
     // Wait for termination event
     loop {
         match events.recv_timeout(Duration::from_secs(5)) {

@@ -28,7 +28,7 @@ class SipAudioSource:
     def __init__(
         self,
         endpoint,
-        call_or_session_id: int,
+        call_or_session_id: str,
         sample_rate: int,
         num_channels: int = 1,
         queue_size_ms: int = 1000,
