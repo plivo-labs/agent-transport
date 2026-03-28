@@ -28,6 +28,10 @@ bytes = "1"
 rand = "0.8"
 tokio-util = { version = "0.7", features = ["rt"] }
 
+# Recording (OGG/Opus)
+opus = "0.3"
+ogg = "0.9"
+
 # Optional audio processing
 neteq = { version = "0.8", default-features = false, optional = true }
 

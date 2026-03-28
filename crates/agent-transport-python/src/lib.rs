@@ -821,6 +821,16 @@ impl AudioStreamEndpoint {
         self.inner.send_raw_message(session_id, message).map_err(py_err)
     }
 
+    /// Start recording (OGG/Opus stereo). Wired through LiveKit's record=True.
+    fn start_recording(&self, session_id: &str, path: &str, stereo: bool) -> PyResult<()> {
+        self.inner.start_recording(session_id, path, stereo).map_err(py_err)
+    }
+
+    /// Stop recording.
+    fn stop_recording(&self, session_id: &str) -> PyResult<()> {
+        self.inner.stop_recording(session_id).map_err(py_err)
+    }
+
     fn poll_event(&self, py: Python) -> PyResult<Option<PyObject>> {
         match self.inner.events().try_recv() {
             Ok(event) => { let dict = event_to_dict(py, &event)?; Ok(Some(dict.into())) }

@@ -404,9 +404,9 @@ class _StubJobContext:
             import os
             rec_dir = str(self.session_directory)
             os.makedirs(rec_dir, exist_ok=True)
-            rec_path = os.path.join(rec_dir, "audio.wav")
-            ep.start_recording(session_id, rec_path, True)  # stereo WAV
-            logger.debug("Recording started (Rust transport): %s", rec_path)
+            rec_path = os.path.join(rec_dir, "audio.ogg")
+            ep.start_recording(session_id, rec_path, True)  # stereo OGG/Opus
+            logger.debug("Recording started (Rust OGG/Opus): %s", rec_path)
 
             # Disable RecorderIO's Python-level recording — Rust handles it
             options["audio"] = False

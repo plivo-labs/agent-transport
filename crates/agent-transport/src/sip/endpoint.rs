@@ -27,7 +27,7 @@ use crate::sip::call::{CallDirection, CallSession, CallState};
 use crate::config::EndpointConfig;
 use crate::error::{EndpointError, Result};
 use crate::events::EndpointEvent;
-use crate::recorder::CallRecorder;
+use crate::recorder::{CallRecorder, RecordingManager};
 use crate::sip::audio_buffer::AudioBuffer;
 use crate::sip::rtp_transport::RtpTransport;
 use crate::sip::sdp;
@@ -49,7 +49,7 @@ struct CallContext {
     held: Arc<AtomicBool>,
     playout_notify: Arc<(Mutex<bool>, Condvar)>,
     beep_detector: Arc<Mutex<Option<BeepDetector>>>,
-    recorder: Option<Arc<CallRecorder>>,
+    recorder: Arc<Mutex<Option<Arc<CallRecorder>>>>,
     cancel: CancellationToken,
     client_dialog: Option<rsipstack::dialog::client_dialog::ClientInviteDialog>,
     server_dialog: Option<rsipstack::dialog::server_dialog::ServerInviteDialog>,
@@ -170,7 +170,7 @@ fn new_call_context(call_id: &str, direction: CallDirection, cc: CancellationTok
         muted: Arc::new(AtomicBool::new(false)), paused: Arc::new(AtomicBool::new(false)),
         held: Arc::new(AtomicBool::new(false)),
         playout_notify: Arc::new((Mutex::new(false), Condvar::new())),
-        beep_detector: Arc::new(Mutex::new(None)), recorder: None, cancel: cc,
+        beep_detector: Arc::new(Mutex::new(None)), recorder: Arc::new(Mutex::new(None)), cancel: cc,
         client_dialog: None, server_dialog: None, local_sdp: None,
     };
     (ctx, session)
@@ -207,6 +207,7 @@ pub struct SipEndpoint {
     event_tx: Sender<EndpointEvent>,
     event_rx: Receiver<EndpointEvent>,
     cancel: CancellationToken,
+    recording_mgr: Arc<RecordingManager>,
 }
 
 impl SipEndpoint {
@@ -256,7 +257,7 @@ impl SipEndpoint {
         })?;
 
         info!("Agent transport initialized");
-        Ok(Self { config, runtime: rt, state, event_tx: etx, event_rx: erx, cancel })
+        Ok(Self { config, runtime: rt, state, event_tx: etx, event_rx: erx, cancel, recording_mgr: RecordingManager::new() })
     }
 
     pub fn register(&self, username: &str, password: &str) -> Result<()> {
@@ -626,20 +627,19 @@ impl SipEndpoint {
     }
 
     pub fn start_recording(&self, call_id: &str, path: &str, stereo: bool) -> Result<()> {
-        let p = path.to_string();
         let mode = if stereo { crate::recorder::RecordingMode::Stereo } else { crate::recorder::RecordingMode::Mono };
-        self.with_call_mut(call_id, |c| {
-            let rec = Arc::new(CallRecorder::new(&p, mode).map_err(|e| EndpointError::Other(format!("WAV: {}", e)))?);
-            c.recorder = Some(rec);
-            Ok::<_, EndpointError>(())
-        })?
+        let sample_rate = 16000; // SIP internal sample rate
+        let rec = self.recording_mgr.start(call_id, path, mode, sample_rate);
+        self.with_call(call_id, |c| {
+            *c.recorder.lock().unwrap() = Some(rec.clone());
+        })
     }
 
     pub fn stop_recording(&self, call_id: &str) -> Result<()> {
-        self.with_call_mut(call_id, |c| {
-            if let Some(r) = c.recorder.take() { r.finalize(); Ok(()) }
-            else { Err(EndpointError::Other("no recording".into())) }
-        })?
+        self.recording_mgr.stop(call_id);
+        self.with_call(call_id, |c| {
+            *c.recorder.lock().unwrap() = None;
+        })
     }
 
     pub fn detect_beep(&self, call_id: &str, config: BeepDetectorConfig) -> Result<()> {

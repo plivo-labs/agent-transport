@@ -853,6 +853,16 @@ impl AudioStreamEndpoint {
     }
 
     #[napi]
+    pub fn start_recording(&self, session_id: String, path: String, stereo: Option<bool>) -> Result<()> {
+        self.inner.start_recording(&session_id, &path, stereo.unwrap_or(true)).map_err(napi_err)
+    }
+
+    #[napi]
+    pub fn stop_recording(&self, session_id: String) -> Result<()> {
+        self.inner.stop_recording(&session_id).map_err(napi_err)
+    }
+
+    #[napi]
     pub fn poll_event(&self) -> Result<Option<EventInfo>> {
         match self.inner.events().try_recv() {
             Ok(event) => Ok(Some(event_to_info(&event))),

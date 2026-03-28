@@ -71,7 +71,7 @@ impl RtpTransport {
 
     /// Start the RTP send loop. Drains from the shared AudioBuffer every ptime_ms.
     /// Matches WebRTC C++ InternalSource::audio_task_ (10ms repeating task).
-    pub fn start_send_loop(self: &Arc<Self>, audio_buf: Arc<AudioBuffer>, bg_audio_buf: Arc<AudioBuffer>, muted: Arc<AtomicBool>, paused: Arc<AtomicBool>, playout: Arc<(Mutex<bool>, Condvar)>, recorder: Option<Arc<CallRecorder>>) -> tokio::task::JoinHandle<()> {
+    pub fn start_send_loop(self: &Arc<Self>, audio_buf: Arc<AudioBuffer>, bg_audio_buf: Arc<AudioBuffer>, muted: Arc<AtomicBool>, paused: Arc<AtomicBool>, playout: Arc<(Mutex<bool>, Condvar)>, recorder: Arc<Mutex<Option<Arc<CallRecorder>>>>) -> tokio::task::JoinHandle<()> {
         let t = Arc::clone(self);
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(Duration::from_millis(t.ptime_ms as u64));
@@ -128,7 +128,7 @@ impl RtpTransport {
 
                 if !samples.is_empty() {
                     // Record agent audio (16kHz, before downsample)
-                    if let Some(ref rec) = recorder { rec.write_agent_samples(&samples); }
+                    if let Ok(guard) = recorder.lock() { if let Some(ref rec) = *guard { rec.write_agent_samples(&samples); } }
 
                     if !muted.load(Ordering::Relaxed) {
                         let m = first; first = false;
@@ -158,7 +158,7 @@ impl RtpTransport {
         })
     }
 
-    pub fn start_recv_loop(self: &Arc<Self>, tx: Sender<AudioFrame>, etx: Sender<EndpointEvent>, cid: String, bd: Arc<Mutex<Option<BeepDetector>>>, held: Arc<AtomicBool>, recorder: Option<Arc<CallRecorder>>) -> tokio::task::JoinHandle<()> {
+    pub fn start_recv_loop(self: &Arc<Self>, tx: Sender<AudioFrame>, etx: Sender<EndpointEvent>, cid: String, bd: Arc<Mutex<Option<BeepDetector>>>, held: Arc<AtomicBool>, recorder: Arc<Mutex<Option<Arc<CallRecorder>>>>) -> tokio::task::JoinHandle<()> {
         let t = Arc::clone(self);
         tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
@@ -226,7 +226,7 @@ impl RtpTransport {
                         };
 
                         // Record user audio (16kHz, after resample)
-                        if let Some(ref rec) = recorder { rec.write_user_samples(&pcm); }
+                        if let Ok(guard) = recorder.lock() { if let Some(ref rec) = *guard { rec.write_user_samples(&pcm); } }
 
                         // Beep detector
                         if let Ok(mut g) = bd.lock() { if let Some(ref mut det) = *g {

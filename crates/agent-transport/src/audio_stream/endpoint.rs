@@ -105,13 +105,12 @@ struct StreamSession {
     bg_audio_buf: Arc<AudioBuffer>,  // Background audio (mixed in send loop)
     extra_headers: HashMap<String, String>,
     encoding: AudioEncoding,
-    // Audio control flags (same as SIP RTP transport)
     muted: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     playout_notify: Arc<(Mutex<bool>, Condvar)>,
-    // Checkpoint tracking
     checkpoint_counter: AtomicU64,
     checkpoint_notify: Arc<(Mutex<Option<String>>, Condvar)>,
+    recorder: Arc<Mutex<Option<Arc<crate::recorder::CallRecorder>>>>,
     cancel: CancellationToken,
 }
 
@@ -124,6 +123,7 @@ pub struct AudioStreamEndpoint {
     event_tx: Sender<EndpointEvent>,
     event_rx: Receiver<EndpointEvent>,
     cancel: CancellationToken,
+    recording_mgr: Arc<crate::recorder::RecordingManager>,
 }
 
 impl AudioStreamEndpoint {
@@ -139,7 +139,7 @@ impl AudioStreamEndpoint {
         });
 
         info!("Audio streaming endpoint on {}", config.listen_addr);
-        Ok(Self { config, runtime: rt, sessions, event_tx: etx, event_rx: erx, cancel })
+        Ok(Self { config, runtime: rt, sessions, event_tx: etx, event_rx: erx, cancel, recording_mgr: crate::recorder::RecordingManager::new() })
     }
 
     /// Send audio with completion callback — matches SipEndpoint::send_audio_with_callback.
@@ -280,6 +280,28 @@ impl AudioStreamEndpoint {
     }
 
     /// Hangup via Plivo REST API. Idempotent.
+    /// Start recording for an audio stream session.
+    pub fn start_recording(&self, session_id: &str, path: &str, stereo: bool) -> Result<()> {
+        let mode = if stereo { crate::recorder::RecordingMode::Stereo } else { crate::recorder::RecordingMode::Mono };
+        let sample_rate = self.config.sample_rate;
+        let rec = self.recording_mgr.start(session_id, path, mode, sample_rate);
+        let s = self.sessions.lock().unwrap();
+        if let Some(sess) = s.get(session_id) {
+            *sess.recorder.lock().unwrap() = Some(rec);
+        }
+        Ok(())
+    }
+
+    /// Stop recording for an audio stream session.
+    pub fn stop_recording(&self, session_id: &str) -> Result<()> {
+        self.recording_mgr.stop(session_id);
+        if let Some(sess) = self.sessions.lock().unwrap().get(session_id) {
+            *sess.recorder.lock().unwrap() = None;
+        }
+        Ok(())
+    }
+
+    /// Hangup via Plivo REST API. Idempotent.
     pub fn hangup(&self, session_id: &str) -> Result<()> {
         let plivo_call_id = {
             let sess = self.sessions.lock().unwrap().remove(session_id);
@@ -370,8 +392,9 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
     tokio::spawn(async move { loop { tokio::select! { _ = cc.cancelled() => break, msg = ws_rx.recv() => { match msg { Some(m) => { if sink.send(m).await.is_err() { break; } }, None => break } } } } });
 
     let mut encoding = AudioEncoding::MulawRate8k; // default, updated on start
-    // speexdsp resampler for 8kHz→16kHz recv path (created on first use if needed)
     let mut upsampler: Option<crate::sip::resampler::Resampler> = None;
+    // Shared recorder reference — set by start_recording(), used by media handler
+    let mut media_recorder: Option<Arc<Mutex<Option<Arc<crate::recorder::CallRecorder>>>>> = None;
 
     loop {
         tokio::select! {
@@ -399,11 +422,12 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
 
                             // Create AudioBuffers + control flags (same pattern as SIP)
                             let audio_buf = Arc::new(AudioBuffer::new());
-                            let bg_audio_buf = Arc::new(AudioBuffer::new()); // Background audio (hold music, ambient)
+                            let bg_audio_buf = Arc::new(AudioBuffer::new());
                             let muted = Arc::new(AtomicBool::new(false));
                             let paused = Arc::new(AtomicBool::new(false));
                             let playout_notify = Arc::new((Mutex::new(false), Condvar::new()));
                             let cp_notify = Arc::new((Mutex::new(None), Condvar::new()));
+                            let session_recorder: Arc<Mutex<Option<Arc<crate::recorder::CallRecorder>>>> = Arc::new(Mutex::new(None));
                             let session_cancel = CancellationToken::new();
 
                             // Spawn send loop — paces outgoing audio at 20ms intervals
@@ -412,6 +436,7 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                             let wstx = ws_tx.clone();
                             let ab = audio_buf.clone();
                             let bg = bg_audio_buf.clone();
+                            let rec_send = session_recorder.clone();
                             let (m, p, pn) = (muted.clone(), paused.clone(), playout_notify.clone());
                             let sc = session_cancel.clone();
                             let input_spf: usize = 320; // 16kHz × 20ms = 320 samples per frame
@@ -450,6 +475,9 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                                             bg_samples
                                         };
 
+                                        // Record agent audio (before encoding)
+                                        if let Ok(guard) = rec_send.lock() { if let Some(ref rec) = *guard { rec.write_agent_samples(&mixed); } }
+
                                         if !m.load(Ordering::Relaxed) {
                                             let payload = encode_for_plivo(&mixed, enc, &mut downsampler);
                                             let b64 = base64::engine::general_purpose::STANDARD.encode(&payload);
@@ -468,12 +496,16 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                                 }
                             });
 
+                            // Store shared recorder ref for media handler
+                            media_recorder = Some(session_recorder.clone());
+
                             sessions.lock().unwrap().insert(sid.clone(), StreamSession {
                                 call_id: start.call_id.clone(), stream_id: start.stream_id.clone(),
                                 ws_tx: ws_tx.clone(), incoming_tx: itx.clone(), incoming_rx: irx.clone(),
                                 audio_buf, bg_audio_buf, extra_headers: headers.clone(), encoding,
                                 muted, paused, playout_notify,
                                 checkpoint_counter: AtomicU64::new(0), checkpoint_notify: cp_notify,
+                                recorder: session_recorder,
                                 cancel: session_cancel,
                             });
 
@@ -505,6 +537,10 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                                         if let Some(ref mut us) = upsampler { us.process(&pcm_8k).to_vec() } else { pcm_8k }
                                     }
                                 };
+                                // Record user audio
+                                if let Some(ref rec_ref) = media_recorder {
+                                    if let Ok(guard) = rec_ref.lock() { if let Some(ref rec) = *guard { rec.write_user_samples(&pcm_16k); } }
+                                }
                                 let n = pcm_16k.len() as u32;
                                 let _ = itx.try_send(AudioFrame { data: pcm_16k, sample_rate: 16000, num_channels: 1, samples_per_channel: n });
                             }
