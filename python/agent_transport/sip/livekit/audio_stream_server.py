@@ -4,7 +4,7 @@ Same pattern as AgentServer but over WebSocket instead of SIP:
     server = AudioStreamServer(listen_addr="0.0.0.0:8765")
 
     @server.audio_stream_session()
-    async def entrypoint(ctx: AudioStreamCallContext):
+    async def entrypoint(ctx: AudioStreamJobContext):
         session = AgentSession(vad=..., stt=..., llm=..., tts=...)
         await ctx.start(session, agent=Assistant())
 
@@ -147,15 +147,15 @@ class _LoadMonitor:
             return self._avg.get_avg()
 
 
-# ─── AudioStreamCallContext ───────────────────────────────────────────────────
+# ─── AudioStreamJobContext ───────────────────────────────────────────────────
 
 @dataclass
-class AudioStreamCallContext:
+class AudioStreamJobContext:
     """Context passed to the @audio_stream_session handler.
 
     Matches LiveKit's standard pattern exactly:
         @server.audio_stream_session()
-        async def entrypoint(ctx: AudioStreamCallContext):
+        async def entrypoint(ctx: AudioStreamJobContext):
             session = AgentSession(vad=..., stt=..., llm=..., tts=...)
             ctx.session = session
             await session.start(agent=Assistant(), room=ctx.room)
@@ -278,7 +278,7 @@ class AudioStreamServer:
         self._ep: AudioStreamEndpoint | None = None
         self._active_sessions: dict[int, asyncio.Task] = {}
         self._session_ended_events: dict[int, asyncio.Event] = {}
-        self._session_contexts: dict[int, AudioStreamCallContext] = {}
+        self._session_contexts: dict[int, AudioStreamJobContext] = {}
         self._load_monitor = _LoadMonitor()
 
     def setup(self) -> Callable:
@@ -352,7 +352,7 @@ class AudioStreamServer:
                 "No audio stream session entrypoint registered.\n"
                 "Define one using the @server.audio_stream_session() decorator, for example:\n"
                 '    @server.audio_stream_session()\n'
-                "    async def entrypoint(ctx: AudioStreamCallContext):\n"
+                "    async def entrypoint(ctx: AudioStreamJobContext):\n"
                 "        ..."
             )
             sys.exit(1)
@@ -578,7 +578,7 @@ class AudioStreamServer:
         job_stub, job_ctx_token = create_transport_context(
             room, agent_name=self._agent_name)
 
-        ctx = AudioStreamCallContext(
+        ctx = AudioStreamJobContext(
             session_id=session_id,
             call_id=call_id,
             stream_id=stream_id,

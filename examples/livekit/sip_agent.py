@@ -18,7 +18,7 @@ import os
 
 from dotenv import load_dotenv
 
-from agent_transport.sip.livekit import AgentServer, CallContext
+from agent_transport.sip.livekit import AgentServer, JobContext
 
 from livekit.agents import Agent, AgentSession, RunContext, TurnHandlingOptions
 from livekit.agents.llm import function_tool
@@ -124,7 +124,7 @@ class Assistant(Agent):
 
 
 @server.sip_session()
-async def entrypoint(ctx: CallContext):
+async def entrypoint(ctx: JobContext):
     session = AgentSession(
         vad=ctx.userdata["vad"],
         stt=deepgram.STT(model="nova-3"),

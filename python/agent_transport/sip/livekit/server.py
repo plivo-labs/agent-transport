@@ -4,7 +4,7 @@ Matches LiveKit's pattern:
     server = AgentServer()
 
     @server.sip_session()
-    async def entrypoint(ctx: CallContext):
+    async def entrypoint(ctx: JobContext):
         session = AgentSession(vad=..., stt=..., llm=..., tts=...)
         await ctx.start(session, agent=Assistant())
 
@@ -154,12 +154,12 @@ class _LoadMonitor:
 
 
 @dataclass
-class CallContext:
+class JobContext:
     """Context passed to the @sip_session handler — equivalent of LiveKit's JobContext.
 
     Matches LiveKit's standard pattern exactly:
         @server.sip_session()
-        async def entrypoint(ctx: CallContext):
+        async def entrypoint(ctx: JobContext):
             session = AgentSession(vad=..., stt=..., llm=..., tts=...)
             ctx.session = session
             await session.start(agent=Assistant(), room=ctx.room)
@@ -283,7 +283,7 @@ class AgentServer:
         self._ep: SipEndpoint | None = None
         self._active_calls: dict[int, asyncio.Task] = {}
         self._call_ended_events: dict[int, asyncio.Event] = {}
-        self._call_contexts: dict[int, CallContext] = {}
+        self._call_contexts: dict[int, JobContext] = {}
         self._pending_outbound: dict[int, asyncio.Future] = {}
         self._load_monitor = _LoadMonitor()
 
@@ -365,7 +365,7 @@ class AgentServer:
                 "No SIP session entrypoint registered.\n"
                 "Define one using the @server.sip_session() decorator, for example:\n"
                 '    @server.sip_session()\n'
-                "    async def entrypoint(ctx: CallContext):\n"
+                "    async def entrypoint(ctx: JobContext):\n"
                 "        ..."
             )
             sys.exit(1)
@@ -654,7 +654,7 @@ class AgentServer:
         job_stub, job_ctx_token = create_transport_context(
             room, agent_name=self._agent_name)
 
-        ctx = CallContext(
+        ctx = JobContext(
             call_id=call_id,
             remote_uri=remote_uri,
             direction=direction,

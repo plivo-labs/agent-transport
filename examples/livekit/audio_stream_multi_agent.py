@@ -29,7 +29,7 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
-from agent_transport.sip.livekit import AudioStreamServer, AudioStreamCallContext
+from agent_transport.sip.livekit import AudioStreamServer, AudioStreamJobContext
 
 from livekit.agents import Agent, AgentSession, RunContext, TurnHandlingOptions
 from livekit.agents.llm import function_tool
@@ -241,7 +241,7 @@ class SupportAgent(Agent):
 
 
 @server.audio_stream_session()
-async def entrypoint(ctx: AudioStreamCallContext):
+async def entrypoint(ctx: AudioStreamJobContext):
     session = AgentSession[CallData](
         vad=ctx.userdata["vad"],
         stt=deepgram.STT(model="nova-3"),
