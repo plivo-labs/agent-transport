@@ -1,0 +1,25 @@
+{
+  "name": "@agent-transport/sip-livekit",
+  "version": "0.1.0",
+  "description": "LiveKit Agents SIP transport adapter for agent-transport",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "agent-transport": "file:../../crates/agent-transport-node"
+  },
+  "peerDependencies": {
+    "@livekit/agents": ">=0.5.0",
+    "@livekit/rtc-node": ">=0.12.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0",
+    "@livekit/agents": ">=0.5.0",
+    "@livekit/rtc-node": ">=0.12.0"
+  }
+}

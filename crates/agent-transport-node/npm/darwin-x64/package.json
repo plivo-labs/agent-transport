@@ -1,0 +1,16 @@
+{
+  "name": "agent-transport-darwin-x64",
+  "version": "0.1.0",
+  "cpu": [
+    "x64"
+  ],
+  "main": "agent-transport.darwin-x64.node",
+  "files": [
+    "agent-transport.darwin-x64.node"
+  ],
+  "description": "SIP and audio streaming transport for AI voice agents (pure Rust)",
+  "license": "MIT",
+  "os": [
+    "darwin"
+  ]
+}

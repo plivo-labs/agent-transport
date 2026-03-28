@@ -60,24 +60,35 @@ cargo build --features audio-stream             # + Plivo audio streaming
 cargo build --features audio-processing         # + jitter buffer, PLC, comfort noise
 ```
 
-### Python Bindings + Adapters
+### Python
 
 ```bash
-cd crates/agent-transport-python && maturin develop   # Native binding
-cd python && pip install -e ".[all]"                   # LiveKit + Pipecat adapters
+# 1. Build the native Rust binding
+cd crates/agent-transport-python && pip install -e .
+
+# 2. Install the SIP adapter (LiveKit or Pipecat)
+cd python && pip install -e ".[livekit]"        # LiveKit adapter
+cd python && pip install -e ".[pipecat]"        # Pipecat adapter
+cd python && pip install -e ".[all]"            # Both
+
+# 3. Install LiveKit plugins
+pip install livekit-plugins-silero livekit-plugins-deepgram livekit-plugins-openai
+pip install livekit-plugins-turn-detector       # Optional: ML-based turn detection
 ```
 
-Install only the adapter you need:
+### TypeScript / Node.js
 
 ```bash
-pip install -e ".[livekit]"   # LiveKit adapter only
-pip install -e ".[pipecat]"   # Pipecat adapter only
-```
-
-### Node.js Bindings
-
-```bash
+# 1. Build the native Rust binding
 cd crates/agent-transport-node && npm run build
+
+# 2. Install the SIP adapter
+cd node/agent-transport-sip-livekit && npm install && npm run build
+
+# 3. Install LiveKit plugins
+npm install @livekit/agents @livekit/agents-plugin-silero \
+  @livekit/agents-plugin-deepgram @livekit/agents-plugin-openai \
+  @livekit/agents-plugin-livekit zod
 ```
 
 ## Examples

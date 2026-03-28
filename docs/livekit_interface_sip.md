@@ -289,9 +289,83 @@ Implements `livekit.agents.voice.io.AudioOutput`. Line-for-line match of LiveKit
 
 ---
 
-## Import Path
+## Import Paths
+
+### Python
 
 ```python
 from agent_transport.sip.livekit import AgentServer, CallContext, run_app
 from agent_transport.sip.livekit import SipAudioInput, SipAudioOutput  # low-level access
 ```
+
+### TypeScript
+
+```typescript
+import { AgentServer, CallContext } from '@agent-transport/sip-livekit';
+import { SipAudioInput, SipAudioOutput } from '@agent-transport/sip-livekit'; // low-level
+```
+
+---
+
+## TypeScript Quick Start
+
+```typescript
+import { AgentServer, type CallContext } from '@agent-transport/sip-livekit';
+import { voice, llm, metrics } from '@livekit/agents';
+import * as deepgram from '@livekit/agents-plugin-deepgram';
+import * as openai from '@livekit/agents-plugin-openai';
+import * as silero from '@livekit/agents-plugin-silero';
+import * as livekit from '@livekit/agents-plugin-livekit';
+import { z } from 'zod';
+
+const server = new AgentServer({
+  sipUsername: process.env.SIP_USERNAME!,
+  sipPassword: process.env.SIP_PASSWORD!,
+});
+
+server.setup(() => ({
+  vad: silero.VAD.load(),
+  turnDetector: new livekit.turnDetector.MultilingualModel(),
+}));
+
+const agent = new voice.Agent({
+  instructions: 'You are a helpful phone assistant.',
+  tools: {
+    getWeather: llm.tool({
+      description: 'Get weather for a location.',
+      parameters: z.object({ location: z.string() }),
+      execute: async ({ location }) => `Sunny in ${location}, 72°F.`,
+    }),
+  },
+});
+
+server.sipSession(async (ctx: CallContext) => {
+  const session = new voice.AgentSession({
+    vad: ctx.userdata.vad as silero.VAD,
+    stt: new deepgram.STT({ model: 'nova-3' }),
+    llm: new openai.LLM({ model: 'gpt-4.1-mini' }),
+    tts: new openai.TTS({ voice: 'alloy' }),
+    turnHandling: {
+      turnDetection: ctx.userdata.turnDetector as livekit.turnDetector.MultilingualModel,
+    },
+    preemptiveGeneration: true,
+    aecWarmupDuration: 3000,
+  });
+
+  session.on(voice.AgentSessionEventTypes.MetricsCollected, (ev) => {
+    metrics.logMetrics(ev.metrics);
+  });
+
+  await ctx.start(session, { agent });
+  session.say('Hello, how can I help you today?');
+});
+
+server.run();
+```
+
+### TypeScript Examples
+
+| Example | Description |
+|---------|-------------|
+| [`sip_agent.ts`](../examples/livekit/sip_agent.ts) | Single agent with tool calling, turn detection, metrics |
+| [`sip_multi_agent.ts`](../examples/livekit/sip_multi_agent.ts) | Multi-agent with class inheritance, `llm.handoff()`, per-agent tools |

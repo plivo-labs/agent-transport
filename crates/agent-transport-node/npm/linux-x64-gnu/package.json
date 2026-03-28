@@ -1,0 +1,19 @@
+{
+  "name": "agent-transport-linux-x64-gnu",
+  "version": "0.1.0",
+  "cpu": [
+    "x64"
+  ],
+  "main": "agent-transport.linux-x64-gnu.node",
+  "files": [
+    "agent-transport.linux-x64-gnu.node"
+  ],
+  "description": "SIP and audio streaming transport for AI voice agents (pure Rust)",
+  "license": "MIT",
+  "os": [
+    "linux"
+  ],
+  "libc": [
+    "glibc"
+  ]
+}

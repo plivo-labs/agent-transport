@@ -1,2 +1,3 @@
-const { PlivoEndpoint, AudioFrame } = require('./plivo-endpoint.node');
-module.exports = { PlivoEndpoint, AudioFrame };
+/* eslint-disable */
+const binding = require('./agent-transport.node');
+module.exports = binding;
