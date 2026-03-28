@@ -672,15 +672,6 @@ class AgentServer:
             SIP_CALLS_TOTAL.labels(nodename=node, direction=direction).inc()
             call_start = time.monotonic()
 
-            # Start recording if enabled
-            if self._recording:
-                try:
-                    os.makedirs(self._recording_dir, exist_ok=True)
-                    rec_path = os.path.join(self._recording_dir, f"call_{call_id}.wav")
-                    self._ep.start_recording(call_id, rec_path, self._recording_stereo)
-                except Exception:
-                    logger.warning("Failed to start recording for call %s", call_id, exc_info=True)
-
             try:
                 await self._entrypoint_fnc(ctx)
                 # Entrypoint returned — session.start() is non-blocking,
@@ -691,13 +682,6 @@ class AgentServer:
                 logger.exception("Call %s handler failed", call_id)
             finally:
                 SIP_CALL_DURATION.labels(nodename=node).observe(time.monotonic() - call_start)
-
-                # Stop recording
-                if self._recording:
-                    try:
-                        self._ep.stop_recording(call_id)
-                    except Exception:
-                        pass
 
                 if ctx._session is not None:
                     try:
