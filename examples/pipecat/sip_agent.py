@@ -5,14 +5,14 @@ Prerequisites:
     pip install "pipecat-ai[deepgram,openai,silero]" python-dotenv loguru
 """
 
-import asyncio
 import os
 
 from dotenv import load_dotenv
 from loguru import logger
 
-from agent_transport import SipEndpoint
-from agent_transport.sip.pipecat import SipTransport
+from agent_transport.sip.pipecat import (
+    SipServerTransport, AudioRecorder, SoundfileMixer,
+)
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
@@ -32,22 +32,20 @@ from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.openai.tts import OpenAITTSService
-from pipecat.transports.base_transport import TransportParams
 
 load_dotenv()
 
-# Load models once at module level — shared across all calls
-# ONNX runtime caches compiled models, so subsequent sessions are fast
-vad = SileroVADAnalyzer()
-turn_detector = LocalSmartTurnAnalyzerV3()
+server = SipServerTransport()
 
 
-async def run_bot(ep: SipEndpoint, call_id: str):
-    transport = SipTransport(ep, call_id, params=TransportParams(
-        audio_in_enabled=True,
-        audio_out_enabled=True,
-    ))
+@server.setup()
+def prewarm():
+    """Load models once — shared across all calls."""
+    return {"vad": SileroVADAnalyzer(), "turn": LocalSmartTurnAnalyzerV3()}
 
+
+@server.handler()
+async def run_bot(transport, userdata):
     llm = OpenAILLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
         settings=OpenAILLMService.Settings(
@@ -66,14 +64,25 @@ async def run_bot(ep: SipEndpoint, call_id: str):
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=vad,
+            vad_analyzer=userdata["vad"],
             user_turn_strategies=UserTurnStrategies(
                 stop=[TurnAnalyzerUserTurnStopStrategy(
-                    turn_analyzer=turn_detector,
+                    turn_analyzer=userdata["turn"],
                 )],
             ),
         ),
     )
+
+    # Rust-backed recorder: AudioBufferProcessor callbacks + WAV file recording
+    recorder = AudioRecorder(transport, path=f"/tmp/call-{transport.session_id}.wav", num_channels=2)
+
+    @recorder.event_handler("on_recording_stopped")
+    async def on_recording_stopped(recorder, path):
+        logger.info(f"Recording saved to {path}")
+
+    # Rust-backed background mixer (uncomment to enable hold music)
+    # mixer = SoundfileMixer(transport, sound_files={"hold": "hold_music.wav"},
+    #                        default_sound="hold", volume=0.3)
 
     pipeline = Pipeline([
         transport.input(),
@@ -83,6 +92,7 @@ async def run_bot(ep: SipEndpoint, call_id: str):
         tts,
         transport.output(),
         assistant_aggregator,
+        recorder,
     ])
 
     task = PipelineTask(pipeline, params=PipelineParams(
@@ -91,48 +101,23 @@ async def run_bot(ep: SipEndpoint, call_id: str):
         allow_interruptions=True,
         enable_metrics=True,
         enable_usage_metrics=True,
+        # audio_out_mixer=mixer,
     ))
 
-    context.add_message({"role": "user", "content": "Please introduce yourself."})
-    await task.queue_frames([LLMRunFrame()])
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport):
+        await recorder.start_recording()
+        logger.info(f"Call connected: {transport.remote_uri} ({transport.direction})")
+        context.add_message({"role": "user", "content": "Please introduce yourself."})
+        await task.queue_frames([LLMRunFrame()])
+
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport):
+        await task.cancel()
 
     runner = PipelineRunner()
     await runner.run(task)
 
 
-async def main():
-    ep = SipEndpoint(
-        sip_server=os.getenv("SIP_DOMAIN", "phone.plivo.com"),
-        log_level=3,
-    )
-
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(
-        None, lambda: ep.register(os.getenv("SIP_USERNAME", ""), os.getenv("SIP_PASSWORD", ""))
-    )
-
-    event = await loop.run_in_executor(None, lambda: ep.wait_for_event(timeout_ms=10000))
-    if not event or event["type"] != "registered":
-        logger.error(f"Registration failed: {event}")
-        return
-    logger.info("Registered, waiting for calls...")
-
-    while True:
-        event = await loop.run_in_executor(None, lambda: ep.wait_for_event(timeout_ms=1000))
-        if not event or event["type"] != "incoming_call":
-            continue
-
-        call_id = event["session"]["call_id"]
-        logger.info(f"Incoming call from {event['session']['remote_uri']}")
-        await loop.run_in_executor(None, lambda: ep.answer(call_id))
-
-        while True:
-            ev = await loop.run_in_executor(None, lambda: ep.wait_for_event(timeout_ms=500))
-            if ev and ev["type"] == "call_media_active":
-                break
-
-        asyncio.create_task(run_bot(ep, call_id))
-
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    server.run()
