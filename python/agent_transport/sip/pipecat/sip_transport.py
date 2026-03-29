@@ -81,7 +81,7 @@ class SipInputTransport(BaseInputTransport):
         await self.set_transport_ready(frame)
         self._recv_task = asyncio.create_task(self._recv_loop())
         self._event_task = asyncio.create_task(self._event_loop())
-        await self._transport._call_event_handler("on_client_connected", self._transport)
+        await self._transport._call_event_handler("on_client_connected")
 
     async def stop(self, frame: EndFrame):
         if not self._running:
@@ -173,7 +173,7 @@ class SipInputTransport(BaseInputTransport):
             await self.push_frame(InputDTMFFrame(button=KeypadEntry(event["digit"])))
         elif event_type == "call_terminated":
             self._running = False
-            await self._transport._call_event_handler("on_client_disconnected", self._transport)
+            await self._transport._call_event_handler("on_client_disconnected")
             await self.push_frame(EndFrame())
         elif event_type == "beep_detected":
             await self._transport._call_event_handler(
