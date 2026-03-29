@@ -622,7 +622,11 @@ class AgentServer:
                 call_id = ev["session"].call_id
                 remote_uri = ev["session"].remote_uri
                 logger.info("Incoming call %s from %s", call_id, remote_uri)
-                await loop.run_in_executor(None, self._ep.answer, call_id)
+                try:
+                    await loop.run_in_executor(None, self._ep.answer, call_id)
+                except Exception as e:
+                    logger.warning("Failed to answer call %s: %s", call_id, e)
+                    continue
                 pending_inbound[call_id] = remote_uri
 
             elif ev_type == "call_media_active":

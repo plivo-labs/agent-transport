@@ -313,7 +313,11 @@ class SipServerTransport:
                 call_id = session.call_id
                 session_data = _session_to_dict(session)
                 logger.info("Incoming call from %s (call_id=%s)", session_data["remote_uri"], call_id)
-                await loop.run_in_executor(None, lambda: self._ep.answer(call_id))
+                try:
+                    await loop.run_in_executor(None, lambda: self._ep.answer(call_id))
+                except Exception as e:
+                    logger.warning("Failed to answer call %s: %s", call_id, e)
+                    continue
                 pending_calls[call_id] = session_data
 
             elif ev_type == "call_media_active":

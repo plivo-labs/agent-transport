@@ -319,6 +319,6 @@ export class AudioStreamOutput extends SipAudioOutput {
       nextInChain?: SipAudioOutput;
     },
   ) {
-    super(endpoint, sessionId, { label: options?.label ?? 'audio-stream-output', ...options });
+    super(endpoint, sessionId, options?.sampleRate, options?.nextInChain);
   }
 }
