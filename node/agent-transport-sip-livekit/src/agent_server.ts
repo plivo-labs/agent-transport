@@ -340,6 +340,18 @@ export class AgentServer {
         if (active?.room) {
           active.room.emitDtmf(ev.digit ?? '');
         }
+
+      } else if (ev.eventType === 'beep_detected' && ev.callId) {
+        const active = this.activeCalls.get(ev.callId);
+        if (active?.room) {
+          active.room.emit('beep_detected', { frequencyHz: ev.frequencyHz ?? 0, durationMs: ev.durationMs ?? 0 });
+        }
+
+      } else if (ev.eventType === 'beep_timeout' && ev.callId) {
+        const active = this.activeCalls.get(ev.callId);
+        if (active?.room) {
+          active.room.emit('beep_timeout', {});
+        }
       }
     }
   }

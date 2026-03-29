@@ -35,6 +35,9 @@ declare module 'agent-transport' {
     error?: string;
     reason?: string;
     digit?: string;
+    method?: string;
+    frequencyHz?: number;
+    durationMs?: number;
   }
 
   export interface AudioStreamConfigJs {
@@ -75,6 +78,7 @@ declare module 'agent-transport' {
     sendRawMessage(callId: string, message: string): void;
     queuedFrames(callId: string): number;
     pollEvent(): EventInfo | null;
+    detectBeep(callId: string, timeoutMs?: number, minDurationMs?: number, maxDurationMs?: number): void;
     startRecording(callId: string, path: string, stereo?: boolean): void;
     stopRecording(callId: string): void;
     get sampleRate(): number;
@@ -106,6 +110,8 @@ declare module 'agent-transport' {
     sendRawMessage(sessionId: string, message: string): void;
     queuedFrames(sessionId: string): number;
     hangup(sessionId: string): void;
+    detectBeep(sessionId: string, timeoutMs?: number, minDurationMs?: number, maxDurationMs?: number): void;
+    cancelBeepDetection(sessionId: string): void;
     pollEvent(): EventInfo | null;
     startRecording(sessionId: string, path: string, stereo?: boolean): void;
     stopRecording(sessionId: string): void;
