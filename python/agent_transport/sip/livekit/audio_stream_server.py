@@ -270,7 +270,7 @@ class AudioStreamServer:
         listen_addr: str | None = None,
         plivo_auth_id: str | None = None,
         plivo_auth_token: str | None = None,
-        sample_rate: int = 16000,
+        sample_rate: int = 8000,
         host: str = "0.0.0.0",
         port: int | None = None,
         agent_name: str = "audio-stream-agent",

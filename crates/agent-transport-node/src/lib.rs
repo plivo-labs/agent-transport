@@ -139,6 +139,8 @@ pub struct EndpointConfig {
     pub stun_server: Option<String>,
     pub codecs: Option<Vec<String>>,
     pub log_level: Option<u32>,
+    /// Pipeline sample rate in Hz (default: 8000).
+    pub sample_rate: Option<u32>,
     /// Enable adaptive jitter buffer (requires jitter-buffer feature).
     pub jitter_buffer: Option<bool>,
     /// Enable packet loss concealment (requires plc feature).
@@ -304,6 +306,7 @@ impl SipEndpoint {
             stun_server: None,
             codecs: None,
             log_level: None,
+            sample_rate: None,
             jitter_buffer: None,
             plc: None,
             comfort_noise: None,
@@ -325,6 +328,7 @@ impl SipEndpoint {
             stun_server: cfg.stun_server.unwrap_or_else(|| "stun-fb.plivo.com:3478".into()),
             codecs: codec_list,
             log_level: cfg.log_level.unwrap_or(3),
+            sample_rate: cfg.sample_rate.unwrap_or(8000),
             audio_processing: agent_transport_core::AudioProcessingConfig {
                 jitter_buffer: cfg.jitter_buffer.unwrap_or(false),
                 plc: cfg.plc.unwrap_or(false),
@@ -567,10 +571,10 @@ impl SipEndpoint {
         self.inner.queued_frames(&call_id).map(|n| n as u32).map_err(napi_err)
     }
 
-    /// Audio sample rate in Hz (always 16000).
+    /// Audio sample rate in Hz.
     #[napi(getter)]
     pub fn sample_rate(&self) -> u32 {
-        16000
+        self.inner.sample_rate()
     }
 
     /// Number of audio channels (always 1 = mono).
@@ -604,7 +608,7 @@ impl SipEndpoint {
         max_duration_ms: Option<u32>,
     ) -> Result<()> {
         let config = RustBeepConfig {
-            sample_rate: 16000,
+            sample_rate: self.inner.sample_rate(),
             timeout_ms: timeout_ms.unwrap_or(30000),
             min_duration_ms: min_duration_ms.unwrap_or(80),
             max_duration_ms: max_duration_ms.unwrap_or(5000),
@@ -736,7 +740,7 @@ impl AudioStreamEndpoint {
             listen_addr: cfg.listen_addr.unwrap_or_else(|| "0.0.0.0:8080".into()),
             plivo_auth_id: cfg.plivo_auth_id.unwrap_or_default(),
             plivo_auth_token: cfg.plivo_auth_token.unwrap_or_default(),
-            sample_rate: cfg.sample_rate.unwrap_or(16000),
+            sample_rate: cfg.sample_rate.unwrap_or(8000),
             auto_hangup: cfg.auto_hangup.unwrap_or(true),
         };
         Ok(Self { inner: RustAudioStreamEndpoint::new(rc).map_err(napi_err)? })

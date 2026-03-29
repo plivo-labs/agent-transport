@@ -31,7 +31,7 @@ class PlivoFrameSerializer:
         auth_id: Optional[str] = None,
         auth_token: Optional[str] = None,
         listen_addr: Optional[str] = None,
-        sample_rate: int = 16000,
+        sample_rate: int = 8000,
         auto_hangup: bool = True,
     ):
         self.auth_id = auth_id or os.environ.get("PLIVO_AUTH_ID", "")

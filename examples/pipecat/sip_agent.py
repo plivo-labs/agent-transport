@@ -96,8 +96,8 @@ async def run_bot(transport, userdata):
     ])
 
     task = PipelineTask(pipeline, params=PipelineParams(
-        audio_in_sample_rate=16000,
-        audio_out_sample_rate=16000,
+        audio_in_sample_rate=8000,
+        audio_out_sample_rate=8000,
         allow_interruptions=True,
         enable_metrics=True,
         enable_usage_metrics=True,

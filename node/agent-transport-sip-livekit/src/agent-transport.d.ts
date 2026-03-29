@@ -22,6 +22,7 @@ declare module 'agent-transport' {
     stunServer?: string;
     codecs?: string[];
     logLevel?: number;
+    sampleRate?: number;
     jitterBuffer?: boolean;
     plc?: boolean;
     comfortNoise?: boolean;

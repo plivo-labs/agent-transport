@@ -52,7 +52,7 @@ pub(crate) struct AudioBuffer {
 impl AudioBuffer {
     /// Create with default queue_size_ms (200ms, matching _ParticipantAudioOutput production).
     pub fn new() -> Self {
-        Self::with_queue_size(DEFAULT_QUEUE_SIZE_MS, 16000)
+        Self::with_queue_size(DEFAULT_QUEUE_SIZE_MS, 8000)
     }
 
     /// Create with configurable queue_size_ms and sample_rate

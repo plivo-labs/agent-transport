@@ -80,6 +80,7 @@ async fn setup_rtp(
     local_ip_str: &str,
     etx: &Sender<EndpointEvent>,
     call_id: &str,
+    pipeline_rate: u32,
 ) -> Result<(String, SocketAddr)> {
     let answer = sdp::parse_answer(remote_sdp_bytes, codecs)?;
     let remote_rtp = SocketAddr::new(answer.remote_ip, answer.remote_port);
@@ -92,7 +93,7 @@ async fn setup_rtp(
 
     let dtmf_pt = answer.dtmf_payload_type.unwrap_or(crate::sip::rtp_transport::DEFAULT_DTMF_PT);
     debug!("Call {} negotiated: codec={:?} dtmf_pt={} ptime={}ms remote_rtp={}", call_id, answer.codec, dtmf_pt, answer.ptime_ms, remote_rtp);
-    let rtp = Arc::new(RtpTransport::new(Arc::new(rtp_sock), remote_rtp, answer.codec, ctx.cancel.clone(), dtmf_pt, answer.ptime_ms));
+    let rtp = Arc::new(RtpTransport::new(Arc::new(rtp_sock), remote_rtp, answer.codec, ctx.cancel.clone(), dtmf_pt, answer.ptime_ms, pipeline_rate));
 
     let (itx, irx) = crossbeam_channel::unbounded();
     rtp.start_send_loop(ctx.audio_buf.clone(), ctx.bg_audio_buf.clone(), ctx.muted.clone(), ctx.paused.clone(), ctx.playout_notify.clone(), ctx.recorder.clone());
@@ -159,13 +160,13 @@ fn start_session_timer(
     });
 }
 
-fn new_call_context(call_id: &str, direction: CallDirection, cc: CancellationToken) -> (CallContext, CallSession) {
+fn new_call_context(call_id: &str, direction: CallDirection, cc: CancellationToken, sample_rate: u32) -> (CallContext, CallSession) {
     let session = CallSession::new(call_id.to_string(), direction);
     let (_itx, irx) = crossbeam_channel::unbounded();
     let ctx = CallContext {
         session: session.clone(), rtp: None,
-        audio_buf: Arc::new(AudioBuffer::new()),
-        bg_audio_buf: Arc::new(AudioBuffer::new()),
+        audio_buf: Arc::new(AudioBuffer::with_queue_size(200, sample_rate)),
+        bg_audio_buf: Arc::new(AudioBuffer::with_queue_size(200, sample_rate)),
         incoming_rx: irx,
         muted: Arc::new(AtomicBool::new(false)), paused: Arc::new(AtomicBool::new(false)),
         held: Arc::new(AtomicBool::new(false)),
@@ -221,7 +222,7 @@ impl SipEndpoint {
             local_addr: None, public_addr: None,
         }));
 
-        let (st, cc, etx2, lp, ua) = (state.clone(), cancel.clone(), etx.clone(), config.local_port, config.user_agent.clone());
+        let (st, cc, etx2, lp, ua, sr) = (state.clone(), cancel.clone(), etx.clone(), config.local_port, config.user_agent.clone(), config.sample_rate);
         rt.block_on(async {
             let addr: SocketAddr = format!("0.0.0.0:{}", lp).parse().unwrap();
             let udp = UdpConnection::create_connection(addr, None, Some(cc.clone())).await.map_err(err)?;
@@ -245,7 +246,7 @@ impl SipEndpoint {
             tokio::spawn(async move {
                 while let Some(tx) = rx.recv().await {
                     if tx.original.method == rsip::Method::Invite {
-                        handle_incoming(&dl2, &st2, &etx3, tx).await;
+                        handle_incoming(&dl2, &st2, &etx3, tx, sr).await;
                     }
                 }
             });
@@ -381,14 +382,14 @@ impl SipEndpoint {
             }
 
             let cc = CancellationToken::new();
-            let (mut ctx, mut session) = new_call_context(&call_id, CallDirection::Outbound, cc.clone());
+            let (mut ctx, mut session) = new_call_context(&call_id, CallDirection::Outbound, cc.clone(), cfg.sample_rate);
             session.remote_uri = dest;
             extract_x_headers(&resp, &mut session);
             ctx.session = session.clone();
             ctx.client_dialog = Some(dialog);
 
             // Set up RTP (shared with inbound)
-            let (_, remote_rtp) = setup_rtp(&mut ctx, resp.body(), &cfg.codecs, pa, &la_str, &etx, &call_id).await?;
+            let (_, remote_rtp) = setup_rtp(&mut ctx, resp.body(), &cfg.codecs, pa, &la_str, &etx, &call_id, cfg.sample_rate).await?;
 
             // Watch for remote BYE
             spawn_dialog_watcher(dr, call_id.clone(), st.clone(), etx.clone(), cc.clone());
@@ -424,7 +425,7 @@ impl SipEndpoint {
                     None
                 } else if code >= 200 && code < 300 {
                     let remote_sdp = ctx.server_dialog.as_ref().unwrap().initial_request().body().to_vec();
-                    let (local_sdp, remote_rtp) = setup_rtp(ctx, &remote_sdp, &cfg.codecs, pa, &la_str, &etx, &call_id).await?;
+                    let (local_sdp, remote_rtp) = setup_rtp(ctx, &remote_sdp, &cfg.codecs, pa, &la_str, &etx, &call_id, cfg.sample_rate).await?;
                     ctx.server_dialog.as_ref().unwrap().accept(None, Some(local_sdp.into_bytes())).map_err(err)?;
                     info!("Inbound call {} connected to {}", call_id, remote_rtp);
                     Some(ctx.cancel.clone())
@@ -637,13 +638,13 @@ impl SipEndpoint {
     }
 
     pub fn queued_frames(&self, call_id: &str) -> Result<usize> {
-        self.with_call(call_id, |c| c.audio_buf.len() / 320) // convert samples to 20ms frame count
+        let spf = (self.config.sample_rate * 20 / 1000) as usize; // samples per 20ms frame
+        self.with_call(call_id, |c| c.audio_buf.len() / spf)
     }
 
     pub fn start_recording(&self, call_id: &str, path: &str, stereo: bool) -> Result<()> {
         let mode = if stereo { crate::recorder::RecordingMode::Stereo } else { crate::recorder::RecordingMode::Mono };
-        let sample_rate = 16000; // SIP internal sample rate
-        let rec = self.recording_mgr.start(call_id, path, mode, sample_rate);
+        let rec = self.recording_mgr.start(call_id, path, mode, self.config.sample_rate);
         self.with_call(call_id, |c| {
             *c.recorder.lock().unwrap() = Some(rec.clone());
         })
@@ -667,6 +668,7 @@ impl SipEndpoint {
         })?
     }
 
+    pub fn sample_rate(&self) -> u32 { self.config.sample_rate }
     pub fn events(&self) -> Receiver<EndpointEvent> { self.event_rx.clone() }
 
     pub fn shutdown(&self) -> Result<()> {
@@ -682,7 +684,7 @@ impl Drop for SipEndpoint { fn drop(&mut self) { let _ = self.shutdown(); } }
 
 // ─── Incoming call handler ───────────────────────────────────────────────────
 
-async fn handle_incoming(dl: &Arc<DialogLayer>, st: &Arc<Mutex<EndpointState>>, etx: &Sender<EndpointEvent>, tx: rsipstack::transaction::transaction::Transaction) {
+async fn handle_incoming(dl: &Arc<DialogLayer>, st: &Arc<Mutex<EndpointState>>, etx: &Sender<EndpointEvent>, tx: rsipstack::transaction::transaction::Transaction, sample_rate: u32) {
     let (ds, dr) = dl.new_dialog_state_channel();
     let cred = st.lock().unwrap().credential.clone();
     let contact = st.lock().unwrap().contact_uri.clone();
@@ -693,7 +695,7 @@ async fn handle_incoming(dl: &Arc<DialogLayer>, st: &Arc<Mutex<EndpointState>>, 
 
     let call_id = format!("call-{:016x}", rand::random::<u64>());
     let cc = CancellationToken::new();
-    let (mut ctx, mut session) = new_call_context(&call_id, CallDirection::Inbound, cc.clone());
+    let (mut ctx, mut session) = new_call_context(&call_id, CallDirection::Inbound, cc.clone(), sample_rate);
 
     let req = dialog.initial_request();
     if let Ok(from) = req.from_header() { session.remote_uri = from.to_string(); }

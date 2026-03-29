@@ -43,7 +43,7 @@ import numpy as np
 import sounddevice as sd
 from agent_transport import SipEndpoint, AudioFrame, init_logging
 
-SAMPLE_RATE = 16000
+SAMPLE_RATE = 8000
 CHANNELS = 1
 FRAME_SAMPLES = SAMPLE_RATE * 20 // 1000
 DTMF_KEYS = set("0123456789*#")

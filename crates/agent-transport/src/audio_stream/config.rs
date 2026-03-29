@@ -9,8 +9,8 @@ pub struct AudioStreamConfig {
     pub plivo_auth_id: String,
     /// Plivo Auth Token (for REST API hangup).
     pub plivo_auth_token: String,
-    /// Pipeline sample rate in Hz (default: 16000).
-    /// Audio is received at 8kHz from Plivo and resampled to this rate.
+    /// Pipeline sample rate in Hz (default: 8000).
+    /// Audio is received at 8kHz from Plivo and resampled to this rate if different.
     pub sample_rate: u32,
     /// Automatically hang up the call on shutdown (default: true).
     pub auto_hangup: bool,
@@ -22,7 +22,7 @@ impl Default for AudioStreamConfig {
             listen_addr: "0.0.0.0:8080".into(),
             plivo_auth_id: String::new(),
             plivo_auth_token: String::new(),
-            sample_rate: 16000,
+            sample_rate: 8000,
             auto_hangup: true,
         }
     }

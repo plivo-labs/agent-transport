@@ -141,9 +141,9 @@ impl AudioStreamEndpoint {
         let cancel = CancellationToken::new();
         let sessions = Arc::new(Mutex::new(HashMap::new()));
 
-        let (addr, sess, etx2, cc) = (config.listen_addr.clone(), sessions.clone(), etx.clone(), cancel.clone());
+        let (addr, sess, etx2, cc, sr) = (config.listen_addr.clone(), sessions.clone(), etx.clone(), cancel.clone(), config.sample_rate);
         rt.spawn(async move {
-            if let Err(e) = run_ws_server(&addr, sess, etx2, cc).await { error!("WS server: {}", e); }
+            if let Err(e) = run_ws_server(&addr, sess, etx2, cc, sr).await { error!("WS server: {}", e); }
         });
 
         info!("Audio streaming endpoint on {}", config.listen_addr);
@@ -368,9 +368,10 @@ impl AudioStreamEndpoint {
     }
 
     pub fn queued_frames(&self, session_id: &str) -> Result<usize> {
+        let spf = (self.config.sample_rate * 20 / 1000) as usize; // samples per 20ms frame
         let s = self.sessions.lock().unwrap();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
-        Ok(sess.audio_buf.len())
+        Ok(sess.audio_buf.len() / spf)
     }
     pub fn sample_rate(&self) -> u32 { self.config.sample_rate }
     pub fn events(&self) -> Receiver<EndpointEvent> { self.event_rx.clone() }
@@ -390,7 +391,7 @@ impl Drop for AudioStreamEndpoint { fn drop(&mut self) { let _ = self.shutdown()
 
 // ─── WebSocket server ────────────────────────────────────────────────────────
 
-async fn run_ws_server(addr: &str, sessions: Arc<Mutex<HashMap<String, StreamSession>>>, etx: Sender<EndpointEvent>, cancel: CancellationToken) -> std::result::Result<(), Box<dyn std::error::Error>> {
+async fn run_ws_server(addr: &str, sessions: Arc<Mutex<HashMap<String, StreamSession>>>, etx: Sender<EndpointEvent>, cancel: CancellationToken, pipeline_rate: u32) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     loop {
         tokio::select! {
@@ -401,14 +402,14 @@ async fn run_ws_server(addr: &str, sessions: Arc<Mutex<HashMap<String, StreamSes
                 let ws = tokio_tungstenite::accept_async(stream).await?;
                 let sid = format!("ws-{:016x}", rand::random::<u64>());
                 let (s, e, c) = (sessions.clone(), etx.clone(), cancel.clone());
-                tokio::spawn(async move { handle_ws(ws, sid, s, e, c).await; });
+                tokio::spawn(async move { handle_ws(ws, sid, s, e, c, pipeline_rate).await; });
             }
         }
     }
     Ok(())
 }
 
-async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>, sid: String, sessions: Arc<Mutex<HashMap<String, StreamSession>>>, etx: Sender<EndpointEvent>, cancel: CancellationToken) {
+async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>, sid: String, sessions: Arc<Mutex<HashMap<String, StreamSession>>>, etx: Sender<EndpointEvent>, cancel: CancellationToken, pipeline_rate: u32) {
     use futures_util::{SinkExt, StreamExt};
     let (mut sink, mut stream) = ws.split();
     let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
@@ -448,8 +449,8 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                             }
 
                             // Create AudioBuffers + control flags (same pattern as SIP)
-                            let audio_buf = Arc::new(AudioBuffer::new());
-                            let bg_audio_buf = Arc::new(AudioBuffer::new());
+                            let audio_buf = Arc::new(AudioBuffer::with_queue_size(200, pipeline_rate));
+                            let bg_audio_buf = Arc::new(AudioBuffer::with_queue_size(200, pipeline_rate));
                             let muted = Arc::new(AtomicBool::new(false));
                             let paused = Arc::new(AtomicBool::new(false));
                             let playout_notify = Arc::new((Mutex::new(false), Condvar::new()));
@@ -471,20 +472,18 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                             let sln = send_loop_notify.clone();
                             let sc = session_cancel.clone();
                             let stream_id_for_loop = start.stream_id.clone();
-                            // Chunk size for checkpoint pacing (at 16kHz):
+                            // Chunk size for checkpoint pacing:
                             // - Must be >= network RTT (~50ms) so Plivo plays long enough
                             //   for playedStream to return before audio runs out
                             // - Plivo recommends 100-200ms for checkpoint pacing
-                            // - 100ms = 1600 samples at 16kHz
+                            // - 100ms at pipeline_rate
                             // First chunk sends whatever is available (as small as 20ms)
                             // for fast time-to-first-audio
-                            let chunk_spf: usize = 1600;
+                            let chunk_spf: usize = (pipeline_rate * 100 / 1000) as usize;
                             let cp_counter = Arc::new(AtomicU64::new(0));
                             tokio::spawn(async move {
-                                // speexdsp resampler for 16kHz→8kHz (if needed for this encoding)
-                                let mut downsampler = if enc.sample_rate() < 16000 {
-                                    crate::sip::resampler::Resampler::new_voip(16000, enc.sample_rate())
-                                } else { None };
+                                // speexdsp resampler: pipeline rate → encoding rate (if different)
+                                let mut downsampler = crate::sip::resampler::Resampler::new_voip(pipeline_rate, enc.sample_rate());
 
                                 loop {
                                     if sc.is_cancelled() { break; }
@@ -522,7 +521,7 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
 
                                         if !m.load(Ordering::Relaxed) {
                                             // Send playAudio
-                                            let payload = encode_for_plivo(&mixed, enc, &mut downsampler);
+                                            let payload = encode_for_wire(&mixed, enc, &mut downsampler);
                                             let b64 = base64::engine::general_purpose::STANDARD.encode(&payload);
                                             let play_json = serde_json::to_string(&serde_json::json!({
                                                 "event": "playAudio",
@@ -586,37 +585,40 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                     "media" => {
                         if let Some(media) = plivo.media {
                             if let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(&media.payload) {
-                                let pcm_16k = match encoding {
+                                let pcm = match encoding {
                                     AudioEncoding::L16Rate16k => {
-                                        raw.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>()
+                                        let pcm_16k: Vec<i16> = raw.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+                                        // Resample 16kHz → pipeline rate if different
+                                        if upsampler.is_none() { upsampler = crate::sip::resampler::Resampler::new_voip(16000, pipeline_rate); }
+                                        if let Some(ref mut us) = upsampler { us.process(&pcm_16k).to_vec() } else { pcm_16k }
                                     }
                                     AudioEncoding::L16Rate8k => {
                                         let pcm_8k: Vec<i16> = raw.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
-                                        if upsampler.is_none() { upsampler = crate::sip::resampler::Resampler::new_voip(8000, 16000); }
+                                        if upsampler.is_none() { upsampler = crate::sip::resampler::Resampler::new_voip(8000, pipeline_rate); }
                                         if let Some(ref mut us) = upsampler { us.process(&pcm_8k).to_vec() } else { pcm_8k }
                                     }
                                     AudioEncoding::MulawRate8k => {
                                         let pcm_8k: Vec<i16> = raw.iter().map(|&b| decode_ulaw(b)).collect();
-                                        if upsampler.is_none() { upsampler = crate::sip::resampler::Resampler::new_voip(8000, 16000); }
+                                        if upsampler.is_none() { upsampler = crate::sip::resampler::Resampler::new_voip(8000, pipeline_rate); }
                                         if let Some(ref mut us) = upsampler { us.process(&pcm_8k).to_vec() } else { pcm_8k }
                                     }
                                 };
                                 // Record user audio
                                 if let Some(ref rec_ref) = media_recorder {
-                                    if let Ok(guard) = rec_ref.lock() { if let Some(ref rec) = *guard { rec.write_user_samples(&pcm_16k); } }
+                                    if let Ok(guard) = rec_ref.lock() { if let Some(ref rec) = *guard { rec.write_user_samples(&pcm); } }
                                 }
                                 // Beep detection on incoming audio (same pattern as SIP RTP recv loop)
                                 if let Some(ref bd_ref) = media_beep_det {
                                     if let Ok(mut g) = bd_ref.lock() { if let Some(ref mut det) = *g {
-                                        match det.process_frame(&pcm_16k) {
+                                        match det.process_frame(&pcm) {
                                             BeepDetectorResult::Detected(e) => { let _ = etx.try_send(EndpointEvent::BeepDetected { call_id: sid.clone(), frequency_hz: e.frequency_hz, duration_ms: e.duration_ms }); *g = None; }
                                             BeepDetectorResult::Timeout => { let _ = etx.try_send(EndpointEvent::BeepTimeout { call_id: sid.clone() }); *g = None; }
                                             _ => {}
                                         }
                                     }}
                                 }
-                                let n = pcm_16k.len() as u32;
-                                let _ = itx.try_send(AudioFrame { data: pcm_16k, sample_rate: 16000, num_channels: 1, samples_per_channel: n });
+                                let n = pcm.len() as u32;
+                                let _ = itx.try_send(AudioFrame { data: pcm, sample_rate: pipeline_rate, num_channels: 1, samples_per_channel: n });
                             }
                         }
                     }
@@ -668,24 +670,24 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
     }
 }
 
-/// Encode 16kHz PCM samples for Plivo based on negotiated format.
-/// Uses speexdsp resampler when downsampling is needed.
-fn encode_for_plivo(samples: &[i16], enc: AudioEncoding, downsampler: &mut Option<crate::sip::resampler::Resampler>) -> Vec<u8> {
+/// Encode PCM samples to the negotiated wire format (mu-law or L16).
+/// Resamples from pipeline rate to encoding rate via speexdsp if needed.
+fn encode_for_wire(samples: &[i16], enc: AudioEncoding, resampler: &mut Option<crate::sip::resampler::Resampler>) -> Vec<u8> {
+    // Resample pipeline rate → encoding rate (if different).
+    // resampler is None when rates match (no resampling needed).
+    let resampled;
+    let out = if let Some(ref mut rs) = resampler {
+        resampled = rs.process(samples).to_vec();
+        &resampled
+    } else {
+        samples
+    };
     match enc {
-        AudioEncoding::L16Rate16k => {
-            samples.iter().flat_map(|&s| s.to_le_bytes()).collect()
-        }
-        AudioEncoding::L16Rate8k => {
-            let pcm_8k = if let Some(ref mut ds) = downsampler {
-                ds.process(samples).to_vec()
-            } else { samples.to_vec() };
-            pcm_8k.iter().flat_map(|&s| s.to_le_bytes()).collect()
+        AudioEncoding::L16Rate16k | AudioEncoding::L16Rate8k => {
+            out.iter().flat_map(|&s| s.to_le_bytes()).collect()
         }
         AudioEncoding::MulawRate8k => {
-            let pcm_8k = if let Some(ref mut ds) = downsampler {
-                ds.process(samples).to_vec()
-            } else { samples.to_vec() };
-            pcm_8k.iter().map(|&s| encode_ulaw(s)).collect()
+            out.iter().map(|&s| encode_ulaw(s)).collect()
         }
     }
 }
