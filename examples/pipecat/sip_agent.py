@@ -31,6 +31,9 @@ from pipecat.transports.base_transport import TransportParams
 
 load_dotenv()
 
+# Load VAD once — shared across all calls
+vad = SileroVADAnalyzer()
+
 
 async def run_bot(ep: SipEndpoint, call_id: str):
     transport = SipTransport(ep, call_id, params=TransportParams(
@@ -55,9 +58,7 @@ async def run_bot(ep: SipEndpoint, call_id: str):
     context = LLMContext()
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(),
-        ),
+        user_params=LLMUserAggregatorParams(vad_analyzer=vad),  # shared instance
     )
 
     pipeline = Pipeline([

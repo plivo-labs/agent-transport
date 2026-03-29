@@ -28,7 +28,6 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.openai.tts import OpenAITTSService
-from pipecat.transports.base_transport import TransportParams
 
 load_dotenv()
 
@@ -36,8 +35,14 @@ serializer = PlivoFrameSerializer()
 server = WebsocketServerTransport(serializer=serializer)
 
 
+@server.setup()
+def prewarm():
+    """Load heavy models once — shared across all sessions."""
+    return {"vad": SileroVADAnalyzer()}
+
+
 @server.handler()
-async def run_bot(transport):
+async def run_bot(transport, userdata):
     llm = OpenAILLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
         settings=OpenAILLMService.Settings(
@@ -56,34 +61,20 @@ async def run_bot(transport):
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(),
+            vad_analyzer=userdata["vad"],  # loaded once in prewarm
         ),
     )
 
-    # Rust-backed background audio mixer (optional)
-    # Feeds audio to Rust's send loop — zero GIL mixing overhead
-    # mixer = SoundfileMixer(
-    #     transport,
-    #     sound_files={"hold": "hold_music.wav"},
-    #     default_sound="hold",
-    #     volume=0.3,
-    # )
-
-    # AudioRecorder = AudioBufferProcessor + Rust file recording
-    # Same callbacks (on_audio_data, on_track_audio_data, per-turn events)
-    # Plus OGG/Opus file via Rust's send loop (zero Python overhead)
-    recorder = AudioRecorder(transport,
-        path=f"/tmp/call-{transport.session_id}.ogg",
-        num_channels=2,
-    )
-
-    @recorder.event_handler("on_audio_data")
-    async def on_audio_data(audio, sample_rate, num_channels):
-        logger.info(f"Audio buffer: {len(audio)} bytes, {sample_rate}Hz, {num_channels}ch")
+    # Rust-backed recorder: AudioBufferProcessor callbacks + OGG/Opus file recording
+    recorder = AudioRecorder(transport, path=f"/tmp/call-{transport.session_id}.ogg", num_channels=2)
 
     @recorder.event_handler("on_recording_stopped")
     async def on_recording_stopped(recorder, path):
         logger.info(f"Recording saved to {path}")
+
+    # Rust-backed background mixer (optional — uncomment to enable hold music)
+    # mixer = SoundfileMixer(transport, sound_files={"hold": "hold_music.wav"},
+    #                        default_sound="hold", volume=0.3)
 
     pipeline = Pipeline([
         transport.input(),
@@ -102,11 +93,12 @@ async def run_bot(transport):
         allow_interruptions=True,
         enable_metrics=True,
         enable_usage_metrics=True,
-        # audio_out_mixer=mixer,  # uncomment to enable background audio
+        # audio_out_mixer=mixer,
     ))
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport):
+        await recorder.start_recording()
         context.add_message({"role": "user", "content": "Please introduce yourself."})
         await task.queue_frames([LLMRunFrame()])
 

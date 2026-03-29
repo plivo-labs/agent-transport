@@ -10,9 +10,13 @@ Usage:
     serializer = PlivoFrameSerializer(auth_id="...", auth_token="...")
     server = WebsocketServerTransport(serializer=serializer)
 
+    @server.setup()
+    def prewarm():
+        return {"vad": SileroVADAnalyzer()}
+
     @server.handler()
-    async def run_bot(transport):
-        pipeline = Pipeline([transport.input(), stt, llm, tts, transport.output()])
+    async def run_bot(transport, userdata):
+        vad = userdata["vad"]
         ...
 
     server.run()
@@ -21,7 +25,7 @@ Usage:
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Callable, Coroutine, Optional
+from typing import Any, Callable, Coroutine, Dict, Optional
 
 from agent_transport import AudioStreamEndpoint
 
@@ -54,7 +58,8 @@ class WebsocketServerTransport:
     and 20ms audio pacing. Manages session lifecycle and creates per-session
     AudioStreamTransport instances.
 
-    Can be configured via PlivoFrameSerializer or direct keyword arguments.
+    Supports @setup() for one-time resource loading (VAD models, turn detectors)
+    that are shared across all sessions — avoids reloading per call.
     """
 
     def __init__(
@@ -64,7 +69,6 @@ class WebsocketServerTransport:
         params: Optional[WebsocketServerParams] = None,
         transport_params: Optional["TransportParams"] = None,
     ) -> None:
-        # Accept config from serializer, params, or defaults
         s = serializer or (params.serializer if params else None) or PlivoFrameSerializer()
         self._listen_addr = s.listen_addr
         self._plivo_auth_id = s.auth_id
@@ -72,6 +76,8 @@ class WebsocketServerTransport:
         self._sample_rate = s.sample_rate
         self._transport_params = transport_params or (params.transport_params if params else None)
         self._handler_fnc: Optional[Callable[..., Coroutine]] = None
+        self._setup_fnc: Optional[Callable] = None
+        self._userdata: Dict[str, Any] = {}
         self._ep: Optional[AudioStreamEndpoint] = None
         self._active_sessions: dict[str, asyncio.Task] = {}
 
@@ -80,13 +86,35 @@ class WebsocketServerTransport:
         """The underlying Rust AudioStreamEndpoint, or None if not started."""
         return self._ep
 
+    @property
+    def userdata(self) -> Dict[str, Any]:
+        """Shared resources from @setup(). Available in handler via userdata arg."""
+        return self._userdata
+
+    def setup(self) -> Callable:
+        """Decorator to register a one-time setup function.
+
+        Runs once before accepting sessions. Return a dict of shared resources
+        (VAD models, turn detectors, etc.) — passed to every handler call.
+        Avoids reloading heavy models per call::
+
+            @server.setup()
+            def prewarm():
+                return {"vad": SileroVADAnalyzer()}
+        """
+        def decorator(fn: Callable) -> Callable:
+            self._setup_fnc = fn
+            return fn
+        return decorator
+
     def handler(self) -> Callable:
         """Decorator to register the bot handler.
 
-        The handler receives an AudioStreamTransport per session::
+        Handler receives transport and shared userdata from @setup()::
 
             @server.handler()
-            async def run_bot(transport: AudioStreamTransport):
+            async def run_bot(transport, userdata):
+                vad = userdata["vad"]
                 pipeline = Pipeline([transport.input(), ...])
                 await PipelineRunner().run(PipelineTask(pipeline))
         """
@@ -108,6 +136,13 @@ class WebsocketServerTransport:
             raise RuntimeError(
                 "No handler registered. Use @server.handler() to define one."
             )
+
+        # Run setup once
+        if self._setup_fnc is not None:
+            result = self._setup_fnc()
+            if isinstance(result, dict):
+                self._userdata = result
+            logger.info("Setup complete: %s", list(self._userdata.keys()) or "(no userdata)")
 
         self._ep = AudioStreamEndpoint(
             listen_addr=self._listen_addr,
@@ -167,7 +202,12 @@ class WebsocketServerTransport:
 
     async def _run_session(self, session_id: str, transport: AudioStreamTransport) -> None:
         try:
-            await self._handler_fnc(transport)
+            import inspect
+            sig = inspect.signature(self._handler_fnc)
+            if len(sig.parameters) >= 2:
+                await self._handler_fnc(transport, self._userdata)
+            else:
+                await self._handler_fnc(transport)
         except asyncio.CancelledError:
             pass
         except Exception:
