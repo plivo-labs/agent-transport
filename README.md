@@ -22,7 +22,8 @@ Same `AgentSession` pipeline -- add `ctx.session = session` to wire SIP/audio st
 
 ```python
 # LiveKit WebRTC                                # Agent Transport SIP/RTP
-from livekit.agents import AgentServer          from agent_transport.sip.livekit import AgentServer, JobProcess
+from livekit.agents import AgentServer,         from agent_transport.sip.livekit import
+    JobProcess                                      AgentServer, JobProcess
 server = AgentServer()                          server = AgentServer(sip_username=..., sip_password=...)
 
 def prewarm(proc: JobProcess):                  def prewarm(proc: JobProcess):
@@ -43,7 +44,8 @@ cli.run_app(server)                             server.run()
 
 ```python
 # LiveKit WebRTC                                # Agent Transport AudioStream
-from livekit.agents import AgentServer          from agent_transport.audio_stream.livekit import AudioStreamServer, JobProcess
+from livekit.agents import AgentServer,         from agent_transport.audio_stream.livekit import
+    JobProcess                                      AudioStreamServer, JobProcess
 server = AgentServer()                          server = AudioStreamServer(listen_addr="0.0.0.0:8765")
 
 def prewarm(proc: JobProcess):                  def prewarm(proc: JobProcess):
