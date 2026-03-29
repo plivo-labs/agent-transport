@@ -515,7 +515,11 @@ export class AgentServer {
         const MAX_BODY = 64 * 1024; // 64KB limit
         req.on('data', (chunk: Buffer) => {
           body += chunk;
-          if (body.length > MAX_BODY) { req.destroy(); }
+          if (body.length > MAX_BODY) {
+            res.writeHead(413, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Request body too large' }));
+            req.destroy();
+          }
         });
         req.on('end', async () => {
           try {

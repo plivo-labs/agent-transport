@@ -333,8 +333,11 @@ class SipAudioOutput(AudioOutput):
 
         if interrupted:
             queued_duration = self._audio_source.queued_duration
-            while not self._audio_buf.empty():
-                queued_duration += self._audio_buf.recv_nowait().duration
+            while True:
+                try:
+                    queued_duration += self._audio_buf.recv_nowait().duration
+                except Exception:
+                    break
             pushed_duration = max(pushed_duration - queued_duration, 0)
             self._audio_source.clear_queue()
             wait_for_playout.cancel()

@@ -506,11 +506,14 @@ impl SipEndpoint {
         let ct = content_type.to_string();
         let b = body.to_string();
         self.runtime.block_on(async {
-            let s = st.lock().unwrap();
-            let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
+            let (cd, sd) = {
+                let s = st.lock().unwrap();
+                let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
+                (ctx.client_dialog.clone(), ctx.server_dialog.clone())
+            };
             let hdrs = vec![rsip::Header::Other("Content-Type".into(), ct)];
-            if let Some(ref d) = ctx.client_dialog { d.info(Some(hdrs), Some(b.into_bytes())).await.map_err(err)?; }
-            else if let Some(ref d) = ctx.server_dialog { d.info(Some(hdrs), Some(b.into_bytes())).await.map_err(err)?; }
+            if let Some(d) = cd { d.info(Some(hdrs), Some(b.into_bytes())).await.map_err(err)?; }
+            else if let Some(d) = sd { d.info(Some(hdrs), Some(b.into_bytes())).await.map_err(err)?; }
             Ok(())
         })
     }
@@ -518,11 +521,14 @@ impl SipEndpoint {
     pub fn transfer(&self, call_id: &str, dest_uri: &str) -> Result<()> {
         let (st, dest) = (self.state.clone(), dest_uri.to_string());
         self.runtime.block_on(async {
-            let s = st.lock().unwrap();
-            let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
+            let (cd, sd) = {
+                let s = st.lock().unwrap();
+                let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
+                (ctx.client_dialog.clone(), ctx.server_dialog.clone())
+            };
             let uri: rsip::Uri = dest.try_into().map_err(|e| err(format!("{:?}", e)))?;
-            if let Some(ref d) = ctx.client_dialog { d.refer(uri, None, None).await.map_err(err)?; }
-            else if let Some(ref d) = ctx.server_dialog { d.refer(uri, None, None).await.map_err(err)?; }
+            if let Some(d) = cd { d.refer(uri, None, None).await.map_err(err)?; }
+            else if let Some(d) = sd { d.refer(uri, None, None).await.map_err(err)?; }
             Ok(())
         })
     }
@@ -534,15 +540,18 @@ impl SipEndpoint {
     pub fn hold(&self, call_id: &str) -> Result<()> {
         let st = self.state.clone();
         self.runtime.block_on(async {
-            let s = st.lock().unwrap();
-            let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
-            if ctx.held.load(Ordering::Relaxed) { return Ok(()); }
-            let sdp = ctx.local_sdp.as_ref().ok_or(EndpointError::Other("no SDP".into()))?
-                .replace("a=sendrecv", "a=sendonly");
+            let (cd, sd, sdp, held) = {
+                let s = st.lock().unwrap();
+                let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
+                if ctx.held.load(Ordering::Relaxed) { return Ok(()); }
+                let sdp = ctx.local_sdp.as_ref().ok_or(EndpointError::Other("no SDP".into()))?
+                    .replace("a=sendrecv", "a=sendonly");
+                (ctx.client_dialog.clone(), ctx.server_dialog.clone(), sdp, ctx.held.clone())
+            };
             let hdrs = vec![rsip::Header::Other("Content-Type".into(), "application/sdp".into())];
-            if let Some(ref d) = ctx.client_dialog { d.reinvite(Some(hdrs), Some(sdp.into_bytes())).await.map_err(err)?; }
-            else if let Some(ref d) = ctx.server_dialog { d.reinvite(Some(hdrs), Some(sdp.into_bytes())).await.map_err(err)?; }
-            ctx.held.store(true, Ordering::Relaxed);
+            if let Some(d) = cd { d.reinvite(Some(hdrs), Some(sdp.into_bytes())).await.map_err(err)?; }
+            else if let Some(d) = sd { d.reinvite(Some(hdrs), Some(sdp.into_bytes())).await.map_err(err)?; }
+            held.store(true, Ordering::Relaxed);
             info!("Call {} held (sendonly)", call_id);
             Ok(())
         })
@@ -551,16 +560,19 @@ impl SipEndpoint {
     pub fn unhold(&self, call_id: &str) -> Result<()> {
         let st = self.state.clone();
         self.runtime.block_on(async {
-            let s = st.lock().unwrap();
-            let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
-            if !ctx.held.load(Ordering::Relaxed) { return Ok(()); }
-            let sdp = ctx.local_sdp.as_ref().ok_or(EndpointError::Other("no SDP".into()))?
-                .replace("a=sendonly", "a=sendrecv")
-                .replace("a=inactive", "a=sendrecv");
+            let (cd, sd, sdp, held) = {
+                let s = st.lock().unwrap();
+                let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
+                if !ctx.held.load(Ordering::Relaxed) { return Ok(()); }
+                let sdp = ctx.local_sdp.as_ref().ok_or(EndpointError::Other("no SDP".into()))?
+                    .replace("a=sendonly", "a=sendrecv")
+                    .replace("a=inactive", "a=sendrecv");
+                (ctx.client_dialog.clone(), ctx.server_dialog.clone(), sdp, ctx.held.clone())
+            };
             let hdrs = vec![rsip::Header::Other("Content-Type".into(), "application/sdp".into())];
-            if let Some(ref d) = ctx.client_dialog { d.reinvite(Some(hdrs), Some(sdp.into_bytes())).await.map_err(err)?; }
-            else if let Some(ref d) = ctx.server_dialog { d.reinvite(Some(hdrs), Some(sdp.into_bytes())).await.map_err(err)?; }
-            ctx.held.store(false, Ordering::Relaxed);
+            if let Some(d) = cd { d.reinvite(Some(hdrs), Some(sdp.into_bytes())).await.map_err(err)?; }
+            else if let Some(d) = sd { d.reinvite(Some(hdrs), Some(sdp.into_bytes())).await.map_err(err)?; }
+            held.store(false, Ordering::Relaxed);
             info!("Call {} unheld (sendrecv)", call_id);
             Ok(())
         })
