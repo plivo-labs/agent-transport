@@ -4,7 +4,7 @@ Same pattern as AgentServer but over WebSocket instead of SIP:
     server = AudioStreamServer(listen_addr="0.0.0.0:8765")
 
     @server.audio_stream_session()
-    async def entrypoint(ctx: AudioStreamJobContext):
+    async def entrypoint(ctx: JobContext):
         session = AgentSession(vad=..., stt=..., llm=..., tts=...)
         await ctx.start(session, agent=Assistant())
 
@@ -46,6 +46,7 @@ from livekit.agents.utils import MovingAverage
 from .audio_stream_io import AudioStreamInput, AudioStreamOutput
 from ._room_facade import TransportRoom, create_transport_context
 from livekit.rtc.room import SipDTMF
+from .server import JobProcess
 
 logger = logging.getLogger("agent_transport.audio_stream_server")
 
@@ -147,15 +148,15 @@ class _LoadMonitor:
             return self._avg.get_avg()
 
 
-# ─── AudioStreamJobContext ───────────────────────────────────────────────────
+# ─── JobContext ───────────────────────────────────────────────────
 
 @dataclass
-class AudioStreamJobContext:
+class JobContext:
     """Context passed to the @audio_stream_session handler.
 
     Matches LiveKit's standard pattern exactly:
         @server.audio_stream_session()
-        async def entrypoint(ctx: AudioStreamJobContext):
+        async def entrypoint(ctx: JobContext):
             session = AgentSession(vad=..., stt=..., llm=..., tts=...)
             ctx.session = session
             await session.start(agent=Assistant(), room=ctx.room)
@@ -184,6 +185,8 @@ class AudioStreamJobContext:
     _job_stub: Any = field(default=None, repr=False)
     _job_ctx_token: Any = field(default=None, repr=False)
     _event_listeners: dict = field(default_factory=dict, repr=False)
+    _proc: Any = field(default=None, repr=False)
+    _shutdown_callbacks: list = field(default_factory=list, repr=False)
 
     @property
     def session(self):
@@ -242,6 +245,15 @@ class AudioStreamJobContext:
         """Room facade — use with session.start(room=ctx.room) like LiveKit WebRTC."""
         return self._room
 
+    @property
+    def proc(self):
+        """Process context — access prewarm data via ctx.proc.userdata."""
+        return self._proc
+
+    def add_shutdown_callback(self, callback):
+        """Register a callback to run when the session ends."""
+        self._shutdown_callbacks.append(callback)
+
 
 # ─── AudioStreamServer ───────────────────────────────────────────────────────
 
@@ -274,12 +286,22 @@ class AudioStreamServer:
         self._auth = auth
         self._entrypoint_fnc: Callable[..., Coroutine] | None = None
         self._setup_fnc: Callable | None = None
+        self._proc = JobProcess()
         self._userdata: dict[str, Any] = {}
         self._ep: AudioStreamEndpoint | None = None
         self._active_sessions: dict[int, asyncio.Task] = {}
         self._session_ended_events: dict[int, asyncio.Event] = {}
-        self._session_contexts: dict[int, AudioStreamJobContext] = {}
+        self._session_contexts: dict[int, JobContext] = {}
         self._load_monitor = _LoadMonitor()
+
+    @property
+    def setup_fnc(self):
+        return self._setup_fnc
+
+    @setup_fnc.setter
+    def setup_fnc(self, fn):
+        """Set prewarm function — fn(proc: JobProcess). Matches LiveKit's server.setup_fnc = prewarm."""
+        self._setup_fnc = fn
 
     def setup(self) -> Callable:
         """Decorator to register a setup function that runs once at startup.
@@ -352,7 +374,7 @@ class AudioStreamServer:
                 "No audio stream session entrypoint registered.\n"
                 "Define one using the @server.audio_stream_session() decorator, for example:\n"
                 '    @server.audio_stream_session()\n'
-                "    async def entrypoint(ctx: AudioStreamJobContext):\n"
+                "    async def entrypoint(ctx: JobContext):\n"
                 "        ..."
             )
             sys.exit(1)
@@ -370,11 +392,15 @@ class AudioStreamServer:
         if self._setup_fnc:
             if self._inference_executor:
                 _set_inference_context(self._inference_executor)
-            result = self._setup_fnc()
+            try:
+                self._setup_fnc(self._proc)  # New pattern: fn(proc)
+            except TypeError:
+                result = self._setup_fnc()  # Old pattern: fn() -> dict
+                if isinstance(result, dict):
+                    self._proc.userdata = result
             if self._inference_executor:
                 _clear_inference_context()
-            if isinstance(result, dict):
-                self._userdata = result
+            self._userdata = self._proc.userdata
             logger.info("Setup complete: %s", list(self._userdata.keys()))
 
         # Create AudioStreamEndpoint (starts WS server immediately)
@@ -578,7 +604,7 @@ class AudioStreamServer:
         job_stub, job_ctx_token = create_transport_context(
             room, agent_name=self._agent_name)
 
-        ctx = AudioStreamJobContext(
+        ctx = JobContext(
             session_id=session_id,
             call_id=call_id,
             stream_id=stream_id,
@@ -591,6 +617,7 @@ class AudioStreamServer:
             _room=room,
             _job_stub=job_stub,
             _job_ctx_token=job_ctx_token,
+            _proc=self._proc,
         )
         self._session_contexts[session_id] = ctx
 
@@ -621,6 +648,13 @@ class AudioStreamServer:
                         await ctx._session.aclose()
                     except Exception:
                         pass
+                for cb in ctx._shutdown_callbacks:
+                    try:
+                        result = cb()
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception:
+                        logger.exception("Shutdown callback failed")
                 try:
                     self._ep.hangup(session_id)
                 except Exception:

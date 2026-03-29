@@ -22,6 +22,10 @@ import { mkdirSync } from 'node:fs';
 import { SipEndpoint } from 'agent-transport';
 import { JobContext } from './call_context.js';
 
+export class JobProcess {
+  userData: Record<string, unknown> = {};
+}
+
 export interface AgentServerOptions {
   sipServer?: string;
   sipPort?: number;
@@ -98,6 +102,7 @@ export class AgentServer {
   private entrypointFn?: EntrypointFn;
   private setupFn?: SetupFn;
   private userdata: Record<string, unknown> = {};
+  private proc = new JobProcess();
   private ep?: SipEndpoint;
   private activeCalls = new Map<string, { promise: Promise<void>; resolveEnded: () => void; room?: any }>();
   private httpServer?: Server;
@@ -129,6 +134,13 @@ export class AgentServer {
    */
   setup(fn: SetupFn): void {
     this.setupFn = fn;
+  }
+
+  /**
+   * LiveKit-compatible setup_fnc setter — accepts a function that receives a JobProcess.
+   */
+  set setupFnc(fn: (proc: JobProcess) => void | Record<string, unknown>) {
+    this.setupFn = fn as any;
   }
 
   /**
@@ -173,9 +185,7 @@ export class AgentServer {
         const runners = InferenceRunner?.registeredRunners;
 
         if (runners && Object.keys(runners).length > 0) {
-          // InferenceProcExecutor is not exported publicly — import from dist
-          // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-          // @ts-expect-error — InferenceProcExecutor is internal but functional
+          // @ts-ignore — optional deep import, may not exist in all versions
           const mod = await import('@livekit/agents/dist/ipc/inference_proc_executor.js').catch(() => null);
           const InferenceProcExecutor = mod?.InferenceProcExecutor ?? null;
 
@@ -199,12 +209,12 @@ export class AgentServer {
         // Run setup within job context stub so MultilingualModel() works
         if (this.inferenceExecutor && (agents as any).runWithJobContext) {
           const stub = { inferenceExecutor: this.inferenceExecutor } as any;
-          this.userdata = (agents as any).runWithJobContext(stub, () => this.setupFn!());
+          (agents as any).runWithJobContext(stub, () => this.callSetupFn());
         } else {
-          this.userdata = this.setupFn();
+          this.callSetupFn();
         }
       } catch {
-        this.userdata = this.setupFn();
+        this.callSetupFn();
       }
       console.log(`Setup complete: ${Object.keys(this.userdata).join(', ')}`);
     }
@@ -248,6 +258,25 @@ export class AgentServer {
     }
     this.httpServer?.close();
     this.ep?.shutdown();
+  }
+
+  /**
+   * Call the setup function, supporting both LiveKit proc pattern and plain pattern.
+   */
+  private callSetupFn(): void {
+    if (!this.setupFn) return;
+    try {
+      const result = (this.setupFn as any)(this.proc);
+      if (result && typeof result === 'object') {
+        Object.assign(this.proc.userData, result);
+      }
+    } catch {
+      const result = (this.setupFn as any)();
+      if (result && typeof result === 'object') {
+        Object.assign(this.proc.userData, result);
+      }
+    }
+    this.userdata = this.proc.userData;
   }
 
   // ─── Event dispatcher (single reader, no race conditions) ──────
@@ -331,6 +360,7 @@ export class AgentServer {
       agentName: this.agentName,
       callEnded,
       resolveCallEnded: resolveEnded,
+      proc: this.proc,
     });
     callEntry.room = ctx.room;
 
@@ -475,8 +505,10 @@ export class AgentServer {
               return;
             }
 
-            const callId = this.ep!.call(destination);
-            console.log(`Outbound call ${callId} to ${destination}`);
+            const fromUri: string | undefined = data.from;
+            const headers: Record<string, string> | undefined = data.headers;
+            const callId = this.ep!.call(destination, fromUri, headers);
+            console.log(`Outbound call ${callId} to ${destination} (from=${fromUri ?? 'default'})`);
 
             // Register pending outbound with 30s timeout
             const mediaReady = new Promise<boolean>((resolve) => {

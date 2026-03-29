@@ -5,8 +5,9 @@ Drop-in SIP transport for LiveKit Agents. Run the same `AgentSession` pipeline (
 ## Quick Start
 
 ```python
-from agent_transport.sip.livekit import AgentServer, JobContext
-from livekit.agents import Agent, AgentSession, TurnHandlingOptions
+from agent_transport.sip.livekit import AgentServer, JobContext, JobProcess
+from livekit.agents import Agent, AgentSession, TurnHandlingOptions, metrics
+from livekit.agents.voice import MetricsCollectedEvent
 from livekit.plugins import deepgram, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
@@ -16,12 +17,11 @@ server = AgentServer(
     sip_server=os.environ.get("SIP_DOMAIN", "phone.plivo.com"),
 )
 
-@server.setup()
-def prewarm():
-    return {
-        "vad": silero.VAD.load(),
-        "turn_detector": MultilingualModel(),
-    }
+def prewarm(proc: JobProcess):
+    proc.userdata["vad"] = silero.VAD.load()
+    proc.userdata["turn_detector"] = MultilingualModel()
+
+server.setup_fnc = prewarm
 
 class Assistant(Agent):
     def __init__(self):
@@ -33,17 +33,22 @@ class Assistant(Agent):
 @server.sip_session()
 async def entrypoint(ctx: JobContext):
     session = AgentSession(
-        vad=ctx.userdata["vad"],
+        vad=ctx.proc.userdata["vad"],
         stt=deepgram.STT(model="nova-3"),
         llm=openai.LLM(model="gpt-4.1-mini"),
         tts=openai.TTS(voice="alloy"),
         turn_handling=TurnHandlingOptions(
-            turn_detection=ctx.userdata["turn_detector"],
+            turn_detection=ctx.proc.userdata["turn_detector"],
         ),
         preemptive_generation=True,
         aec_warmup_duration=3.0,
     )
     ctx.session = session
+
+    @session.on("metrics_collected")
+    def _on_metrics_collected(ev: MetricsCollectedEvent):
+        metrics.log_metrics(ev.metrics)
+
     await session.start(agent=Assistant(), room=ctx.room)
 
 if __name__ == "__main__":
@@ -96,12 +101,12 @@ AgentServer(
 )
 ```
 
-### Decorators
+### Setup & Decorators
 
-| Decorator | Description |
-|-----------|-------------|
-| `@server.setup()` | Register a setup function that runs once at startup. Returns a dict available as `ctx.userdata` in each call. |
-| `@server.sip_session()` | Register the call entrypoint — equivalent of `@server.rtc_session()` in LiveKit. |
+| API | Description |
+|-----|-------------|
+| `server.setup_fnc = prewarm` | Register a setup function `prewarm(proc: JobProcess)` that runs once at startup. Load models into `proc.userdata`, available as `ctx.proc.userdata` in each call. |
+| `@server.sip_session()` | Register the call entrypoint -- equivalent of `@server.rtc_session()` in LiveKit. |
 
 ### HTTP Endpoints
 
@@ -137,22 +142,23 @@ Passed to the `@sip_session()` handler — equivalent of LiveKit's `JobContext`.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `call_id` | `int` | SIP call identifier |
+| `call_id` | `str` | SIP call identifier |
 | `remote_uri` | `str` | Caller's SIP URI |
 | `direction` | `str` | `"inbound"` or `"outbound"` |
-| `userdata` | `dict` | Shared data from `@server.setup()` |
+| `proc` | `JobProcess` | Process info; `ctx.proc.userdata` has data from `prewarm()` |
 
 ### Methods
 
 | Method | Description |
 |--------|-------------|
 | `ctx.start(session, agent=)` | Wire SIP audio I/O, start the agent, and wait for call end. Equivalent of `session.start(agent=, room=ctx.room)`. |
+| `ctx.add_shutdown_callback(cb)` | Register a callback to run when the call ends (cleanup, metrics flush, etc.). |
 
 ---
 
 ## Call Recording
 
-Stereo WAV recording at the Rust RTP layer — zero CPU encoding overhead.
+Stereo OGG/Opus recording at the Rust RTP layer -- efficient compressed output.
 
 ```python
 server = AgentServer(
@@ -162,11 +168,11 @@ server = AgentServer(
 )
 ```
 
-Output: `recordings/call_{id}.wav` — 16kHz, 16-bit PCM.
+Output: `recordings/call_{id}.ogg` -- OGG/Opus, 16kHz.
 
-- User audio captured after G.711 decode + 8→16kHz resample
-- Agent audio captured from the AudioBuffer before 16→8kHz downsample
-- Write-through (no buffering), ~3.8 MB/minute stereo
+- User audio captured after G.711 decode + 8->16kHz resample
+- Agent audio captured from the AudioBuffer before 16->8kHz downsample
+- Opus-encoded in batch, much smaller files than raw PCM
 
 ---
 
@@ -203,12 +209,11 @@ python agent.py download-files
 ```
 
 ```python
-@server.setup()
-def prewarm():
-    return {
-        "vad": silero.VAD.load(),
-        "turn_detector": MultilingualModel(),  # or EnglishModel()
-    }
+def prewarm(proc: JobProcess):
+    proc.userdata["vad"] = silero.VAD.load()
+    proc.userdata["turn_detector"] = MultilingualModel()  # or EnglishModel()
+
+server.setup_fnc = prewarm
 ```
 
 ---
@@ -270,8 +275,13 @@ Implements `livekit.agents.voice.io.AudioOutput`. Line-for-line match of LiveKit
 | Example | Description |
 |---------|-------------|
 | [`sip_agent.py`](../examples/livekit/sip_agent.py) | Single agent with tool calling, turn detection, preemptive generation |
-| [`sip_multi_agent.py`](../examples/livekit/sip_multi_agent.py) | Multi-agent with greeter → sales/support handoff and tool calling |
+| [`sip_agent.ts`](../examples/livekit/sip_agent.ts) | TypeScript SIP agent with tool calling, turn detection, metrics |
+| [`sip_multi_agent.py`](../examples/livekit/sip_multi_agent.py) | Multi-agent with greeter -> sales/support handoff and tool calling |
+| [`sip_multi_agent.ts`](../examples/livekit/sip_multi_agent.ts) | TypeScript multi-agent with class inheritance and `llm.handoff()` |
 | [`audio_stream_agent.py`](../examples/livekit/audio_stream_agent.py) | Agent over Plivo audio streaming (WebSocket) |
+| [`audio_stream_agent.ts`](../examples/livekit/audio_stream_agent.ts) | TypeScript audio streaming agent |
+| [`audio_stream_multi_agent.py`](../examples/livekit/audio_stream_multi_agent.py) | Audio streaming multi-agent with handoff |
+| [`audio_stream_multi_agent.ts`](../examples/livekit/audio_stream_multi_agent.ts) | TypeScript audio streaming multi-agent |
 
 ---
 
@@ -295,7 +305,7 @@ Implements `livekit.agents.voice.io.AudioOutput`. Line-for-line match of LiveKit
 ### Python
 
 ```python
-from agent_transport.sip.livekit import AgentServer, JobContext, run_app
+from agent_transport.sip.livekit import AgentServer, JobContext, JobProcess, run_app
 from agent_transport.sip.livekit import SipAudioInput, SipAudioOutput  # low-level access
 ```
 
@@ -324,10 +334,10 @@ const server = new AgentServer({
   sipPassword: process.env.SIP_PASSWORD!,
 });
 
-server.setup(() => ({
-  vad: silero.VAD.load(),
-  turnDetector: new livekit.turnDetector.MultilingualModel(),
-}));
+server.setupFnc = (proc) => {
+  proc.userdata.vad = silero.VAD.load();
+  proc.userdata.turnDetector = new livekit.turnDetector.MultilingualModel();
+};
 
 const agent = new voice.Agent({
   instructions: 'You are a helpful phone assistant.',
@@ -342,12 +352,12 @@ const agent = new voice.Agent({
 
 server.sipSession(async (ctx: JobContext) => {
   const session = new voice.AgentSession({
-    vad: ctx.userdata.vad as silero.VAD,
+    vad: ctx.proc.userdata.vad as silero.VAD,
     stt: new deepgram.STT({ model: 'nova-3' }),
     llm: new openai.LLM({ model: 'gpt-4.1-mini' }),
     tts: new openai.TTS({ voice: 'alloy' }),
     turnHandling: {
-      turnDetection: ctx.userdata.turnDetector as livekit.turnDetector.MultilingualModel,
+      turnDetection: ctx.proc.userdata.turnDetector as livekit.turnDetector.MultilingualModel,
     },
     preemptiveGeneration: true,
     aecWarmupDuration: 3000,

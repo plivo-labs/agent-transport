@@ -42,6 +42,12 @@ from ._room_facade import TransportRoom, create_transport_context
 logger = logging.getLogger("agent_transport.server")
 
 
+class JobProcess:
+    """Stub matching LiveKit's JobProcess — holds prewarm data."""
+    def __init__(self):
+        self.userdata: dict[str, Any] = {}
+
+
 _inference_ctx_token = None
 
 def _set_inference_context(executor) -> None:
@@ -186,6 +192,8 @@ class JobContext:
     _room: Any = field(default=None, repr=False)
     _job_ctx_token: Any = field(default=None, repr=False)
     _event_listeners: dict = field(default_factory=dict, repr=False)
+    _proc: Any = field(default=None, repr=False)
+    _shutdown_callbacks: list = field(default_factory=list, repr=False)
 
     @property
     def session(self):
@@ -244,6 +252,15 @@ class JobContext:
         """Room facade — use with session.start(room=ctx.room) like LiveKit WebRTC."""
         return self._room
 
+    @property
+    def proc(self):
+        """Process context — access prewarm data via ctx.proc.userdata."""
+        return self._proc
+
+    def add_shutdown_callback(self, callback):
+        """Register a callback to run when the session ends."""
+        self._shutdown_callbacks.append(callback)
+
 
 class AgentServer:
     """SIP voice agent server — handles inbound and outbound calls.
@@ -279,6 +296,7 @@ class AgentServer:
         self._recording_stereo = recording_stereo
         self._entrypoint_fnc: Callable[..., Coroutine] | None = None
         self._setup_fnc: Callable | None = None
+        self._proc = JobProcess()
         self._userdata: dict[str, Any] = {}
         self._ep: SipEndpoint | None = None
         self._active_calls: dict[int, asyncio.Task] = {}
@@ -286,6 +304,15 @@ class AgentServer:
         self._call_contexts: dict[int, JobContext] = {}
         self._pending_outbound: dict[int, asyncio.Future] = {}
         self._load_monitor = _LoadMonitor()
+
+    @property
+    def setup_fnc(self):
+        return self._setup_fnc
+
+    @setup_fnc.setter
+    def setup_fnc(self, fn):
+        """Set prewarm function — fn(proc: JobProcess). Matches LiveKit's server.setup_fnc = prewarm."""
+        self._setup_fnc = fn
 
     def setup(self) -> Callable:
         """Decorator to register a setup function that runs once at startup.
@@ -388,11 +415,15 @@ class AgentServer:
         if self._setup_fnc:
             if self._inference_executor:
                 _set_inference_context(self._inference_executor)
-            result = self._setup_fnc()
+            try:
+                self._setup_fnc(self._proc)  # New pattern: fn(proc)
+            except TypeError:
+                result = self._setup_fnc()  # Old pattern: fn() -> dict
+                if isinstance(result, dict):
+                    self._proc.userdata = result
             if self._inference_executor:
                 _clear_inference_context()
-            if isinstance(result, dict):
-                self._userdata = result
+            self._userdata = self._proc.userdata
             logger.info("Setup complete: %s", list(self._userdata.keys()))
 
         self._ep = SipEndpoint(sip_server=self._sip_server)
@@ -536,13 +567,18 @@ class AgentServer:
         if not destination:
             return web.json_response({"error": "missing 'to' field"}, status=400)
 
+        from_uri = data.get("from")  # Optional SIP From URI
+        headers = data.get("headers")  # Optional custom SIP headers
+
         loop = asyncio.get_running_loop()
         try:
-            call_id = await loop.run_in_executor(None, self._ep.make_call, destination)
+            call_id = await loop.run_in_executor(
+                None, lambda: self._ep.call(destination, from_uri, headers)
+            )
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 
-        logger.info("Outbound call %s to %s", call_id, destination)
+        logger.info("Outbound call %s to %s (from=%s)", call_id, destination, from_uri or "default")
 
         # Register a future that the event dispatcher will resolve on call_media_active
         media_fut = asyncio.get_running_loop().create_future()
@@ -664,6 +700,7 @@ class AgentServer:
             _call_ended=call_ended,
             _room=room,
             _job_ctx_token=job_ctx_token,
+            _proc=self._proc,
         )
         self._call_contexts[call_id] = ctx
 
@@ -694,6 +731,13 @@ class AgentServer:
                         await ctx._session.aclose()
                     except Exception:
                         pass
+                for cb in ctx._shutdown_callbacks:
+                    try:
+                        result = cb()
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception:
+                        logger.exception("Shutdown callback failed")
                 try:
                     self._ep.hangup(call_id)
                 except Exception:

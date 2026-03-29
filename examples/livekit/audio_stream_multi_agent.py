@@ -29,9 +29,10 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
-from agent_transport.sip.livekit import AudioStreamServer, AudioStreamJobContext
+from agent_transport.audio_stream.livekit import AudioStreamServer, JobContext, JobProcess
 
-from livekit.agents import Agent, AgentSession, RunContext, TurnHandlingOptions
+from livekit.agents import Agent, AgentSession, RunContext, TurnHandlingOptions, metrics
+from livekit.agents.voice import MetricsCollectedEvent
 from livekit.agents.llm import function_tool
 from livekit.agents.job import get_job_context
 from livekit.plugins import deepgram, openai, silero
@@ -48,12 +49,12 @@ server = AudioStreamServer(
 )
 
 
-@server.setup()
-def prewarm():
-    return {
-        "vad": silero.VAD.load(),
-        "turn_detector": MultilingualModel(),
-    }
+def prewarm(proc: JobProcess):
+    proc.userdata["vad"] = silero.VAD.load()
+    proc.userdata["turn_detector"] = MultilingualModel()
+
+
+server.setup_fnc = prewarm
 
 
 @dataclass
@@ -242,21 +243,26 @@ class SupportAgent(Agent):
 
 
 @server.audio_stream_session()
-async def entrypoint(ctx: AudioStreamJobContext):
+async def entrypoint(ctx: JobContext):
     session = AgentSession[CallData](
-        vad=ctx.userdata["vad"],
+        vad=ctx.proc.userdata["vad"],
         stt=deepgram.STT(model="nova-3"),
         llm=openai.LLM(model="gpt-4.1-mini"),
         tts=openai.TTS(voice="alloy"),
         userdata=CallData(),
         turn_handling=TurnHandlingOptions(
-            turn_detection=ctx.userdata["turn_detector"],
+            turn_detection=ctx.proc.userdata["turn_detector"],
         ),
         preemptive_generation=True,
         aec_warmup_duration=3.0,
         tts_text_transforms=["filter_emoji", "filter_markdown"],
     )
     ctx.session = session
+
+    @session.on("metrics_collected")
+    def _on_metrics_collected(ev: MetricsCollectedEvent):
+        metrics.log_metrics(ev.metrics)
+
     await session.start(agent=GreeterAgent(), room=ctx.room)
 
 

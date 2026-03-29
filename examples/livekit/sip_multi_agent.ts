@@ -11,7 +11,7 @@
  *   npx ts-node examples/livekit/sip_multi_agent.ts dev
  */
 
-import { AgentServer, type JobContext } from '@agent-transport/sip-livekit';
+import { AgentServer, JobProcess, type JobContext } from '@agent-transport/sip-livekit';
 import { voice, llm, metrics, getJobContext } from '@livekit/agents';
 import * as deepgram from '@livekit/agents-plugin-deepgram';
 import * as openai from '@livekit/agents-plugin-openai';
@@ -30,10 +30,10 @@ const server = new AgentServer({
   sipServer: process.env.SIP_DOMAIN ?? 'phone.plivo.com',
 });
 
-server.setup(() => ({
-  vad: silero.VAD.load(),
-  turnDetector: new livekit.turnDetector.MultilingualModel(),
-}));
+server.setupFnc = (proc: JobProcess) => {
+  proc.userData.vad = silero.VAD.load();
+  proc.userData.turnDetector = new livekit.turnDetector.MultilingualModel();
+};
 
 // ─── Agents (class-based, matching LiveKit TS pattern) ───────────
 
@@ -222,13 +222,13 @@ class SupportAgent extends voice.Agent<CallData> {
 
 server.sipSession(async (ctx: JobContext) => {
   const session = new voice.AgentSession<CallData>({
-    vad: ctx.userdata.vad as silero.VAD,
+    vad: ctx.proc.userData.vad as silero.VAD,
     stt: new deepgram.STT({ model: 'nova-3' }),
     llm: new openai.LLM({ model: 'gpt-4.1-mini' }),
     tts: new openai.TTS({ voice: 'alloy' }),
     userData: {} as CallData,
     turnHandling: {
-      turnDetection: ctx.userdata.turnDetector as livekit.turnDetector.MultilingualModel,
+      turnDetection: ctx.proc.userData.turnDetector as livekit.turnDetector.MultilingualModel,
     },
     preemptiveGeneration: true,
     aecWarmupDuration: 3000,

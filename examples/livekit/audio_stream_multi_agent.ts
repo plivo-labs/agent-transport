@@ -14,7 +14,7 @@
  *   npx ts-node examples/livekit/audio_stream_multi_agent.ts dev
  */
 
-import { AgentServer, type JobContext } from '@agent-transport/sip-livekit';
+import { AudioStreamServer, JobProcess, type AudioStreamJobContext } from '@agent-transport/sip-livekit';
 import { voice, llm, metrics, getJobContext } from '@livekit/agents';
 import * as deepgram from '@livekit/agents-plugin-deepgram';
 import * as openai from '@livekit/agents-plugin-openai';
@@ -27,16 +27,16 @@ type CallData = {
   intent?: string;
 };
 
-const server = new AgentServer({
-  sipUsername: process.env.SIP_USERNAME!,
-  sipPassword: process.env.SIP_PASSWORD!,
-  sipServer: process.env.SIP_DOMAIN ?? 'phone.plivo.com',
+const server = new AudioStreamServer({
+  listenAddr: process.env.AUDIO_STREAM_ADDR ?? '0.0.0.0:8765',
+  plivoAuthId: process.env.PLIVO_AUTH_ID ?? '',
+  plivoAuthToken: process.env.PLIVO_AUTH_TOKEN ?? '',
 });
 
-server.setup(() => ({
-  vad: silero.VAD.load(),
-  turnDetector: new livekit.turnDetector.MultilingualModel(),
-}));
+server.setupFnc = (proc: JobProcess) => {
+  proc.userData.vad = silero.VAD.load();
+  proc.userData.turnDetector = new livekit.turnDetector.MultilingualModel();
+};
 
 // ─── Agents (class-based, matching LiveKit TS pattern) ───────────
 
@@ -223,15 +223,15 @@ class SupportAgent extends voice.Agent<CallData> {
 
 // ─── Server ──────────────────────────────────────────────────────
 
-server.sipSession(async (ctx: JobContext) => {
+server.audioStreamSession(async (ctx: AudioStreamJobContext) => {
   const session = new voice.AgentSession<CallData>({
-    vad: ctx.userdata.vad as silero.VAD,
+    vad: ctx.proc.userData.vad as silero.VAD,
     stt: new deepgram.STT({ model: 'nova-3' }),
     llm: new openai.LLM({ model: 'gpt-4.1-mini' }),
     tts: new openai.TTS({ voice: 'alloy' }),
     userData: {} as CallData,
     turnHandling: {
-      turnDetection: ctx.userdata.turnDetector as livekit.turnDetector.MultilingualModel,
+      turnDetection: ctx.proc.userData.turnDetector as livekit.turnDetector.MultilingualModel,
     },
     preemptiveGeneration: true,
     aecWarmupDuration: 3000,

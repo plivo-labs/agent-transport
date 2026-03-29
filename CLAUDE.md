@@ -28,9 +28,10 @@ python/                       # Python adapters
 │   │   └── livekit/          # LiveKit AgentServer + SIP I/O adapters
 │   └── audio_stream/
 │       ├── pipecat/          # Pipecat AudioStreamTransport + AudioStreamServer
-│       └── livekit/          # (planned) LiveKit audio stream adapters
+│       └── livekit/          # LiveKit AudioStreamServer + audio stream I/O adapters
 
-node/                         # Node.js adapter types
+node/
+├── agent-transport-sip-livekit/  # TypeScript LiveKit adapters (SIP + AudioStream)
 ```
 
 ## Build
