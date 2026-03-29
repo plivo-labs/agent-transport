@@ -34,15 +34,17 @@ pub(crate) struct RtpTransport {
     pub remote_addr: Mutex<SocketAddr>,
     ssrc: u32, codec: Codec, seq: AtomicU16, timestamp: AtomicU32,
     pub dtmf_pt: u8, pub ptime_ms: u32, pub cancel: CancellationToken,
+    /// Pipeline sample rate — the rate at which audio frames are exchanged with adapters.
+    pub pipeline_rate: u32,
 }
 
 impl RtpTransport {
-    pub fn new(socket: Arc<UdpSocket>, remote: SocketAddr, codec: Codec, cancel: CancellationToken, dtmf_pt: u8, ptime_ms: u32) -> Self {
-        Self { socket, remote_addr: Mutex::new(remote), ssrc: rand::random(), codec, seq: AtomicU16::new(0), timestamp: AtomicU32::new(0), dtmf_pt, ptime_ms, cancel }
+    pub fn new(socket: Arc<UdpSocket>, remote: SocketAddr, codec: Codec, cancel: CancellationToken, dtmf_pt: u8, ptime_ms: u32, pipeline_rate: u32) -> Self {
+        Self { socket, remote_addr: Mutex::new(remote), ssrc: rand::random(), codec, seq: AtomicU16::new(0), timestamp: AtomicU32::new(0), dtmf_pt, ptime_ms, cancel, pipeline_rate }
     }
 
     fn remote(&self) -> SocketAddr { *self.remote_addr.lock().unwrap() }
-    fn spf(&self) -> u32 { 8000 * self.ptime_ms / 1000 }
+    fn spf(&self) -> u32 { self.codec.sample_rate() * self.ptime_ms / 1000 }
 
     async fn send(&self, pt: u8, ts: u32, marker: bool, payload: Vec<u8>) -> std::io::Result<()> {
         let pkt = Packet { header: Header { version: 2, marker, payload_type: pt, sequence_number: self.seq.fetch_add(1, Ordering::Relaxed), timestamp: ts, ssrc: self.ssrc, ..Default::default() }, payload: bytes::Bytes::from(payload) };
@@ -76,13 +78,14 @@ impl RtpTransport {
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(Duration::from_millis(t.ptime_ms as u64));
             let (sil, spf) = (t.codec.silence_byte(), t.spf());
-            let input_spf = (spf * 2) as usize; // 320 samples at 16kHz = 20ms
+            let input_spf = (t.pipeline_rate * t.ptime_ms / 1000) as usize;
             let mut first = true;
             let mut pkt_count = 0u32;
             let mut octet_count = 0u32;
             let mut rtcp_iv = tokio::time::interval(Duration::from_secs(5));
             rtcp_iv.tick().await;
-            let mut downsampler = Resampler::new_voip(16000, 8000);
+            let pipeline_rate = t.pipeline_rate;
+            let mut downsampler = Resampler::new_voip(pipeline_rate, t.codec.sample_rate());
 
             loop {
                 tokio::select! {
@@ -91,7 +94,7 @@ impl RtpTransport {
                         let ts = t.timestamp.load(Ordering::Relaxed);
                         let sr = super::rtcp::build_sender_report(t.ssrc, ts, pkt_count, octet_count);
                         let _ = t.socket.send_to(&sr, t.remote()).await;
-                        let buf_ms = (audio_buf.len() as u32 * 1000) / 16000;
+                        let buf_ms = (audio_buf.len() as u32 * 1000) / pipeline_rate;
                         debug!("RTP TX: pkts={} octets={} buf={}ms codec={:?} remote={}", pkt_count, octet_count, buf_ms, t.codec, t.remote());
                     }
                     _ = iv.tick() => {}
@@ -127,7 +130,7 @@ impl RtpTransport {
                 };
 
                 if !samples.is_empty() {
-                    // Record agent audio (16kHz, before downsample)
+                    // Record agent audio (pipeline rate, before downsample)
                     if let Ok(guard) = recorder.lock() { if let Some(ref rec) = *guard { rec.write_agent_samples(&samples); } }
 
                     if !muted.load(Ordering::Relaxed) {
@@ -166,8 +169,9 @@ impl RtpTransport {
             let mut ka = tokio::time::interval(NAT_KEEPALIVE);
             let (mut dtmf_ev, mut dtmf_timer): (Option<u8>, Option<Instant>) = (None, None);
             let (mut rx_pkts, mut rx_log_time) = (0u32, Instant::now());
-            // speexdsp resampler: 8kHz→16kHz (same approach as FreeSWITCH)
-            let mut upsampler = Resampler::new_voip(8000, 16000);
+            let pipeline_rate = t.pipeline_rate;
+            // speexdsp resampler: codec rate → pipeline rate (same approach as FreeSWITCH)
+            let mut upsampler = Resampler::new_voip(t.codec.sample_rate(), pipeline_rate);
 
             loop {
                 tokio::select! {
@@ -217,7 +221,7 @@ impl RtpTransport {
                         if let Some(ev) = dtmf_ev { if dtmf_timer.map(|t| t.elapsed() > DTMF_END_TIMEOUT).unwrap_or(false) { if let Some(d) = dtmf::event_to_digit(ev) { warn!("DTMF END timeout: {}", d); let _ = etx.try_send(EndpointEvent::DtmfReceived { call_id: cid.clone(), digit: d, method: "rfc2833".into() }); } dtmf_ev = None; dtmf_timer = None; } }
                         if pkt.header.payload_type != t.codec.payload_type() { continue; }
 
-                        // Decode G.711, then upsample 8kHz→16kHz via speexdsp
+                        // Decode G.711, then resample codec rate → pipeline rate via speexdsp
                         let s8 = t.codec.decode(&pkt.payload);
                         let pcm = if let Some(ref mut us) = upsampler {
                             us.process(&s8).to_vec()
@@ -225,7 +229,7 @@ impl RtpTransport {
                             s8 // same rate — no resampling
                         };
 
-                        // Record user audio (16kHz, after resample)
+                        // Record user audio (pipeline rate, after resample)
                         if let Ok(guard) = recorder.lock() { if let Some(ref rec) = *guard { rec.write_user_samples(&pcm); } }
 
                         // Beep detector
@@ -237,7 +241,7 @@ impl RtpTransport {
                             }
                         }}
                         let n = pcm.len() as u32;
-                        let _ = tx.try_send(AudioFrame { data: pcm, sample_rate: 16000, num_channels: 1, samples_per_channel: n });
+                        let _ = tx.try_send(AudioFrame { data: pcm, sample_rate: pipeline_rate, num_channels: 1, samples_per_channel: n });
                         rx_pkts += 1;
                         if rx_log_time.elapsed() >= Duration::from_secs(5) {
                             debug!("RTP RX: pkts={} ssrc={:?} remote={}", rx_pkts, remote_ssrc, from);

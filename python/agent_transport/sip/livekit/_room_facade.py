@@ -116,12 +116,13 @@ class _TransportLocalParticipant:
         """Read frames from a published audio track and send to endpoint's background mixer.
 
         Creates an rtc.AudioStream from the local track (loopback read),
-        resamples to 16kHz, and forwards to ep.send_background_audio().
+        resamples to endpoint's pipeline rate, and forwards to ep.send_background_audio().
         Rust send loop mixes this with agent voice before encoding.
         """
         try:
+            sr = self._ep.sample_rate if self._ep is not None else 8000
             stream = rtc.AudioStream.from_track(
-                track=track, sample_rate=16000, num_channels=1)
+                track=track, sample_rate=sr, num_channels=1)
             logger.debug("Forwarding published track %s to background mixer", pub_sid)
 
             async for event in stream:

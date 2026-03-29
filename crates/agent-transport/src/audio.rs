@@ -7,7 +7,7 @@ pub struct AudioFrame {
     /// PCM samples, interleaved by channel.
     pub data: Vec<i16>,
 
-    /// Sample rate in Hz (8000 for G.711, 16000 after resampling).
+    /// Sample rate in Hz (matches the pipeline sample rate configured on the endpoint).
     pub sample_rate: u32,
 
     /// Number of audio channels (1 = mono, 2 = stereo).

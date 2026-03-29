@@ -43,13 +43,14 @@ export class SipAudioInput {
           }
 
           if (self.attached) {
+            const sr = self.endpoint.sampleRate;
             const samplesPerChannel = bytes.length / 2;
             const data = new Int16Array(bytes.buffer, bytes.byteOffset, samplesPerChannel);
-            controller.enqueue(new AudioFrame(data, 16000, 1, samplesPerChannel));
+            controller.enqueue(new AudioFrame(data, sr, 1, samplesPerChannel));
 
             self.frameCount++;
             if (self.frameCount === 1) {
-              console.log(`SipAudioInput: first frame received sr=16000 samples=${samplesPerChannel}`);
+              console.log(`SipAudioInput: first frame received sr=${sr} samples=${samplesPerChannel}`);
             } else if (self.frameCount % 250 === 0) {
               console.log(`SipAudioInput: ${self.frameCount} frames forwarded (${(self.frameCount * 0.02).toFixed(1)}s)`);
             }
@@ -64,8 +65,9 @@ export class SipAudioInput {
   private pushSilenceAndClose(controller: ReadableStreamDefaultController<AudioFrame>) {
     try {
       // Push 0.5s silence to flush STT (matches LiveKit _ParticipantAudioInputStream)
-      const silentSamples = 8000; // 0.5s at 16kHz
-      controller.enqueue(new AudioFrame(new Int16Array(silentSamples), 16000, 1, silentSamples));
+      const sr = this.endpoint.sampleRate;
+      const silentSamples = sr / 2; // 0.5s at pipeline rate
+      controller.enqueue(new AudioFrame(new Int16Array(silentSamples), sr, 1, silentSamples));
     } catch { /* stream already closed */ }
     try { controller.close(); } catch { /* already closed */ }
   }

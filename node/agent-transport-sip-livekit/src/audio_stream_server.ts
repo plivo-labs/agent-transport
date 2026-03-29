@@ -92,7 +92,7 @@ export class AudioStreamServer {
     this.listenAddr = opts.listenAddr ?? process.env.AUDIO_STREAM_ADDR ?? '0.0.0.0:8765';
     this.plivoAuthId = opts.plivoAuthId ?? process.env.PLIVO_AUTH_ID ?? '';
     this.plivoAuthToken = opts.plivoAuthToken ?? process.env.PLIVO_AUTH_TOKEN ?? '';
-    this.sampleRate = opts.sampleRate ?? 16000;
+    this.sampleRate = opts.sampleRate ?? 8000;
     this.host = opts.host ?? '0.0.0.0';
     this.port = opts.port ?? parseInt(process.env.PORT ?? '8080');
     this.agentName = opts.agentName ?? 'audio-stream-agent';
