@@ -23,7 +23,10 @@ Usage:
 """
 
 import asyncio
+import inspect
 import logging
+import platform
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Dict, Optional
 
@@ -38,6 +41,37 @@ except ImportError:
 
 from ..audio_stream_transport import AudioStreamTransport
 from ..serializers.plivo import PlivoFrameSerializer
+
+try:
+    import prometheus_client
+    HAS_PROMETHEUS = True
+except ImportError:
+    HAS_PROMETHEUS = False
+
+try:
+    from aiohttp import web
+    HAS_AIOHTTP = True
+except ImportError:
+    HAS_AIOHTTP = False
+
+
+# ─── Prometheus metrics ──────────────────────────────────────────────────────
+
+if HAS_PROMETHEUS:
+    STREAM_SESSIONS_TOTAL = prometheus_client.Counter(
+        "pipecat_audio_stream_sessions_total", "Total audio stream sessions",
+        ["nodename"],
+    )
+    STREAM_SESSION_DURATION = prometheus_client.Histogram(
+        "pipecat_audio_stream_session_duration_seconds", "Session duration",
+        buckets=[1, 5, 10, 30, 60, 120, 300, 600],
+    )
+    RUNNING_SESSIONS_GAUGE = prometheus_client.Gauge(
+        "pipecat_audio_stream_running_sessions", "Active sessions",
+    )
+    CPU_LOAD_GAUGE = prometheus_client.Gauge(
+        "pipecat_audio_stream_cpu_load", "CPU load percent",
+    )
 
 
 @dataclass
@@ -55,11 +89,15 @@ class WebsocketServerTransport:
 
     Matches pipecat.transports.websocket.server.WebsocketServerTransport interface.
     Wraps AudioStreamEndpoint (Rust) for WebSocket handling, codec negotiation,
-    and 20ms audio pacing. Manages session lifecycle and creates per-session
-    AudioStreamTransport instances.
+    and checkpoint-based audio pacing. Manages session lifecycle and creates
+    per-session AudioStreamTransport instances.
 
-    Supports @setup() for one-time resource loading (VAD models, turn detectors)
-    that are shared across all sessions — avoids reloading per call.
+    Features:
+    - @setup() for one-time resource loading (VAD, turn detectors)
+    - @handler() for per-session bot logic
+    - HTTP endpoints: /health, /metrics, /worker
+    - Prometheus metrics: session count, duration, CPU
+    - Active session tracking + graceful drain on shutdown
     """
 
     def __init__(
@@ -68,6 +106,8 @@ class WebsocketServerTransport:
         serializer: Optional[PlivoFrameSerializer] = None,
         params: Optional[WebsocketServerParams] = None,
         transport_params: Optional["TransportParams"] = None,
+        http_host: str = "0.0.0.0",
+        http_port: Optional[int] = None,
     ) -> None:
         s = serializer or (params.serializer if params else None) or PlivoFrameSerializer()
         self._listen_addr = s.listen_addr
@@ -75,11 +115,14 @@ class WebsocketServerTransport:
         self._plivo_auth_token = s.auth_token
         self._sample_rate = s.sample_rate
         self._transport_params = transport_params or (params.transport_params if params else None)
+        self._http_host = http_host
+        self._http_port = http_port
         self._handler_fnc: Optional[Callable[..., Coroutine]] = None
         self._setup_fnc: Optional[Callable] = None
         self._userdata: Dict[str, Any] = {}
         self._ep: Optional[AudioStreamEndpoint] = None
         self._active_sessions: dict[str, asyncio.Task] = {}
+        self._session_start_times: dict[str, float] = {}
 
     @property
     def endpoint(self) -> Optional[AudioStreamEndpoint]:
@@ -152,6 +195,11 @@ class WebsocketServerTransport:
         )
         logger.info("WebSocket server listening on %s", self._listen_addr)
 
+        # Start HTTP server if aiohttp available and port configured
+        http_task = None
+        if HAS_AIOHTTP and self._http_port:
+            http_task = asyncio.create_task(self._run_http_server())
+
         try:
             await self._session_loop()
         except asyncio.CancelledError:
@@ -164,6 +212,12 @@ class WebsocketServerTransport:
                 for task in self._active_sessions.values():
                     task.cancel()
                 await asyncio.gather(*self._active_sessions.values(), return_exceptions=True)
+            if http_task:
+                http_task.cancel()
+                try:
+                    await http_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             if self._ep:
                 self._ep.shutdown()
             logger.info("Server shut down")
@@ -199,10 +253,14 @@ class WebsocketServerTransport:
 
             task = asyncio.create_task(self._run_session(session_id, transport))
             self._active_sessions[session_id] = task
+            self._session_start_times[session_id] = time.monotonic()
 
     async def _run_session(self, session_id: str, transport: AudioStreamTransport) -> None:
+        if HAS_PROMETHEUS:
+            STREAM_SESSIONS_TOTAL.labels(nodename=platform.node()).inc()
+            RUNNING_SESSIONS_GAUGE.inc()
+
         try:
-            import inspect
             sig = inspect.signature(self._handler_fnc)
             if len(sig.parameters) >= 2:
                 await self._handler_fnc(transport, self._userdata)
@@ -213,5 +271,61 @@ class WebsocketServerTransport:
         except Exception:
             logger.exception("Session %s handler failed", session_id)
         finally:
+            duration = time.monotonic() - self._session_start_times.pop(session_id, time.monotonic())
             self._active_sessions.pop(session_id, None)
-            logger.info("Session %s ended", session_id)
+            if HAS_PROMETHEUS:
+                RUNNING_SESSIONS_GAUGE.dec()
+                STREAM_SESSION_DURATION.observe(duration)
+            logger.info("Session %s ended (%.1fs)", session_id, duration)
+
+    # ── HTTP server ──────────────────────────────────────────────────────
+
+    async def _run_http_server(self) -> None:
+        app = web.Application()
+        app.router.add_get("/health", self._health_handler)
+        app.router.add_get("/metrics", self._metrics_handler)
+        app.router.add_get("/worker", self._worker_handler)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, self._http_host, self._http_port)
+        logger.info("HTTP server on http://%s:%d (health, metrics, worker)",
+                     self._http_host, self._http_port)
+        await site.start()
+
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await runner.cleanup()
+
+    async def _health_handler(self, request: "web.Request") -> "web.Response":
+        if self._ep is None:
+            return web.Response(status=503, text="not ready")
+        return web.Response(text="ok")
+
+    async def _metrics_handler(self, request: "web.Request") -> "web.Response":
+        if HAS_PROMETHEUS:
+            RUNNING_SESSIONS_GAUGE.set(len(self._active_sessions))
+            try:
+                import psutil
+                CPU_LOAD_GAUGE.set(psutil.cpu_percent())
+            except ImportError:
+                pass
+            return web.Response(
+                text=prometheus_client.generate_latest().decode(),
+                content_type="text/plain",
+            )
+        return web.Response(text="prometheus_client not installed", status=501)
+
+    async def _worker_handler(self, request: "web.Request") -> "web.Response":
+        import json
+        return web.Response(
+            text=json.dumps({
+                "worker_type": "JT_AUDIO_STREAM",
+                "active_sessions": len(self._active_sessions),
+                "listen_addr": self._listen_addr,
+                "sample_rate": self._sample_rate,
+            }),
+            content_type="application/json",
+        )
