@@ -253,7 +253,6 @@ pub async fn handle_client_authenticate(
     let params = &mut via_header.params;
     params.retain(|p| !matches!(p, rsip::Param::Branch(_)));
     params.push(make_via_branch());
-    params.push(Param::Other("rport".into(), None));
     new_req.headers_mut().unique_push(via_header.into());
 
     new_req.headers_mut().retain(|h| {

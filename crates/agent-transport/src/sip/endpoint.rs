@@ -285,10 +285,13 @@ impl SipEndpoint {
 
             let (ch, cp) = pa.map(|a| (a.ip().to_string(), a.port())).unwrap_or((la.addr.host.to_string(), la.addr.port.map(u16::from).unwrap_or(5060)));
             let contact_uri: rsip::Uri = format!("sip:{}@{}:{}", user, ch, cp).try_into().map_err(|e| err(format!("{:?}", e)))?;
-            let _contact_hp: rsip::HostWithPort = format!("{}:{}", ch, cp).try_into().map_err(|e| err(format!("{:?}", e)))?;
-            let contact = Registration::create_nat_aware_contact(&user, Some(_contact_hp), &la);
             let mut reg = Registration::new(ei, Some(cred.clone()));
-            reg.contact = Some(contact);
+            // Set STUN address as initial public_address. Don't pin reg.contact —
+            // let rsipstack's fallback use public_address, which gets updated from
+            // the Via rport/received after 401 challenge. This ensures the Contact
+            // in the auth'd retry matches the actual source port seen by the server.
+            let stun_hp: rsip::HostWithPort = format!("{}:{}", ch, cp).try_into().map_err(|e| err(format!("{:?}", e)))?;
+            reg.public_address = Some(stun_hp);
 
             let server_uri: rsip::Uri = format!("sip:{}", srv).try_into().map_err(|e| err(format!("{:?}", e)))?;
             let resp = reg.register(server_uri.clone(), Some(exp)).await.map_err(err)?;
