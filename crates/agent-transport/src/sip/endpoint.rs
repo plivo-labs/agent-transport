@@ -69,6 +69,8 @@ struct EndpointState {
     aor: Option<rsip::Uri>,
     local_addr: Option<SipAddr>,
     public_addr: Option<SocketAddr>,
+    /// UDP connection for SIP signaling NAT keepalive.
+    udp_conn: Option<Arc<UdpConnection>>,
 }
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
@@ -231,7 +233,7 @@ impl SipEndpoint {
         let state = Arc::new(Mutex::new(EndpointState {
             registered: false, calls: HashMap::new(),
             dialog_layer: None, credential: None, contact_uri: None, aor: None,
-            local_addr: None, public_addr: None,
+            local_addr: None, public_addr: None, udp_conn: None,
         }));
 
         let (st, cc, etx2, lp, ua, isr, osr) = (state.clone(), cancel.clone(), etx.clone(), config.local_port, config.user_agent.clone(), config.input_sample_rate, config.output_sample_rate);
@@ -239,6 +241,7 @@ impl SipEndpoint {
             let addr: SocketAddr = format!("0.0.0.0:{}", lp).parse().unwrap();
             let udp = UdpConnection::create_connection(addr, None, Some(cc.clone())).await.map_err(err)?;
             let la = udp.get_addr().clone();
+            let udp_for_keepalive = udp.clone();
             let tl = TransportLayer::new(cc.clone());
             tl.add_transport(udp.into());
             let mut b = EndpointBuilder::new();
@@ -274,6 +277,7 @@ impl SipEndpoint {
             let mut s = st.lock().unwrap();
             s.dialog_layer = Some(dl);
             s.local_addr = Some(la);
+            s.udp_conn = Some(Arc::new(udp_for_keepalive));
             Ok::<_, EndpointError>(())
         })?;
 
@@ -327,6 +331,7 @@ impl SipEndpoint {
 
                 let re = reg.expires().max(50) as u64;
                 let (st2, etx2) = (st.clone(), etx.clone());
+                let cc2 = cc.clone();
                 tokio::spawn(async move {
                     loop {
                         tokio::select! { _ = cc.cancelled() => break, _ = tokio::time::sleep(std::time::Duration::from_secs(re)) => {} }
@@ -337,6 +342,24 @@ impl SipEndpoint {
                         }
                     }
                 });
+
+                // SIP signaling NAT keepalive — send CRLF pings to the registration proxy
+                // every 15s to keep the UDP NAT mapping alive between re-registrations.
+                // Without this, symmetric NAT may drop the mapping (typical 30s timeout)
+                // before the next re-registration, causing incoming INVITEs to be lost.
+                let udp_ka = st.lock().unwrap().udp_conn.clone();
+                if let Some(udp_ka) = udp_ka {
+                    let hp: rsip::HostWithPort = format!("{}:{}", srv, port).try_into().unwrap();
+                    let sip_dest = SipAddr::new(rsip::Transport::Udp, hp);
+                    tokio::spawn(async move {
+                        let mut iv = tokio::time::interval(std::time::Duration::from_secs(15));
+                        loop {
+                            tokio::select! { _ = cc2.cancelled() => break, _ = iv.tick() => {} }
+                            let _ = udp_ka.send_raw(b"\r\n\r\n", &sip_dest).await;
+                        }
+                    });
+                }
+
                 Ok(())
             } else {
                 let e = format!("SIP {}", resp.status_code);
