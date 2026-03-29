@@ -230,9 +230,24 @@ class SipOutputTransport(BaseOutputTransport):
         await loop.run_in_executor(None, lambda: self._ep.send_dtmf(self._cid, digit))
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
-        """Send audio frame to SIP call via Rust endpoint."""
+        """Send audio frame to SIP call via Rust endpoint with backpressure."""
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+
+        def _on_complete():
+            try:
+                loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(None))
+            except RuntimeError:
+                try:
+                    fut.set_result(None)
+                except Exception:
+                    pass
+
         try:
-            self._ep.send_audio_bytes(self._cid, frame.audio, frame.sample_rate, frame.num_channels)
+            self._ep.send_audio_notify(
+                self._cid, frame.audio, frame.sample_rate, frame.num_channels, _on_complete
+            )
+            await fut
             return True
         except Exception as e:
             logger.error("write_audio_frame failed: %s", e)

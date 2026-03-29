@@ -81,7 +81,7 @@ class AudioRecorder(AudioBufferProcessor):
             self._rust_recording = False
         await super().stop_recording()
         if self._path:
-            await self._call_event_handler("on_recording_stopped", self, self._path)
+            await self._call_event_handler("on_recording_stopped", self._path)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         if isinstance(frame, (EndFrame, CancelFrame)) and self._rust_recording:

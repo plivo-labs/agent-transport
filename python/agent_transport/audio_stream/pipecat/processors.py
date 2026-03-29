@@ -100,7 +100,7 @@ class AudioRecorder(AudioBufferProcessor):
         await super().stop_recording()
         # Notify file path
         if self._path:
-            await self._call_event_handler("on_recording_stopped", self, self._path)
+            await self._call_event_handler("on_recording_stopped", self._path)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         # Stop Rust recording before EndFrame/CancelFrame propagates to transport

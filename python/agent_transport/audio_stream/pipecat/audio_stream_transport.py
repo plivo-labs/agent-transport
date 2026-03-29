@@ -232,17 +232,28 @@ class AudioStreamOutputTransport(BaseOutputTransport):
         await loop.run_in_executor(None, lambda: self._ep.send_dtmf(self._sid, digit))
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
-        """Send audio frame to Plivo via Rust endpoint.
+        """Send audio frame via Rust endpoint with backpressure.
 
-        The Rust endpoint handles:
-        - Buffering in AudioBuffer with backpressure
-        - Resampling 16kHz → 8kHz if needed
-        - Encoding to negotiated format (mulaw/L16)
-        - Base64 encoding and JSON wrapping
-        - Paced sending at 20ms intervals
+        Uses send_audio_notify with async callback to apply backpressure
+        when the AudioBuffer is above threshold, preventing frame drops.
         """
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+
+        def _on_complete():
+            try:
+                loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(None))
+            except RuntimeError:
+                try:
+                    fut.set_result(None)
+                except Exception:
+                    pass
+
         try:
-            self._ep.send_audio_bytes(self._sid, frame.audio, frame.sample_rate, frame.num_channels)
+            self._ep.send_audio_notify(
+                self._sid, frame.audio, frame.sample_rate, frame.num_channels, _on_complete
+            )
+            await fut
             return True
         except Exception as e:
             logger.error("write_audio_frame failed: %s", e)
