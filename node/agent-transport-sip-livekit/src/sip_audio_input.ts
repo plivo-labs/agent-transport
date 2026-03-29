@@ -43,7 +43,7 @@ export class SipAudioInput {
           }
 
           if (self.attached) {
-            const sr = self.endpoint.sampleRate;
+            const sr = self.endpoint.inputSampleRate;
             const samplesPerChannel = bytes.length / 2;
             const data = Int16Array.from(new Int16Array(bytes.buffer, bytes.byteOffset, samplesPerChannel));
             controller.enqueue(new AudioFrame(data, sr, 1, samplesPerChannel));
@@ -65,7 +65,7 @@ export class SipAudioInput {
   private pushSilenceAndClose(controller: ReadableStreamDefaultController<AudioFrame>) {
     try {
       // Push 0.5s silence to flush STT (matches LiveKit _ParticipantAudioInputStream)
-      const sr = this.endpoint.sampleRate;
+      const sr = this.endpoint.inputSampleRate;
       const silentSamples = sr / 2; // 0.5s at pipeline rate
       controller.enqueue(new AudioFrame(new Int16Array(silentSamples), sr, 1, silentSamples));
     } catch { /* stream already closed */ }

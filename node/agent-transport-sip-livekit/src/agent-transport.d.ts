@@ -22,7 +22,8 @@ declare module 'agent-transport' {
     stunServer?: string;
     codecs?: string[];
     logLevel?: number;
-    sampleRate?: number;
+    inputSampleRate?: number;
+    outputSampleRate?: number;
     jitterBuffer?: boolean;
     plc?: boolean;
     comfortNoise?: boolean;
@@ -44,7 +45,8 @@ declare module 'agent-transport' {
     listenAddr?: string;
     plivoAuthId?: string;
     plivoAuthToken?: string;
-    sampleRate?: number;
+    inputSampleRate?: number;
+    outputSampleRate?: number;
     autoHangup?: boolean;
   }
 
@@ -81,7 +83,8 @@ declare module 'agent-transport' {
     detectBeep(callId: string, timeoutMs?: number, minDurationMs?: number, maxDurationMs?: number): void;
     startRecording(callId: string, path: string, stereo?: boolean): void;
     stopRecording(callId: string): void;
-    get sampleRate(): number;
+    get inputSampleRate(): number;
+    get outputSampleRate(): number;
     get numChannels(): number;
     shutdown(): void;
   }
@@ -115,7 +118,8 @@ declare module 'agent-transport' {
     pollEvent(): EventInfo | null;
     startRecording(sessionId: string, path: string, stereo?: boolean): void;
     stopRecording(sessionId: string): void;
-    get sampleRate(): number;
+    get inputSampleRate(): number;
+    get outputSampleRate(): number;
     get numChannels(): number;
     shutdown(): void;
   }

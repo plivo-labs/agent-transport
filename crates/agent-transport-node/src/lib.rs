@@ -142,8 +142,10 @@ pub struct EndpointConfig {
     pub stun_server: Option<String>,
     pub codecs: Option<Vec<String>>,
     pub log_level: Option<u32>,
-    /// Pipeline sample rate in Hz (default: 8000).
-    pub sample_rate: Option<u32>,
+    /// Input sample rate in Hz (default: 8000).
+    pub input_sample_rate: Option<u32>,
+    /// Output sample rate in Hz (default: 8000).
+    pub output_sample_rate: Option<u32>,
     /// Enable adaptive jitter buffer (requires jitter-buffer feature).
     pub jitter_buffer: Option<bool>,
     /// Enable packet loss concealment (requires plc feature).
@@ -309,7 +311,8 @@ impl SipEndpoint {
             stun_server: None,
             codecs: None,
             log_level: None,
-            sample_rate: None,
+            input_sample_rate: None,
+            output_sample_rate: None,
             jitter_buffer: None,
             plc: None,
             comfort_noise: None,
@@ -331,7 +334,8 @@ impl SipEndpoint {
             stun_server: cfg.stun_server.unwrap_or_else(|| "stun-fb.plivo.com:3478".into()),
             codecs: codec_list,
             log_level: cfg.log_level.unwrap_or(3),
-            sample_rate: cfg.sample_rate.unwrap_or(8000),
+            input_sample_rate: cfg.input_sample_rate.unwrap_or(8000),
+            output_sample_rate: cfg.output_sample_rate.unwrap_or(8000),
             audio_processing: agent_transport_core::AudioProcessingConfig {
                 jitter_buffer: cfg.jitter_buffer.unwrap_or(false),
                 plc: cfg.plc.unwrap_or(false),
@@ -576,8 +580,13 @@ impl SipEndpoint {
 
     /// Audio sample rate in Hz.
     #[napi(getter)]
-    pub fn sample_rate(&self) -> u32 {
-        self.inner.sample_rate()
+    pub fn input_sample_rate(&self) -> u32 {
+        self.inner.input_sample_rate()
+    }
+
+    #[napi(getter)]
+    pub fn output_sample_rate(&self) -> u32 {
+        self.inner.output_sample_rate()
     }
 
     /// Number of audio channels (always 1 = mono).
@@ -611,7 +620,7 @@ impl SipEndpoint {
         max_duration_ms: Option<u32>,
     ) -> Result<()> {
         let config = RustBeepConfig {
-            sample_rate: self.inner.sample_rate(),
+            sample_rate: self.inner.input_sample_rate(),
             timeout_ms: timeout_ms.unwrap_or(30000),
             min_duration_ms: min_duration_ms.unwrap_or(80),
             max_duration_ms: max_duration_ms.unwrap_or(5000),
@@ -725,7 +734,8 @@ pub struct AudioStreamConfigJs {
     pub listen_addr: Option<String>,
     pub plivo_auth_id: Option<String>,
     pub plivo_auth_token: Option<String>,
-    pub sample_rate: Option<u32>,
+    pub input_sample_rate: Option<u32>,
+    pub output_sample_rate: Option<u32>,
     pub auto_hangup: Option<bool>,
 }
 
@@ -738,10 +748,11 @@ pub struct AudioStreamEndpoint {
 impl AudioStreamEndpoint {
     #[napi(constructor)]
     pub fn new(config: Option<AudioStreamConfigJs>) -> Result<Self> {
-        let cfg = config.unwrap_or(AudioStreamConfigJs { listen_addr: None, plivo_auth_id: None, plivo_auth_token: None, sample_rate: None, auto_hangup: None });
+        let cfg = config.unwrap_or(AudioStreamConfigJs { listen_addr: None, plivo_auth_id: None, plivo_auth_token: None, input_sample_rate: None, output_sample_rate: None, auto_hangup: None });
         let rc = RustAudioStreamConfig {
             listen_addr: cfg.listen_addr.unwrap_or_else(|| "0.0.0.0:8080".into()),
-            sample_rate: cfg.sample_rate.unwrap_or(8000),
+            input_sample_rate: cfg.input_sample_rate.unwrap_or(8000),
+            output_sample_rate: cfg.output_sample_rate.unwrap_or(8000),
             auto_hangup: cfg.auto_hangup.unwrap_or(true),
         };
         let protocol = std::sync::Arc::new(PlivoProtocol::new(
@@ -873,7 +884,7 @@ impl AudioStreamEndpoint {
         max_duration_ms: Option<u32>,
     ) -> Result<()> {
         let config = RustBeepConfig {
-            sample_rate: self.inner.sample_rate(),
+            sample_rate: self.inner.input_sample_rate(),
             timeout_ms: timeout_ms.unwrap_or(30000),
             min_duration_ms: min_duration_ms.unwrap_or(80),
             max_duration_ms: max_duration_ms.unwrap_or(5000),
@@ -906,7 +917,10 @@ impl AudioStreamEndpoint {
     }
 
     #[napi(getter)]
-    pub fn sample_rate(&self) -> u32 { self.inner.sample_rate() }
+    pub fn input_sample_rate(&self) -> u32 { self.inner.input_sample_rate() }
+
+    #[napi(getter)]
+    pub fn output_sample_rate(&self) -> u32 { self.inner.output_sample_rate() }
 
     #[napi(getter)]
     pub fn num_channels(&self) -> u32 { 1 }

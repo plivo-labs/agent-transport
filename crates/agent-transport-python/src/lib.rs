@@ -250,13 +250,14 @@ impl SipEndpoint {
     ///   jitter_buffer: Enable adaptive jitter buffer (feature: jitter-buffer)
     ///   plc: Enable packet loss concealment (feature: plc)
     ///   comfort_noise: Enable comfort noise generation (feature: comfort-noise)
-    #[pyo3(signature = (sip_server="phone.plivo.com", stun_server="stun-fb.plivo.com:3478", codecs=None, log_level=3, sample_rate=8000, jitter_buffer=false, plc=false, comfort_noise=false))]
+    #[pyo3(signature = (sip_server="phone.plivo.com", stun_server="stun-fb.plivo.com:3478", codecs=None, log_level=3, input_sample_rate=8000, output_sample_rate=8000, jitter_buffer=false, plc=false, comfort_noise=false))]
     fn new(
         sip_server: &str,
         stun_server: &str,
         codecs: Option<Vec<String>>,
         log_level: u32,
-        sample_rate: u32,
+        input_sample_rate: u32,
+        output_sample_rate: u32,
         jitter_buffer: bool,
         plc: bool,
         comfort_noise: bool,
@@ -276,7 +277,8 @@ impl SipEndpoint {
             stun_server: stun_server.into(),
             codecs: codec_list,
             log_level,
-            sample_rate,
+            input_sample_rate,
+            output_sample_rate,
             audio_processing: agent_transport_core::AudioProcessingConfig {
                 jitter_buffer,
                 plc,
@@ -542,8 +544,8 @@ impl SipEndpoint {
 
     /// Audio sample rate in Hz.
     #[getter]
-    fn sample_rate(&self) -> u32 {
-        self.inner.sample_rate()
+    fn input_sample_rate(&self) -> u32 {
+        self.inner.input_sample_rate()
     }
 
     /// Number of audio channels (always 1 = mono).
@@ -577,7 +579,7 @@ impl SipEndpoint {
         max_duration_ms: u32,
     ) -> PyResult<()> {
         let config = RustBeepConfig {
-            sample_rate: self.inner.sample_rate(),
+            sample_rate: self.inner.input_sample_rate(),
             timeout_ms,
             min_duration_ms,
             max_duration_ms,
@@ -705,10 +707,10 @@ struct AudioStreamEndpoint {
 #[pymethods]
 impl AudioStreamEndpoint {
     #[new]
-    #[pyo3(signature = (listen_addr="0.0.0.0:8080", plivo_auth_id="", plivo_auth_token="", sample_rate=8000, auto_hangup=true))]
-    fn new(listen_addr: &str, plivo_auth_id: &str, plivo_auth_token: &str, sample_rate: u32, auto_hangup: bool) -> PyResult<Self> {
+    #[pyo3(signature = (listen_addr="0.0.0.0:8080", plivo_auth_id="", plivo_auth_token="", input_sample_rate=8000, output_sample_rate=8000, auto_hangup=true))]
+    fn new(listen_addr: &str, plivo_auth_id: &str, plivo_auth_token: &str, input_sample_rate: u32, output_sample_rate: u32, auto_hangup: bool) -> PyResult<Self> {
         let config = RustAudioStreamConfig {
-            listen_addr: listen_addr.into(), sample_rate, auto_hangup,
+            listen_addr: listen_addr.into(), input_sample_rate, output_sample_rate, auto_hangup,
         };
         let protocol = std::sync::Arc::new(PlivoProtocol::new(plivo_auth_id.into(), plivo_auth_token.into()));
         let inner = RustAudioStreamEndpoint::new(config, protocol).map_err(py_err)?;
@@ -826,7 +828,7 @@ impl AudioStreamEndpoint {
         max_duration_ms: u32,
     ) -> PyResult<()> {
         let config = RustBeepConfig {
-            sample_rate: self.inner.sample_rate(),
+            sample_rate: self.inner.input_sample_rate(),
             timeout_ms,
             min_duration_ms,
             max_duration_ms,
@@ -884,7 +886,7 @@ impl AudioStreamEndpoint {
     }
 
     #[getter]
-    fn sample_rate(&self) -> u32 { self.inner.sample_rate() }
+    fn input_sample_rate(&self) -> u32 { self.inner.input_sample_rate() }
 
     fn shutdown(&self, py: Python) -> PyResult<()> {
         let inner = &self.inner;

@@ -64,18 +64,18 @@ pub struct AudioStreamEndpoint {
 
 impl AudioStreamEndpoint {
     pub fn new(config: AudioStreamConfig, protocol: Arc<dyn StreamProtocol>) -> Result<Self> {
-        if config.sample_rate == 0 { return Err(EndpointError::Other("sample_rate must be > 0".into())); }
+        if config.input_sample_rate == 0 || config.output_sample_rate == 0 { return Err(EndpointError::Other("sample_rate must be > 0".into())); }
         let rt = Runtime::new().map_err(|e| EndpointError::Other(e.to_string()))?;
         let (etx, erx) = crossbeam_channel::unbounded();
         let cancel = CancellationToken::new();
         let sessions = Arc::new(Mutex::new(HashMap::new()));
 
-        let (addr, sess, etx2, cc, sr, proto) = (
+        let (addr, sess, etx2, cc, isr, osr, proto) = (
             config.listen_addr.clone(), sessions.clone(), etx.clone(),
-            cancel.clone(), config.sample_rate, protocol.clone(),
+            cancel.clone(), config.input_sample_rate, config.output_sample_rate, protocol.clone(),
         );
         rt.spawn(async move {
-            if let Err(e) = run_ws_server(&addr, sess, etx2, cc, sr, proto).await {
+            if let Err(e) = run_ws_server(&addr, sess, etx2, cc, isr, osr, proto).await {
                 error!("WS server: {}", e);
             }
         });
@@ -214,7 +214,7 @@ impl AudioStreamEndpoint {
 
     pub fn start_recording(&self, session_id: &str, path: &str, stereo: bool) -> Result<()> {
         let mode = if stereo { crate::recorder::RecordingMode::Stereo } else { crate::recorder::RecordingMode::Mono };
-        let sample_rate = self.config.sample_rate;
+        let sample_rate = self.config.output_sample_rate;
         let rec = self.recording_mgr.start(session_id, path, mode, sample_rate);
         let s = self.sessions.lock().unwrap();
         if let Some(sess) = s.get(session_id) {
@@ -279,13 +279,14 @@ impl AudioStreamEndpoint {
     }
 
     pub fn queued_frames(&self, session_id: &str) -> Result<usize> {
-        let spf = (self.config.sample_rate * 20 / 1000) as usize;
+        let spf = (self.config.output_sample_rate * 20 / 1000) as usize;
         let s = self.sessions.lock().unwrap();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         Ok(sess.audio_buf.len() / spf)
     }
 
-    pub fn sample_rate(&self) -> u32 { self.config.sample_rate }
+    pub fn input_sample_rate(&self) -> u32 { self.config.input_sample_rate }
+    pub fn output_sample_rate(&self) -> u32 { self.config.output_sample_rate }
     pub fn events(&self) -> Receiver<EndpointEvent> { self.event_rx.clone() }
 
     pub fn shutdown(&self) -> Result<()> {
@@ -309,7 +310,7 @@ async fn run_ws_server(
     sessions: Arc<Mutex<HashMap<String, StreamSession>>>,
     etx: Sender<EndpointEvent>,
     cancel: CancellationToken,
-    pipeline_rate: u32,
+    input_sample_rate: u32, output_sample_rate: u32,
     protocol: Arc<dyn StreamProtocol>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
@@ -322,7 +323,7 @@ async fn run_ws_server(
                 let ws = tokio_tungstenite::accept_async(stream).await?;
                 let sid = format!("ws-{:016x}", rand::random::<u64>());
                 let (s, e, c, p) = (sessions.clone(), etx.clone(), cancel.clone(), protocol.clone());
-                tokio::spawn(async move { handle_ws(ws, sid, s, e, c, pipeline_rate, p).await; });
+                tokio::spawn(async move { handle_ws(ws, sid, s, e, c, input_sample_rate, output_sample_rate, p).await; });
             }
         }
     }
@@ -337,7 +338,7 @@ async fn handle_ws(
     sessions: Arc<Mutex<HashMap<String, StreamSession>>>,
     etx: Sender<EndpointEvent>,
     cancel: CancellationToken,
-    pipeline_rate: u32,
+    input_sample_rate: u32, output_sample_rate: u32,
     protocol: Arc<dyn StreamProtocol>,
 ) {
     use futures_util::{SinkExt, StreamExt};
@@ -382,8 +383,8 @@ async fn handle_ws(
                         encoding = enc;
                         upsampler = None; // Reset for new encoding
 
-                        let audio_buf = Arc::new(AudioBuffer::with_queue_size(200, pipeline_rate));
-                        let bg_audio_buf = Arc::new(AudioBuffer::with_queue_size(200, pipeline_rate));
+                        let audio_buf = Arc::new(AudioBuffer::with_queue_size(200, output_sample_rate));
+                        let bg_audio_buf = Arc::new(AudioBuffer::with_queue_size(200, output_sample_rate));
                         let muted = Arc::new(AtomicBool::new(false));
                         let paused = Arc::new(AtomicBool::new(false));
                         let playout_notify = Arc::new((Mutex::new(false), Condvar::new()));
@@ -402,13 +403,13 @@ async fn handle_ws(
                         let sln = send_loop_notify.clone();
                         let sc = session_cancel.clone();
                         let stream_id_for_loop = stream_id.clone();
-                        let chunk_spf: usize = (pipeline_rate * 100 / 1000) as usize;
+                        let chunk_spf: usize = (output_sample_rate * 100 / 1000) as usize;
                         let cp_counter = Arc::new(AtomicU64::new(0));
                         let send_proto = protocol.clone();
                         let send_enc = encoding;
 
                         tokio::spawn(async move {
-                            let mut resampler = crate::sip::resampler::Resampler::new_voip(pipeline_rate, send_enc.sample_rate());
+                            let mut resampler = crate::sip::resampler::Resampler::new_voip(output_sample_rate, send_enc.sample_rate());
 
                             loop {
                                 if sc.is_cancelled() { break; }
@@ -499,7 +500,7 @@ async fn handle_ws(
                             let native = encoding.decode(&payload);
                             let wire_rate = encoding.sample_rate();
                             if upsampler.is_none() {
-                                upsampler = crate::sip::resampler::Resampler::new_voip(wire_rate, pipeline_rate);
+                                upsampler = crate::sip::resampler::Resampler::new_voip(wire_rate, input_sample_rate);
                             }
                             if let Some(ref mut us) = upsampler {
                                 us.process(&native).to_vec()
@@ -533,7 +534,7 @@ async fn handle_ws(
                         }
 
                         let n = pcm.len() as u32;
-                        let _ = itx.try_send(AudioFrame { data: pcm, sample_rate: pipeline_rate, num_channels: 1, samples_per_channel: n });
+                        let _ = itx.try_send(AudioFrame { data: pcm, sample_rate: input_sample_rate, num_channels: 1, samples_per_channel: n });
                     }
 
                     StreamEvent::Dtmf { digit } => {

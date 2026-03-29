@@ -83,7 +83,7 @@ export class SipAudioOutput extends EventEmitter {
     super();
     this.endpoint = endpoint;
     this.callId = callId;
-    this.sampleRate = sampleRate ?? endpoint.sampleRate;
+    this.sampleRate = sampleRate ?? endpoint.outputSampleRate;
     this.nextInChain = nextInChain;
 
     // Chain event forwarding (matches AudioOutput base class)

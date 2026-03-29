@@ -67,7 +67,7 @@ class SipAudioInput(AudioInput):
         self._cid = call_id
         self._label = label
         self._source = source
-        self._sample_rate = endpoint.sample_rate
+        self._sample_rate = endpoint.input_sample_rate
         self._num_channels = 1
 
         self._data_ch: Chan[rtc.AudioFrame] = Chan()
@@ -186,7 +186,7 @@ class SipAudioOutput(AudioOutput):
         next_in_chain=None,
         **kwargs,
     ) -> None:
-        _sample_rate = sample_rate or endpoint.sample_rate
+        _sample_rate = sample_rate or endpoint.output_sample_rate
 
         super().__init__(
             label=label,

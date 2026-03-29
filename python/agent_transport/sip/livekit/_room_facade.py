@@ -120,7 +120,7 @@ class _TransportLocalParticipant:
         Rust send loop mixes this with agent voice before encoding.
         """
         try:
-            sr = self._ep.sample_rate if self._ep is not None else 8000
+            sr = self._ep.input_sample_rate if self._ep is not None else 8000
             stream = rtc.AudioStream.from_track(
                 track=track, sample_rate=sr, num_channels=1)
             logger.debug("Forwarding published track %s to background mixer", pub_sid)

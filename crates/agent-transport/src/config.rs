@@ -78,11 +78,13 @@ pub struct EndpointConfig {
     /// Registration expiry in seconds
     pub register_expires: u32,
 
-    /// Pipeline sample rate in Hz (default: 8000).
-    /// Audio frames exchanged with Python/Node adapters use this rate.
-    /// SIP codecs (G.711) are natively 8kHz; resampling is applied automatically
-    /// when the pipeline rate differs from the codec rate.
-    pub sample_rate: u32,
+    /// Input sample rate in Hz (default: 8000).
+    /// Audio frames from the codec are resampled to this rate before delivery.
+    pub input_sample_rate: u32,
+
+    /// Output sample rate in Hz (default: 8000).
+    /// Audio frames from TTS are expected at this rate and resampled to codec rate.
+    pub output_sample_rate: u32,
 
     /// Optional audio processing settings.
     /// Requires corresponding Cargo features: `jitter-buffer`, `plc`, `comfort-noise`.
@@ -132,7 +134,8 @@ impl Default for EndpointConfig {
             user_agent: "agent-transport/0.1.0".into(),
             local_port: 0,
             register_expires: 120,
-            sample_rate: 8000,
+            input_sample_rate: 8000,
+            output_sample_rate: 8000,
             audio_processing: AudioProcessingConfig::default(),
         }
     }
