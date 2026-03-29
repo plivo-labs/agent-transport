@@ -324,7 +324,7 @@ class SipAudioOutput(AudioOutput):
 
         wait_for_playout = asyncio.create_task(_wait_buffered_audio())
         await asyncio.wait(
-            [wait_for_playout, wait_for_interruption],
+            {wait_for_playout, wait_for_interruption},
             return_when=asyncio.FIRST_COMPLETED,
         )
 

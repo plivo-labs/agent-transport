@@ -366,9 +366,6 @@ export class AgentServer {
     let resolveEnded!: () => void;
     const callEnded = new Promise<void>((r) => { resolveEnded = r; });
 
-    const callEntry: { promise: Promise<void>; resolveEnded: () => void; room?: any } = { promise: Promise.resolve(), resolveEnded };
-    this.activeCalls.set(callId, callEntry);
-
     const ctx = new JobContext({
       callId,
       remoteUri,
@@ -380,7 +377,6 @@ export class AgentServer {
       resolveCallEnded: resolveEnded,
       proc: this.proc,
     });
-    callEntry.room = ctx.room;
 
     const runCall = async () => {
       this.sipCallsTotal[direction]++;
@@ -457,7 +453,8 @@ export class AgentServer {
       }
     };
 
-    callEntry.promise = runCall();
+    const callPromise = runCall();
+    this.activeCalls.set(callId, { promise: callPromise, resolveEnded, room: ctx.room });
   }
 
   // ─── HTTP server ────────────────────────────────────────────────
@@ -544,7 +541,12 @@ export class AgentServer {
             });
 
             mediaReady.then((ok) => {
-              if (ok) this.startCall(callId, destination, 'outbound');
+              if (ok) {
+                this.startCall(callId, destination, 'outbound');
+              } else {
+                console.warn(`Outbound call ${callId} timed out waiting for media`);
+                try { this.ep!.hangup(callId); } catch {}
+              }
             });
 
             res.writeHead(200, { 'Content-Type': 'application/json' });

@@ -21,7 +21,7 @@
  */
 
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
-import { hostname } from 'node:os';
+import { hostname, cpus } from 'node:os';
 import { AudioStreamEndpoint } from 'agent-transport';
 import { AudioStreamJobContext } from './audio_stream_context.js';
 import { JobProcess } from './agent_server.js';
@@ -42,28 +42,34 @@ type SetupFn = () => Record<string, unknown>;
 
 class LoadMonitor {
   private samples: number[] = [];
-  private interval: ReturnType<typeof setInterval>;
+  private readonly windowSize = 5;
+  private timer: ReturnType<typeof setInterval>;
 
   constructor() {
-    this.interval = setInterval(() => this.sample(), 500);
+    this.timer = setInterval(() => this.sample(), 500);
+    this.timer.unref();
   }
 
   private sample(): void {
-    const usage = process.cpuUsage();
-    const total = (usage.user + usage.system) / 1e6;
-    this.samples.push(total);
-    if (this.samples.length > 5) this.samples.shift();
+    const cpuList = cpus();
+    let idle = 0;
+    let total = 0;
+    for (const cpu of cpuList) {
+      idle += cpu.times.idle;
+      total += cpu.times.user + cpu.times.nice + cpu.times.sys + cpu.times.irq + cpu.times.idle;
+    }
+    const usage = 1 - idle / total;
+    this.samples.push(usage);
+    if (this.samples.length > this.windowSize) this.samples.shift();
   }
 
   getLoad(): number {
-    if (this.samples.length < 2) return 0;
-    const diff = this.samples[this.samples.length - 1] - this.samples[0];
-    const elapsed = this.samples.length * 0.5;
-    return Math.min(diff / elapsed, 1.0);
+    if (this.samples.length === 0) return 0;
+    return this.samples.reduce((a, b) => a + b, 0) / this.samples.length;
   }
 
   stop(): void {
-    clearInterval(this.interval);
+    clearInterval(this.timer);
   }
 }
 
@@ -284,9 +290,6 @@ export class AudioStreamServer {
     let resolveEnded!: () => void;
     const callEnded = new Promise<void>((r) => { resolveEnded = r; });
 
-    const entry: { promise: Promise<void>; resolveEnded: () => void; room?: any } = { promise: Promise.resolve(), resolveEnded };
-    this.activeSessions.set(sessionId, entry);
-
     const ctx = new AudioStreamJobContext({
       sessionId,
       callId,
@@ -300,7 +303,6 @@ export class AudioStreamServer {
       resolveCallEnded: resolveEnded,
       proc: this.proc,
     });
-    entry.room = ctx.room;
 
     const runSession = async () => {
       this.sessionCount++;
@@ -350,7 +352,8 @@ export class AudioStreamServer {
       }
     };
 
-    entry.promise = runSession();
+    const sessionPromise = runSession();
+    this.activeSessions.set(sessionId, { promise: sessionPromise, resolveEnded, room: ctx.room });
   }
 
   // ─── HTTP server ────────────────────────────────────────────────────

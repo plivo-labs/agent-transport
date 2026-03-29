@@ -64,6 +64,7 @@ pub struct AudioStreamEndpoint {
 
 impl AudioStreamEndpoint {
     pub fn new(config: AudioStreamConfig, protocol: Arc<dyn StreamProtocol>) -> Result<Self> {
+        if config.sample_rate == 0 { return Err(EndpointError::Other("sample_rate must be > 0".into())); }
         let rt = Runtime::new().map_err(|e| EndpointError::Other(e.to_string()))?;
         let (etx, erx) = crossbeam_channel::unbounded();
         let cancel = CancellationToken::new();

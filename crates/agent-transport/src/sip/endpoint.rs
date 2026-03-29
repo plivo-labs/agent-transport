@@ -98,7 +98,7 @@ async fn setup_rtp(
 
     let (itx, irx) = crossbeam_channel::unbounded();
     let send_handle = rtp.start_send_loop(ctx.audio_buf.clone(), ctx.bg_audio_buf.clone(), ctx.muted.clone(), ctx.paused.clone(), ctx.playout_notify.clone(), ctx.recorder.clone());
-    let recv_handle = rtp.start_recv_loop(itx, etx.clone(), call_id.to_string(), ctx.beep_detector.clone(), ctx.held.clone(), ctx.recorder.clone());
+    let recv_handle = rtp.start_recv_loop(itx, etx.clone(), call_id.to_string(), ctx.session.direction, ctx.beep_detector.clone(), ctx.held.clone(), ctx.recorder.clone());
     ctx.rtp_tasks = vec![send_handle, recv_handle];
 
     ctx.rtp = Some(rtp);
@@ -222,6 +222,7 @@ pub struct SipEndpoint {
 
 impl SipEndpoint {
     pub fn new(config: EndpointConfig) -> Result<Self> {
+        if config.sample_rate == 0 { return Err(EndpointError::Other("sample_rate must be > 0".into())); }
         let rt = Runtime::new().map_err(err)?;
         let (etx, erx) = crossbeam_channel::unbounded();
         let cancel = CancellationToken::new();
