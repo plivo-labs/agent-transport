@@ -863,6 +863,29 @@ impl AudioStreamEndpoint {
     }
 
     #[napi]
+    pub fn detect_beep(
+        &self,
+        session_id: String,
+        timeout_ms: Option<u32>,
+        min_duration_ms: Option<u32>,
+        max_duration_ms: Option<u32>,
+    ) -> Result<()> {
+        let config = RustBeepConfig {
+            sample_rate: self.inner.sample_rate(),
+            timeout_ms: timeout_ms.unwrap_or(30000),
+            min_duration_ms: min_duration_ms.unwrap_or(80),
+            max_duration_ms: max_duration_ms.unwrap_or(5000),
+            ..Default::default()
+        };
+        self.inner.detect_beep(&session_id, config).map_err(napi_err)
+    }
+
+    #[napi]
+    pub fn cancel_beep_detection(&self, session_id: String) -> Result<()> {
+        self.inner.cancel_beep_detection(&session_id).map_err(napi_err)
+    }
+
+    #[napi]
     pub fn start_recording(&self, session_id: String, path: String, stereo: Option<bool>) -> Result<()> {
         self.inner.start_recording(&session_id, &path, stereo.unwrap_or(true)).map_err(napi_err)
     }

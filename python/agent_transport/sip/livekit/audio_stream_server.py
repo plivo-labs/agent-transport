@@ -590,6 +590,22 @@ class AudioStreamServer:
                                           participant=ctx._room._remote)
                         ctx._room.emit("sip_dtmf_received", dtmf_ev)
 
+            elif ev_type == "beep_detected":
+                session_id = ev.get("call_id", "")
+                freq = ev.get("frequency_hz", 0.0)
+                dur = ev.get("duration_ms", 0)
+                logger.info("Beep detected on session %s (freq=%.0fHz, dur=%dms)", session_id, freq, dur)
+                ctx = self._session_contexts.get(session_id)
+                if ctx:
+                    ctx._emit("beep_detected", freq, dur)
+
+            elif ev_type == "beep_timeout":
+                session_id = ev.get("call_id", "")
+                logger.debug("Beep timeout on session %s", session_id)
+                ctx = self._session_contexts.get(session_id)
+                if ctx:
+                    ctx._emit("beep_timeout")
+
     async def _start_session(self, session_id: str, call_id: str, stream_id: str, extra_headers: dict) -> None:
         session_ended = asyncio.Event()
         self._session_ended_events[session_id] = session_ended
