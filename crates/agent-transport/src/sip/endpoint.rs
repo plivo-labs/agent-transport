@@ -65,6 +65,8 @@ struct EndpointState {
     dialog_layer: Option<Arc<DialogLayer>>,
     credential: Option<Credential>,
     contact_uri: Option<rsip::Uri>,
+    /// Address of Record — sip:user@domain — used as From header in outbound calls.
+    aor: Option<rsip::Uri>,
     local_addr: Option<SipAddr>,
     public_addr: Option<SocketAddr>,
 }
@@ -228,7 +230,7 @@ impl SipEndpoint {
         let cancel = CancellationToken::new();
         let state = Arc::new(Mutex::new(EndpointState {
             registered: false, calls: HashMap::new(),
-            dialog_layer: None, credential: None, contact_uri: None,
+            dialog_layer: None, credential: None, contact_uri: None, aor: None,
             local_addr: None, public_addr: None,
         }));
 
@@ -302,6 +304,8 @@ impl SipEndpoint {
             reg.public_address = Some(stun_hp);
 
             let server_uri: rsip::Uri = format!("sip:{}", srv).try_into().map_err(|e| err(format!("{:?}", e)))?;
+            // AOR (Address of Record) — sip:user@domain — used as From in outbound calls
+            let aor: rsip::Uri = format!("sip:{}@{}", user, srv).try_into().map_err(|e| err(format!("{:?}", e)))?;
             let resp = reg.register(server_uri.clone(), Some(exp)).await.map_err(err)?;
 
             if resp.status_code == rsip::StatusCode::OK {
@@ -312,11 +316,11 @@ impl SipEndpoint {
                     info!("Registered {}@{} (NAT: {}:{})", user, srv, h, p);
                     let uri: rsip::Uri = format!("sip:{}@{}:{}", user, h, p).try_into().map_err(|e| err(format!("{:?}", e)))?;
                     let nat_addr = format!("{}:{}", h, p).parse::<std::net::SocketAddr>().ok();
-                    { let mut s = st.lock().unwrap(); s.registered = true; s.credential = Some(cred); s.contact_uri = Some(uri.clone()); s.public_addr = nat_addr.or(pa); }
+                    { let mut s = st.lock().unwrap(); s.registered = true; s.credential = Some(cred); s.contact_uri = Some(uri.clone()); s.aor = Some(aor.clone()); s.public_addr = nat_addr.or(pa); }
                     uri
                 } else {
                     info!("Registered {}@{}", user, srv);
-                    { let mut s = st.lock().unwrap(); s.registered = true; s.credential = Some(cred); s.contact_uri = Some(contact_uri.clone()); s.public_addr = pa; }
+                    { let mut s = st.lock().unwrap(); s.registered = true; s.credential = Some(cred); s.contact_uri = Some(contact_uri.clone()); s.aor = Some(aor.clone()); s.public_addr = pa; }
                     contact_uri
                 };
                 let _ = etx.try_send(EndpointEvent::Registered);
@@ -358,26 +362,27 @@ impl SipEndpoint {
     }
 
     /// Make an outbound call with an optional From URI.
-    /// If `from_uri` is None, uses the registered contact URI.
+    /// If `from_uri` is None, uses the AOR (sip:user@domain) from registration.
     pub fn call_with_from(&self, dest_uri: &str, from_uri: Option<&str>, headers: Option<HashMap<String, String>>) -> Result<String> {
         let (dest, cfg, st, etx) = (dest_uri.to_string(), self.config.clone(), self.state.clone(), self.event_tx.clone());
         let from_override = from_uri.map(|s| s.to_string());
         self.runtime.block_on(async {
-            let (dl, cred, contact, la, pa) = {
+            let (dl, cred, contact, aor, la, pa) = {
                 let s = st.lock().unwrap();
                 (s.dialog_layer.clone().ok_or(EndpointError::NotInitialized)?,
                  s.credential.clone().ok_or(EndpointError::NotRegistered)?,
                  s.contact_uri.clone().ok_or(EndpointError::NotRegistered)?,
+                 s.aor.clone().ok_or(EndpointError::NotRegistered)?,
                  s.local_addr.clone().ok_or(EndpointError::NotInitialized)?,
                  s.public_addr)
             };
             let la_str = la.addr.host.to_string();
 
-            // Resolve the From/caller URI
+            // Resolve the From/caller URI — AOR (sip:user@domain), not Contact (sip:user@nat-ip:port)
             let caller: rsip::Uri = if let Some(ref from) = from_override {
                 from.clone().try_into().map_err(|e| err(format!("invalid from_uri: {:?}", e)))?
             } else {
-                contact.clone()
+                aor
             };
 
             // SDP offer for the INVITE
