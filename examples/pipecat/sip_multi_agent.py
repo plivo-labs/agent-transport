@@ -2,7 +2,6 @@
 """Pipecat multi-agent over SIP via agent-transport.
 
 Greeter → Sales/Support handoff via function calling.
-Matches LiveKit multi-agent pattern adapted for Pipecat pipelines.
 
 Prerequisites:
     pip install "pipecat-ai[deepgram,openai,silero]" python-dotenv loguru
@@ -20,6 +19,7 @@ from agent_transport import SipEndpoint
 from agent_transport.sip.pipecat import SipTransport
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -28,6 +28,10 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
+)
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
+    TurnAnalyzerUserTurnStopStrategy,
 )
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
@@ -92,8 +96,9 @@ AGENTS = {
     ),
 }
 
-# Load VAD once — shared across all calls
+# Load models once at module level — shared across all calls
 vad = SileroVADAnalyzer()
+turn_detector = LocalSmartTurnAnalyzerV3()
 
 
 # ─── Bot logic ───────────────────────────────────────────────────────────────
@@ -122,7 +127,14 @@ async def run_bot(ep: SipEndpoint, call_id: str):
         context = LLMContext()
         user_agg, asst_agg = LLMContextAggregatorPair(
             context,
-            user_params=LLMUserAggregatorParams(vad_analyzer=vad),
+            user_params=LLMUserAggregatorParams(
+                vad_analyzer=vad,
+                user_turn_strategies=UserTurnStrategies(
+                    stop=[TurnAnalyzerUserTurnStopStrategy(
+                        turn_analyzer=turn_detector,
+                    )],
+                ),
+            ),
         )
 
         pipeline = Pipeline([
