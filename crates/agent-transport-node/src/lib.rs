@@ -17,6 +17,7 @@ use agent_transport_core::{
 };
 use agent_transport_core::audio_stream::config::AudioStreamConfig as RustAudioStreamConfig;
 use agent_transport_core::audio_stream::endpoint::AudioStreamEndpoint as RustAudioStreamEndpoint;
+use agent_transport_core::audio_stream::plivo::PlivoProtocol;
 
 fn napi_err(e: impl std::fmt::Display) -> napi::Error {
     Error::from_reason(e.to_string())
@@ -715,7 +716,7 @@ impl SipEndpoint {
     }
 }
 
-// ─── AudioStreamEndpoint (Plivo WebSocket audio streaming) ───────────────────
+// ─── AudioStreamEndpoint (WebSocket audio streaming) ────────────────────────
 
 #[napi(object)]
 pub struct AudioStreamConfigJs {
@@ -738,12 +739,14 @@ impl AudioStreamEndpoint {
         let cfg = config.unwrap_or(AudioStreamConfigJs { listen_addr: None, plivo_auth_id: None, plivo_auth_token: None, sample_rate: None, auto_hangup: None });
         let rc = RustAudioStreamConfig {
             listen_addr: cfg.listen_addr.unwrap_or_else(|| "0.0.0.0:8080".into()),
-            plivo_auth_id: cfg.plivo_auth_id.unwrap_or_default(),
-            plivo_auth_token: cfg.plivo_auth_token.unwrap_or_default(),
             sample_rate: cfg.sample_rate.unwrap_or(8000),
             auto_hangup: cfg.auto_hangup.unwrap_or(true),
         };
-        Ok(Self { inner: RustAudioStreamEndpoint::new(rc).map_err(napi_err)? })
+        let protocol = std::sync::Arc::new(PlivoProtocol::new(
+            cfg.plivo_auth_id.unwrap_or_default(),
+            cfg.plivo_auth_token.unwrap_or_default(),
+        ));
+        Ok(Self { inner: RustAudioStreamEndpoint::new(rc, protocol).map_err(napi_err)? })
     }
 
     #[napi]

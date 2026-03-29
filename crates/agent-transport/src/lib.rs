@@ -2,9 +2,9 @@
 //!
 //! Supports:
 //! - **SIP transport** (`sip` module): Direct SIP calling via rsipstack + RTP
-//! - **Audio streaming** (`audio_stream` module): Plivo WebSocket audio streaming
+//! - **Audio streaming** (`audio_stream` module): WebSocket audio streaming with pluggable providers
 //!
-//! Both transports produce/consume the same `AudioFrame` format (int16 PCM, 16kHz mono).
+//! Both transports produce/consume the same `AudioFrame` format (int16 PCM, configurable sample rate).
 //!
 //! # Example (SIP)
 //! ```no_run

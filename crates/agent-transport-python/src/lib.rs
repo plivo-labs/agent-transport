@@ -14,6 +14,7 @@ use agent_transport_core::{
 };
 use agent_transport_core::audio_stream::config::AudioStreamConfig as RustAudioStreamConfig;
 use agent_transport_core::audio_stream::endpoint::AudioStreamEndpoint as RustAudioStreamEndpoint;
+use agent_transport_core::audio_stream::plivo::PlivoProtocol;
 
 fn py_err(e: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
@@ -707,10 +708,10 @@ impl AudioStreamEndpoint {
     #[pyo3(signature = (listen_addr="0.0.0.0:8080", plivo_auth_id="", plivo_auth_token="", sample_rate=8000, auto_hangup=true))]
     fn new(listen_addr: &str, plivo_auth_id: &str, plivo_auth_token: &str, sample_rate: u32, auto_hangup: bool) -> PyResult<Self> {
         let config = RustAudioStreamConfig {
-            listen_addr: listen_addr.into(), plivo_auth_id: plivo_auth_id.into(),
-            plivo_auth_token: plivo_auth_token.into(), sample_rate, auto_hangup,
+            listen_addr: listen_addr.into(), sample_rate, auto_hangup,
         };
-        let inner = RustAudioStreamEndpoint::new(config).map_err(py_err)?;
+        let protocol = std::sync::Arc::new(PlivoProtocol::new(plivo_auth_id.into(), plivo_auth_token.into()));
+        let inner = RustAudioStreamEndpoint::new(config, protocol).map_err(py_err)?;
         Ok(Self { inner })
     }
 
