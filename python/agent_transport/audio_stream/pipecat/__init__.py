@@ -14,6 +14,7 @@ from .audio_stream_transport import (
     AudioStreamOutputTransport,
 )
 from .mixers import SoundfileMixer
+from .processors import AudioRecorder
 
 __all__ = [
     "PlivoFrameSerializer",
@@ -23,4 +24,5 @@ __all__ = [
     "AudioStreamInputTransport",
     "AudioStreamOutputTransport",
     "SoundfileMixer",
+    "AudioRecorder",
 ]
