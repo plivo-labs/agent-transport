@@ -542,10 +542,16 @@ impl SipEndpoint {
         self.inner.queued_frames(call_id).map_err(py_err)
     }
 
-    /// Audio sample rate in Hz.
+    /// Input audio sample rate in Hz.
     #[getter]
     fn input_sample_rate(&self) -> u32 {
         self.inner.input_sample_rate()
+    }
+
+    /// Output audio sample rate in Hz.
+    #[getter]
+    fn output_sample_rate(&self) -> u32 {
+        self.inner.output_sample_rate()
     }
 
     /// Number of audio channels (always 1 = mono).
@@ -887,6 +893,9 @@ impl AudioStreamEndpoint {
 
     #[getter]
     fn input_sample_rate(&self) -> u32 { self.inner.input_sample_rate() }
+
+    #[getter]
+    fn output_sample_rate(&self) -> u32 { self.inner.output_sample_rate() }
 
     fn shutdown(&self, py: Python) -> PyResult<()> {
         let inner = &self.inner;
