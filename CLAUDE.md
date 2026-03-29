@@ -22,9 +22,13 @@ crates/
 └── beep-detector/            # Standalone beep detection
 
 python/                       # Python adapters
-├── agent_transport_adapters/
-│   ├── livekit/              # LiveKit AudioInput/AudioOutput adapters
-│   └── pipecat/              # Pipecat BaseTransport adapters
+├── agent_transport/
+│   ├── sip/
+│   │   ├── pipecat/          # Pipecat SipTransport adapter
+│   │   └── livekit/          # LiveKit AgentServer + SIP I/O adapters
+│   └── audio_stream/
+│       ├── pipecat/          # Pipecat AudioStreamTransport + AudioStreamServer
+│       └── livekit/          # (planned) LiveKit audio stream adapters
 
 node/                         # Node.js adapter types
 ```

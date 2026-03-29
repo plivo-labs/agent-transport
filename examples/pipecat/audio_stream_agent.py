@@ -1,116 +1,90 @@
 #!/usr/bin/env python3
 """Pipecat voice agent over Plivo audio streaming.
 
-Starts a WebSocket server that Plivo connects to. Runs a Pipecat
-pipeline (STT → LLM → TTS) over the Plivo audio stream.
-
-No SIP registration needed — Plivo initiates the WebSocket connection.
-
 Prerequisites:
-    cd crates/agent-transport-python && maturin develop --features audio-stream
-    cd python && pip install -e ".[pipecat]"
-    pip install "pipecat-ai[deepgram,openai]"
-
-Setup:
-    Configure Plivo XML answer URL to return:
-    <Response>
-        <Stream bidirectional="true" url="ws://your-server:8080" />
-    </Response>
-
-Usage:
-    PLIVO_AUTH_ID=xxx PLIVO_AUTH_TOKEN=yyy \
-    DEEPGRAM_API_KEY=xxx OPENAI_API_KEY=xxx \
-    python examples/pipecat_audio_stream_agent.py
+    pip install "pipecat-ai[deepgram,openai,silero]" python-dotenv loguru
 """
 
-import asyncio
-import logging
 import os
 
-from agent_transport import AudioStreamEndpoint
-from agent_transport.sip.pipecat import AudioStreamTransport
+from dotenv import load_dotenv
+from loguru import logger
 
+from agent_transport.audio_stream.pipecat import AudioStreamServer, AudioStreamTransport
+
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.services.deepgram import DeepgramSTTService
-from pipecat.services.openai import OpenAILLMService, OpenAITTSService
-from pipecat.transports.base_transport import TransportParams
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.openai.tts import OpenAITTSService
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+load_dotenv()
+
+server = AudioStreamServer()
 
 
-async def handle_session(ep, session_id: int):
-    """Run the Pipecat pipeline for a single audio stream session."""
-    transport = AudioStreamTransport(ep, session_id, params=TransportParams(
-        audio_in_enabled=True,
-        audio_in_passthrough=True,
-        audio_out_enabled=True,
-        audio_in_sample_rate=16000,
-        audio_out_sample_rate=16000,
-    ))
-
-    stt = DeepgramSTTService(api_key=os.environ["DEEPGRAM_API_KEY"])
+@server.handler()
+async def run_bot(transport: AudioStreamTransport):
     llm = OpenAILLMService(
-        api_key=os.environ["OPENAI_API_KEY"],
-        model="gpt-4o-mini",
-        params=OpenAILLMService.InputParams(
-            temperature=0.7,
+        api_key=os.getenv("OPENAI_API_KEY"),
+        settings=OpenAILLMService.Settings(
+            system_instruction=(
+                "You are a helpful voice assistant on a phone call. "
+                "Your output will be converted to audio so don't include special characters. "
+                "Respond in short, conversational sentences."
+            ),
         ),
     )
-    tts = OpenAITTSService(
-        api_key=os.environ["OPENAI_API_KEY"],
-        voice="alloy",
+
+    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+    tts = OpenAITTSService(api_key=os.getenv("OPENAI_API_KEY"))
+
+    context = LLMContext()
+    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(),
+        ),
     )
 
     pipeline = Pipeline([
         transport.input(),
         stt,
+        user_aggregator,
         llm,
         tts,
         transport.output(),
+        assistant_aggregator,
     ])
 
     task = PipelineTask(pipeline, params=PipelineParams(
+        audio_in_sample_rate=16000,
+        audio_out_sample_rate=16000,
         allow_interruptions=True,
+        enable_metrics=True,
+        enable_usage_metrics=True,
     ))
 
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport):
+        context.add_message({"role": "user", "content": "Please introduce yourself."})
+        await task.queue_frames([LLMRunFrame()])
+
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport):
+        await task.cancel()
+
     runner = PipelineRunner()
-    logger.info("Pipeline started for session %d", session_id)
     await runner.run(task)
-    logger.info("Pipeline finished for session %d", session_id)
-
-
-async def main():
-    ep = AudioStreamEndpoint(
-        listen_addr="0.0.0.0:8080",
-        plivo_auth_id=os.environ.get("PLIVO_AUTH_ID", ""),
-        plivo_auth_token=os.environ.get("PLIVO_AUTH_TOKEN", ""),
-    )
-    logger.info("WebSocket server listening on 0.0.0.0:8080")
-
-    loop = asyncio.get_running_loop()
-
-    try:
-        while True:
-            logger.info("Waiting for Plivo to connect...")
-            event = await loop.run_in_executor(None, lambda: ep.wait_for_event(timeout_ms=0))
-            if not event or event["type"] != "incoming_call":
-                continue
-
-            session_id = event["session"]["call_id"]
-            logger.info("Plivo connected — session %d", session_id)
-
-            # Wait for media active
-            await loop.run_in_executor(None, lambda: ep.wait_for_event(timeout_ms=5000))
-
-            await handle_session(ep, session_id)
-    except KeyboardInterrupt:
-        pass
-
-    ep.shutdown()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    server.run()

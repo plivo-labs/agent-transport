@@ -1,118 +1,122 @@
 #!/usr/bin/env python3
-"""Pipecat voice agent over SIP transport.
-
-Registers with a SIP server, waits for incoming calls, and runs
-a Pipecat pipeline (STT → LLM → TTS) over the SIP call.
-
-No WebSocket server needed — audio flows directly over RTP.
+"""Pipecat voice agent over SIP via agent-transport.
 
 Prerequisites:
-    cd crates/agent-transport-python && maturin develop
-    cd python && pip install -e ".[pipecat]"
-    pip install "pipecat-ai[deepgram,openai]"
-
-Usage:
-    SIP_USERNAME=xxx SIP_PASSWORD=yyy \
-    DEEPGRAM_API_KEY=xxx OPENAI_API_KEY=xxx \
-    python examples/pipecat_sip_agent.py
+    pip install "pipecat-ai[deepgram,openai,silero]" python-dotenv loguru
 """
 
 import asyncio
-import logging
 import os
-import sys
+
+from dotenv import load_dotenv
+from loguru import logger
 
 from agent_transport import SipEndpoint
 from agent_transport.sip.pipecat import SipTransport
 
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.services.deepgram import DeepgramSTTService
-from pipecat.services.openai import OpenAILLMService, OpenAITTSService
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.openai.tts import OpenAITTSService
 from pipecat.transports.base_transport import TransportParams
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+load_dotenv()
 
 
-async def handle_call(ep: SipEndpoint, call_id: int):
-    """Run the Pipecat pipeline for a single call."""
+async def run_bot(ep: SipEndpoint, call_id: str):
     transport = SipTransport(ep, call_id, params=TransportParams(
         audio_in_enabled=True,
-        audio_in_passthrough=True,
         audio_out_enabled=True,
-        audio_in_sample_rate=16000,
-        audio_out_sample_rate=16000,
     ))
 
-    stt = DeepgramSTTService(api_key=os.environ["DEEPGRAM_API_KEY"])
     llm = OpenAILLMService(
-        api_key=os.environ["OPENAI_API_KEY"],
-        model="gpt-4o-mini",
-        params=OpenAILLMService.InputParams(
-            temperature=0.7,
+        api_key=os.getenv("OPENAI_API_KEY"),
+        settings=OpenAILLMService.Settings(
+            system_instruction=(
+                "You are a helpful voice assistant on a phone call. "
+                "Your output will be converted to audio so don't include special characters. "
+                "Respond in short, conversational sentences."
+            ),
         ),
     )
-    tts = OpenAITTSService(
-        api_key=os.environ["OPENAI_API_KEY"],
-        voice="alloy",
+
+    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+    tts = OpenAITTSService(api_key=os.getenv("OPENAI_API_KEY"))
+
+    context = LLMContext()
+    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(),
+        ),
     )
 
     pipeline = Pipeline([
         transport.input(),
         stt,
+        user_aggregator,
         llm,
         tts,
         transport.output(),
+        assistant_aggregator,
     ])
 
     task = PipelineTask(pipeline, params=PipelineParams(
+        audio_in_sample_rate=16000,
+        audio_out_sample_rate=16000,
         allow_interruptions=True,
+        enable_metrics=True,
+        enable_usage_metrics=True,
     ))
 
+    context.add_message({"role": "user", "content": "Please introduce yourself."})
+    await task.queue_frames([LLMRunFrame()])
+
     runner = PipelineRunner()
-    logger.info("Pipeline started for call %d", call_id)
     await runner.run(task)
-    logger.info("Pipeline finished for call %d", call_id)
 
 
 async def main():
-    username = os.environ.get("SIP_USERNAME", "")
-    password = os.environ.get("SIP_PASSWORD", "")
-    sip_domain = os.environ.get("SIP_DOMAIN", "phone.plivo.com")
-
-    ep = SipEndpoint(sip_server=sip_domain, log_level=3)
+    ep = SipEndpoint(
+        sip_server=os.getenv("SIP_DOMAIN", "phone.plivo.com"),
+        log_level=3,
+    )
 
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, lambda: ep.register(username, password))
+    await loop.run_in_executor(
+        None, lambda: ep.register(os.getenv("SIP_USERNAME", ""), os.getenv("SIP_PASSWORD", ""))
+    )
+
     event = await loop.run_in_executor(None, lambda: ep.wait_for_event(timeout_ms=10000))
     if not event or event["type"] != "registered":
-        logger.error("Registration failed: %s", event)
+        logger.error(f"Registration failed: {event}")
         return
-    logger.info("Registered as %s@%s", username, sip_domain)
+    logger.info("Registered, waiting for calls...")
 
-    logger.info("Waiting for incoming calls...")
-    try:
+    while True:
+        event = await loop.run_in_executor(None, lambda: ep.wait_for_event(timeout_ms=1000))
+        if not event or event["type"] != "incoming_call":
+            continue
+
+        call_id = event["session"]["call_id"]
+        logger.info(f"Incoming call from {event['session']['remote_uri']}")
+        await loop.run_in_executor(None, lambda: ep.answer(call_id))
+
         while True:
-            event = await loop.run_in_executor(None, lambda: ep.wait_for_event(timeout_ms=1000))
-            if not event:
-                continue
-            if event["type"] == "incoming_call":
-                call_id = event["session"]["call_id"]
-                logger.info("Incoming call from %s", event["session"]["remote_uri"])
-                await loop.run_in_executor(None, lambda: ep.answer(call_id))
+            ev = await loop.run_in_executor(None, lambda: ep.wait_for_event(timeout_ms=500))
+            if ev and ev["type"] == "call_media_active":
+                break
 
-                while True:
-                    ev = await loop.run_in_executor(None, lambda: ep.wait_for_event(timeout_ms=500))
-                    if ev and ev["type"] == "call_media_active":
-                        break
-
-                await handle_call(ep, call_id)
-    except KeyboardInterrupt:
-        pass
-
-    ep.shutdown()
+        asyncio.create_task(run_bot(ep, call_id))
 
 
 if __name__ == "__main__":
