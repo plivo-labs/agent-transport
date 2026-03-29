@@ -3,6 +3,10 @@
 //! Supports all 3 audio formats: x-l16 8kHz, x-l16 16kHz, x-mulaw 8kHz.
 //! Handles: playAudio, clearAudio, checkpoint, sendDTMF commands.
 //! Receives: start, media, dtmf, stop, playedStream, clearedAudio events.
+//!
+//! Uses checkpoint-based pacing (per Plivo recommendation): send chunk →
+//! send checkpoint → wait for playedStream → send next chunk.
+//! Plivo's server-side buffer handles smooth playback.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -110,6 +114,8 @@ struct StreamSession {
     playout_notify: Arc<(Mutex<bool>, Condvar)>,
     checkpoint_counter: AtomicU64,
     checkpoint_notify: Arc<(Mutex<Option<String>>, Condvar)>,
+    /// Notifies send loop when Plivo confirms playedStream (checkpoint pacing)
+    send_loop_notify: Arc<tokio::sync::Notify>,
     recorder: Arc<Mutex<Option<Arc<crate::recorder::CallRecorder>>>>,
     cancel: CancellationToken,
 }
@@ -222,6 +228,8 @@ impl AudioStreamEndpoint {
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         // Clear local AudioBuffer (fires any pending completion callbacks)
         sess.audio_buf.clear();
+        // Unblock send loop if it's waiting for playedStream
+        sess.send_loop_notify.notify_one();
         // Send clearAudio to Plivo to clear server-side buffer
         let json = serde_json::to_string(&serde_json::json!({ "event": "clearAudio", "streamId": sess.stream_id }))
             .map_err(|e| EndpointError::Other(e.to_string()))?;
@@ -279,7 +287,6 @@ impl AudioStreamEndpoint {
         Ok(())
     }
 
-    /// Hangup via Plivo REST API. Idempotent.
     /// Start recording for an audio stream session.
     pub fn start_recording(&self, session_id: &str, path: &str, stereo: bool) -> Result<()> {
         let mode = if stereo { crate::recorder::RecordingMode::Stereo } else { crate::recorder::RecordingMode::Mono };
@@ -427,40 +434,54 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                             let paused = Arc::new(AtomicBool::new(false));
                             let playout_notify = Arc::new((Mutex::new(false), Condvar::new()));
                             let cp_notify = Arc::new((Mutex::new(None), Condvar::new()));
+                            let send_loop_notify = Arc::new(tokio::sync::Notify::new());
                             let session_recorder: Arc<Mutex<Option<Arc<crate::recorder::CallRecorder>>>> = Arc::new(Mutex::new(None));
                             let session_cancel = CancellationToken::new();
 
-                            // Spawn send loop — paces outgoing audio at 20ms intervals
-                            // Mixes agent voice + background audio before encoding
+                            // Spawn checkpoint-paced send loop
+                            // Per Plivo recommendation: send chunk → checkpoint → wait playedStream → next chunk
+                            // Plivo's server-side buffer handles smooth playback; no local timer needed
                             let enc = encoding;
                             let wstx = ws_tx.clone();
                             let ab = audio_buf.clone();
                             let bg = bg_audio_buf.clone();
                             let rec_send = session_recorder.clone();
                             let (m, p, pn) = (muted.clone(), paused.clone(), playout_notify.clone());
+                            let sln = send_loop_notify.clone();
                             let sc = session_cancel.clone();
-                            let input_spf: usize = 320; // 16kHz × 20ms = 320 samples per frame
+                            let stream_id_for_loop = start.stream_id.clone();
+                            // Chunk size for checkpoint pacing (at 16kHz):
+                            // - Must be >= network RTT (~50ms) so Plivo plays long enough
+                            //   for playedStream to return before audio runs out
+                            // - Plivo recommends 100-200ms for checkpoint pacing
+                            // - 100ms = 1600 samples at 16kHz
+                            // First chunk sends whatever is available (as small as 20ms)
+                            // for fast time-to-first-audio
+                            let chunk_spf: usize = 1600;
+                            let cp_counter = Arc::new(AtomicU64::new(0));
                             tokio::spawn(async move {
-                                let mut iv = tokio::time::interval(Duration::from_millis(20));
                                 // speexdsp resampler for 16kHz→8kHz (if needed for this encoding)
                                 let mut downsampler = if enc.sample_rate() < 16000 {
                                     crate::sip::resampler::Resampler::new_voip(16000, enc.sample_rate())
                                 } else { None };
+
                                 loop {
-                                    tokio::select! { _ = sc.cancelled() => break, _ = iv.tick() => {} }
-                                    if p.load(Ordering::Relaxed) { continue; }
+                                    if sc.is_cancelled() { break; }
+                                    if p.load(Ordering::Relaxed) {
+                                        tokio::time::sleep(Duration::from_millis(20)).await;
+                                        continue;
+                                    }
 
-                                    // Drain agent voice + background audio
-                                    let voice = ab.drain(input_spf);
-                                    let bg_samples = bg.drain(input_spf);
+                                    // Drain up to chunk_spf samples of agent voice + background audio
+                                    let voice = ab.drain(chunk_spf);
+                                    let bg_samples = bg.drain(chunk_spf);
 
-                                    // Mix: add samples, clamp to i16 range
                                     let has_voice = !voice.is_empty();
                                     let has_bg = !bg_samples.is_empty();
 
                                     if has_voice || has_bg {
+                                        // Mix: add samples, clamp to i16 range
                                         let mixed = if has_voice && has_bg {
-                                            // Mix voice + background
                                             let len = voice.len().max(bg_samples.len());
                                             let mut out = Vec::with_capacity(len);
                                             for i in 0..len {
@@ -479,19 +500,38 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                                         if let Ok(guard) = rec_send.lock() { if let Some(ref rec) = *guard { rec.write_agent_samples(&mixed); } }
 
                                         if !m.load(Ordering::Relaxed) {
+                                            // Send playAudio
                                             let payload = encode_for_plivo(&mixed, enc, &mut downsampler);
                                             let b64 = base64::engine::general_purpose::STANDARD.encode(&payload);
-                                            let json = serde_json::to_string(&serde_json::json!({
+                                            let play_json = serde_json::to_string(&serde_json::json!({
                                                 "event": "playAudio",
                                                 "media": { "contentType": enc.content_type(), "sampleRate": enc.send_sample_rate(), "payload": b64 }
                                             })).unwrap_or_default();
-                                            let _ = wstx.send(Message::Text(json));
+                                            let _ = wstx.send(Message::Text(play_json));
+
+                                            // Send checkpoint — Plivo will respond with playedStream when this chunk plays
+                                            let cp_name = format!("sl-{}", cp_counter.fetch_add(1, Ordering::Relaxed));
+                                            let cp_json = serde_json::to_string(&serde_json::json!({
+                                                "event": "checkpoint", "streamId": stream_id_for_loop, "name": cp_name
+                                            })).unwrap_or_default();
+                                            let _ = wstx.send(Message::Text(cp_json));
+
+                                            // Wait for playedStream confirmation (or timeout as safety fallback)
+                                            tokio::select! {
+                                                _ = sc.cancelled() => break,
+                                                _ = sln.notified() => {},
+                                                _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                                                    debug!("Send loop: checkpoint timeout, continuing");
+                                                }
+                                            }
                                         }
                                     } else {
-                                        // No audio — notify playout completion
+                                        // No audio — notify playout completion and wait for audio to arrive
                                         if ab.is_empty() {
                                             if let Ok(mut d) = pn.0.lock() { *d = true; pn.1.notify_all(); }
                                         }
+                                        // Poll for audio at 10ms intervals (fast response when audio arrives)
+                                        tokio::time::sleep(Duration::from_millis(10)).await;
                                     }
                                 }
                             });
@@ -505,6 +545,7 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                                 audio_buf, bg_audio_buf, extra_headers: headers.clone(), encoding,
                                 muted, paused, playout_notify,
                                 checkpoint_counter: AtomicU64::new(0), checkpoint_notify: cp_notify,
+                                send_loop_notify,
                                 recorder: session_recorder,
                                 cancel: session_cancel,
                             });
@@ -516,7 +557,7 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                             session.extra_headers = headers;
                             let _ = etx.try_send(EndpointEvent::IncomingCall { session });
                             let _ = etx.try_send(EndpointEvent::CallMediaActive { call_id: sid.clone() });
-                            info!("Session {} started (encoding={:?})", sid, encoding);
+                            info!("Session {} started (encoding={:?}, checkpoint pacing)", sid, encoding);
                         }
                     }
                     "media" => {
@@ -558,6 +599,9 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                         if let Some(name) = plivo.name {
                             debug!("playedStream: checkpoint '{}' on session {}", name, sid);
                             if let Some(sess) = sessions.lock().unwrap().get(sid.as_str()) {
+                                // Notify send loop to send next chunk (checkpoint pacing)
+                                sess.send_loop_notify.notify_one();
+                                // Notify wait_for_playout() callers (user-facing API)
                                 let (lock, cvar) = &*sess.checkpoint_notify;
                                 *lock.lock().unwrap() = Some(name);
                                 cvar.notify_all();
@@ -566,7 +610,6 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                     }
                     "clearedAudio" => {
                         debug!("clearedAudio confirmed on session {}", sid);
-                        // Could emit an event here if needed
                     }
                     "stop" => {
                         info!("Session {} stopped", sid);
@@ -584,8 +627,6 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
     }
 
     // Cleanup on WS disconnect (handles abrupt disconnects without "stop" event)
-    // If session still exists, it means we broke out of the loop without a "stop" event
-    // (e.g., caller hung up, network drop, Plivo closed WS without sending "stop")
     if let Some(sess) = sessions.lock().unwrap().remove(&sid) {
         sess.cancel.cancel();
         let session = crate::sip::call::CallSession::new(sid.clone(), crate::sip::call::CallDirection::Inbound);
