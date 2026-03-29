@@ -58,7 +58,7 @@ async def run_bot(transport, userdata):
     )
 
     stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
-    tts = OpenAITTSService(api_key=os.getenv("OPENAI_API_KEY"), sample_rate=8000)
+    tts = OpenAITTSService(api_key=os.getenv("OPENAI_API_KEY"))
 
     context = LLMContext()
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
@@ -105,14 +105,14 @@ async def run_bot(transport, userdata):
     ))
 
     @transport.event_handler("on_client_connected")
-    async def on_client_connected(processor):
+    async def on_client_connected(transport):
         await recorder.start_recording()
         logger.info(f"Call connected: {transport.remote_uri} ({transport.direction})")
         context.add_message({"role": "user", "content": "Please introduce yourself."})
         await task.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(processor):
+    async def on_client_disconnected(transport):
         await task.cancel()
 
     runner = PipelineRunner()

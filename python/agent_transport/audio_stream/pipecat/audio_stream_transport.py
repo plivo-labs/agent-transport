@@ -255,8 +255,7 @@ class AudioStreamOutputTransport(BaseOutputTransport):
             )
             await fut
             return True
-        except Exception as e:
-            logger.error("write_audio_frame failed: %s", e)
+        except Exception:
             return False
 
     def queued_frames(self) -> int:

@@ -89,18 +89,17 @@ class AudioRecorder(AudioBufferProcessor):
 
     async def stop_recording(self):
         """Stop recording. Stops Rust file, then fires Python callbacks."""
-        # Stop Rust recording first (while session may still exist)
+        if not self._path or hasattr(self, '_stop_fired'):
+            return
+        self._stop_fired = True
         if self._rust_recording:
             try:
                 self._transport.stop_recording()
             except Exception as e:
                 logger.warning("Rust recording failed to stop: %s", e)
             self._rust_recording = False
-        # Fire Python callbacks (on_audio_data, on_track_audio_data)
         await super().stop_recording()
-        # Notify file path
-        if self._path:
-            await self._call_event_handler("on_recording_stopped", self._path)
+        await self._call_event_handler("on_recording_stopped", self._path)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         # Stop Rust recording before EndFrame/CancelFrame propagates to transport

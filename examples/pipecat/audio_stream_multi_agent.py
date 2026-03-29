@@ -127,7 +127,7 @@ async def run_bot(transport, userdata):
             model="gpt-4o-mini",
             settings=OpenAILLMService.Settings(system_instruction=cfg.system_prompt),
         )
-        tts = OpenAITTSService(api_key=os.getenv("OPENAI_API_KEY"), voice=cfg.voice, sample_rate=8000)
+        tts = OpenAITTSService(api_key=os.getenv("OPENAI_API_KEY"), voice=cfg.voice)
 
         context = LLMContext()
         user_agg, asst_agg = LLMContextAggregatorPair(
@@ -158,7 +158,7 @@ async def run_bot(transport, userdata):
     context, task = make_pipeline("greeter")
 
     @transport.event_handler("on_client_connected")
-    async def on_client_connected(processor):
+    async def on_client_connected(transport):
         await recorder.start_recording()
         cfg = AGENTS[current_agent]
         if cfg.greeting:
@@ -167,7 +167,7 @@ async def run_bot(transport, userdata):
         await task.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(processor):
+    async def on_client_disconnected(transport):
         await task.cancel()
 
     runner = PipelineRunner()
