@@ -58,7 +58,8 @@ class AudioStreamInputTransport(BaseInputTransport):
     """
 
     def __init__(self, endpoint, session_id: str, transport: "AudioStreamTransport",
-                 params: Optional[TransportParams] = None, **kwargs):
+                 params: Optional[TransportParams] = None,
+                 event_queue: Optional[asyncio.Queue] = None, **kwargs):
         if params is None:
             params = TransportParams(
                 audio_in_enabled=True,
@@ -68,6 +69,7 @@ class AudioStreamInputTransport(BaseInputTransport):
         self._ep = endpoint
         self._sid = session_id
         self._transport = transport
+        self._event_queue = event_queue  # per-session queue from server (avoids event-stealing)
         self._running = False
         self._recv_task: Optional[asyncio.Task] = None
         self._event_task: Optional[asyncio.Task] = None
@@ -127,7 +129,29 @@ class AudioStreamInputTransport(BaseInputTransport):
                 ))
 
     async def _event_loop(self):
-        """Poll for DTMF, call state, and lifecycle events from Plivo."""
+        """Poll for DTMF, call state, and lifecycle events.
+
+        If an event_queue is provided (by the server), reads from it.
+        Otherwise falls back to polling endpoint directly (standalone usage).
+        """
+        if self._event_queue:
+            await self._event_loop_from_queue()
+        else:
+            await self._event_loop_from_endpoint()
+
+    async def _event_loop_from_queue(self):
+        """Read events from per-session queue (dispatched by server)."""
+        while self._running:
+            try:
+                event = await asyncio.wait_for(self._event_queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            except Exception:
+                break
+            await self._handle_event(event)
+
+    async def _event_loop_from_endpoint(self):
+        """Poll events directly from endpoint (standalone, no server)."""
         loop = asyncio.get_running_loop()
         while self._running:
             try:
@@ -135,24 +159,28 @@ class AudioStreamInputTransport(BaseInputTransport):
                     None, lambda: self._ep.wait_for_event(timeout_ms=100)
                 )
             except Exception:
-                break  # Endpoint shut down — exit cleanly
+                break
             if event is None:
                 continue
-            event_type = event.get("type", "")
-            if event_type == "dtmf_received":
-                await self.push_frame(InputDTMFFrame(button=KeypadEntry(event["digit"])))
-            elif event_type == "call_terminated":
-                self._running = False
-                await self._transport._call_event_handler("on_client_disconnected", self._transport)
-                await self.push_frame(EndFrame())
-            elif event_type == "beep_detected":
-                await self._transport._call_event_handler(
-                    "on_beep_detected", self._transport,
-                    frequency_hz=event.get("frequency_hz"),
-                    duration_ms=event.get("duration_ms"),
-                )
-            elif event_type == "beep_timeout":
-                await self._transport._call_event_handler("on_beep_timeout", self._transport)
+            await self._handle_event(event)
+
+    async def _handle_event(self, event):
+        """Process a single event."""
+        event_type = event.get("type", "")
+        if event_type == "dtmf_received":
+            await self.push_frame(InputDTMFFrame(button=KeypadEntry(event["digit"])))
+        elif event_type == "call_terminated":
+            self._running = False
+            await self._transport._call_event_handler("on_client_disconnected", self._transport)
+            await self.push_frame(EndFrame())
+        elif event_type == "beep_detected":
+            await self._transport._call_event_handler(
+                "on_beep_detected", self._transport,
+                frequency_hz=event.get("frequency_hz"),
+                duration_ms=event.get("duration_ms"),
+            )
+        elif event_type == "beep_timeout":
+            await self._transport._call_event_handler("on_beep_timeout", self._transport)
 
 
 # ─── Output Transport ───────────────────────────────────────────────────────
@@ -318,6 +346,7 @@ class AudioStreamTransport(BaseTransport):
         name: Optional[str] = None,
         params: Optional[TransportParams] = None,
         session_data: Optional[Dict[str, Any]] = None,
+        _event_queue: Optional[asyncio.Queue] = None,
         **kwargs,
     ):
         super().__init__(name=name or "AudioStreamTransport", **kwargs)
@@ -325,6 +354,7 @@ class AudioStreamTransport(BaseTransport):
         self._sid = session_id
         self._params = params
         self._session_data = session_data or {}
+        self._event_queue = _event_queue  # per-session queue from server
         self._input: Optional[AudioStreamInputTransport] = None
         self._output: Optional[AudioStreamOutputTransport] = None
 
@@ -340,7 +370,8 @@ class AudioStreamTransport(BaseTransport):
         if self._input is None:
             self._input = AudioStreamInputTransport(
                 self._ep, self._sid, transport=self,
-                params=self._params, name=f"{self._name}-input",
+                params=self._params, event_queue=self._event_queue,
+                name=f"{self._name}-input",
             )
         return self._input
 

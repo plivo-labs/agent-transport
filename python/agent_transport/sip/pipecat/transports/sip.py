@@ -3,6 +3,9 @@
 Manages SipEndpoint lifecycle, SIP registration, session acceptance,
 and per-session SipTransport creation.
 
+Uses a single event dispatcher loop (matching LiveKit AgentServer pattern)
+to avoid event-stealing race conditions between server and per-session loops.
+
 Usage:
     from agent_transport.sip.pipecat import SipServerTransport
 
@@ -71,6 +74,18 @@ if HAS_PROMETHEUS:
     )
 
 
+def _session_to_dict(session) -> Dict[str, Any]:
+    """Convert a PyO3 CallSession object to a plain dict for transport metadata."""
+    return {
+        "call_id": session.call_id,
+        "call_uuid": getattr(session, "call_uuid", None) or "",
+        "remote_uri": getattr(session, "remote_uri", ""),
+        "local_uri": getattr(session, "local_uri", ""),
+        "direction": getattr(session, "direction", ""),
+        "extra_headers": getattr(session, "extra_headers", {}),
+    }
+
+
 @dataclass
 class SipServerParams:
     """Parameters for SipServerTransport."""
@@ -94,6 +109,7 @@ class SipServerTransport:
     - Incoming call acceptance + session management
     - Outbound calls via call() method
     - Per-session SipTransport creation
+    - Single event dispatcher (no event-stealing races)
     - @setup() for one-time model loading (VAD, turn detector)
     - @handler() for per-session bot logic
     - HTTP endpoints: /health, /metrics, /call
@@ -128,7 +144,7 @@ class SipServerTransport:
         self._plc = plc or p.plc
         self._comfort_noise = comfort_noise or p.comfort_noise
         self._http_host = http_host
-        self._http_port = http_port or int(os.environ.get("PORT", "8080"))
+        self._http_port = http_port or int(os.environ.get("PORT", "0")) or None
         self._transport_params = transport_params or (p.transport_params if params else None)
 
         self._handler_fnc: Optional[Callable[..., Coroutine]] = None
@@ -137,6 +153,8 @@ class SipServerTransport:
         self._ep: Optional[SipEndpoint] = None
         self._active_sessions: Dict[str, asyncio.Task] = {}
         self._session_start_times: Dict[str, float] = {}
+        # Per-session event queues — server dispatches events to the right session
+        self._session_event_queues: Dict[str, asyncio.Queue] = {}
 
     @property
     def endpoint(self) -> Optional[SipEndpoint]:
@@ -151,8 +169,7 @@ class SipServerTransport:
     def setup(self) -> Callable:
         """Decorator to register a one-time setup function.
 
-        Runs once before accepting calls. Return a dict of shared resources
-        (VAD models, turn detectors, etc.) — passed to every handler call::
+        Runs once before accepting calls. Return a dict of shared resources::
 
             @server.setup()
             def prewarm():
@@ -181,19 +198,14 @@ class SipServerTransport:
     async def call(self, dest_uri: str, headers: Optional[Dict[str, str]] = None) -> Optional[str]:
         """Make an outbound SIP call.
 
-        Args:
-            dest_uri: SIP URI to call (e.g., sip:+1234567890@provider.com)
-            headers: Optional custom SIP headers
-
-        Returns:
-            call_id if successful, None otherwise.
+        Returns call_id if successful, None otherwise.
         """
         if not self._ep:
             raise RuntimeError("Server not started")
         loop = asyncio.get_running_loop()
         try:
             call_id = await loop.run_in_executor(
-                None, lambda: self._ep.call(dest_uri, headers)
+                None, lambda: self._ep.call(dest_uri, headers=headers)
             )
             return call_id
         except Exception as e:
@@ -247,19 +259,18 @@ class SipServerTransport:
 
         logger.info("Registered as %s@%s", self._sip_username, self._sip_server)
 
-        # Start HTTP server if aiohttp available
+        # Start HTTP server if aiohttp available and port configured
         http_task = None
-        if HAS_AIOHTTP:
+        if HAS_AIOHTTP and self._http_port:
             http_task = asyncio.create_task(self._run_http_server())
 
         try:
-            await self._session_loop()
+            await self._event_loop()
         except asyncio.CancelledError:
             pass
         except KeyboardInterrupt:
             pass
         finally:
-            # Drain active sessions
             if self._active_sessions:
                 logger.info("Draining %d active session(s)...", len(self._active_sessions))
                 for task in self._active_sessions.values():
@@ -278,8 +289,15 @@ class SipServerTransport:
                     pass
             logger.info("Server shut down")
 
-    async def _session_loop(self) -> None:
+    async def _event_loop(self) -> None:
+        """Single event dispatcher — reads ALL events, routes to correct session.
+
+        Avoids event-stealing race between server loop and per-session loops.
+        Matches LiveKit AgentServer._sip_event_loop pattern.
+        """
         loop = asyncio.get_running_loop()
+        # Calls waiting for call_media_active after answer
+        pending_calls: dict[str, dict] = {}  # call_id → session_data
 
         while True:
             event = await loop.run_in_executor(
@@ -288,41 +306,65 @@ class SipServerTransport:
             if not event:
                 continue
 
-            if event["type"] == "incoming_call":
-                session = event.get("session", {})
-                call_id = session.get("call_id", "")
-                remote_uri = session.get("remote_uri", "")
-                logger.info("Incoming call from %s (call_id=%s)", remote_uri, call_id)
+            ev_type = event["type"]
 
-                # Answer the call
+            if ev_type == "incoming_call":
+                session = event["session"]
+                call_id = session.call_id
+                session_data = _session_to_dict(session)
+                logger.info("Incoming call from %s (call_id=%s)", session_data["remote_uri"], call_id)
                 await loop.run_in_executor(None, lambda: self._ep.answer(call_id))
+                pending_calls[call_id] = session_data
 
-                # Wait for media active
-                while True:
-                    ev = await loop.run_in_executor(
-                        None, lambda: self._ep.wait_for_event(timeout_ms=500)
-                    )
-                    if ev and ev["type"] == "call_media_active":
-                        break
+            elif ev_type == "call_media_active":
+                call_id = event.get("call_id", "")
+                if call_id in pending_calls:
+                    session_data = pending_calls.pop(call_id)
+                    self._start_session(call_id, session_data)
 
-                transport = SipTransport(
-                    self._ep, call_id,
-                    session_data=session,
-                    params=self._transport_params or TransportParams(
-                        audio_in_enabled=True,
-                        audio_out_enabled=True,
-                    ),
-                )
+            elif ev_type == "call_terminated":
+                session = event["session"]
+                call_id = session.call_id
+                pending_calls.pop(call_id, None)
+                q = self._session_event_queues.get(call_id)
+                if q:
+                    await q.put(event)
 
-                task = asyncio.create_task(self._run_session(call_id, transport))
-                self._active_sessions[call_id] = task
-                self._session_start_times[call_id] = time.monotonic()
+            elif ev_type == "dtmf_received":
+                call_id = event.get("call_id", "")
+                q = self._session_event_queues.get(call_id)
+                if q:
+                    await q.put(event)
+
+            elif ev_type in ("beep_detected", "beep_timeout"):
+                call_id = event.get("call_id", "")
+                q = self._session_event_queues.get(call_id)
+                if q:
+                    await q.put(event)
+
+    def _start_session(self, call_id: str, session_data: dict) -> None:
+        """Create transport and spawn session handler task."""
+        event_queue: asyncio.Queue = asyncio.Queue()
+        self._session_event_queues[call_id] = event_queue
+
+        transport = SipTransport(
+            self._ep, call_id,
+            session_data=session_data,
+            params=self._transport_params or TransportParams(
+                audio_in_enabled=True,
+                audio_out_enabled=True,
+            ),
+            _event_queue=event_queue,
+        )
+
+        task = asyncio.create_task(self._run_session(call_id, transport))
+        self._active_sessions[call_id] = task
+        self._session_start_times[call_id] = time.monotonic()
 
     async def _run_session(self, call_id: str, transport: SipTransport) -> None:
+        direction = transport.direction or "inbound"
         if HAS_PROMETHEUS:
-            SIP_CALLS_TOTAL.labels(
-                nodename=platform.node(), direction=transport.direction or "inbound",
-            ).inc()
+            SIP_CALLS_TOTAL.labels(nodename=platform.node(), direction=direction).inc()
             RUNNING_CALLS_GAUGE.inc()
 
         try:
@@ -338,6 +380,7 @@ class SipServerTransport:
         finally:
             duration = time.monotonic() - self._session_start_times.pop(call_id, time.monotonic())
             self._active_sessions.pop(call_id, None)
+            self._session_event_queues.pop(call_id, None)
             if HAS_PROMETHEUS:
                 RUNNING_CALLS_GAUGE.dec()
                 SIP_CALL_DURATION.observe(duration)
@@ -358,7 +401,6 @@ class SipServerTransport:
                      self._http_host, self._http_port)
         await site.start()
 
-        # Keep running until cancelled
         try:
             while True:
                 await asyncio.sleep(3600)

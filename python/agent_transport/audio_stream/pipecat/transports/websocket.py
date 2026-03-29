@@ -74,6 +74,18 @@ if HAS_PROMETHEUS:
     )
 
 
+def _session_to_dict(session) -> Dict[str, Any]:
+    """Convert a PyO3 CallSession object to a plain dict for transport metadata."""
+    return {
+        "call_id": session.call_id,
+        "call_uuid": getattr(session, "call_uuid", None) or "",
+        "remote_uri": getattr(session, "remote_uri", ""),
+        "local_uri": getattr(session, "local_uri", ""),
+        "direction": getattr(session, "direction", ""),
+        "extra_headers": getattr(session, "extra_headers", {}),
+    }
+
+
 @dataclass
 class WebsocketServerParams:
     """Parameters for WebsocketServerTransport.
@@ -92,12 +104,8 @@ class WebsocketServerTransport:
     and checkpoint-based audio pacing. Manages session lifecycle and creates
     per-session AudioStreamTransport instances.
 
-    Features:
-    - @setup() for one-time resource loading (VAD, turn detectors)
-    - @handler() for per-session bot logic
-    - HTTP endpoints: /health, /metrics, /worker
-    - Prometheus metrics: session count, duration, CPU
-    - Active session tracking + graceful drain on shutdown
+    Uses a single event dispatcher loop (matching LiveKit AgentServer pattern)
+    to avoid event-stealing race conditions between server and per-session loops.
     """
 
     def __init__(
@@ -123,6 +131,8 @@ class WebsocketServerTransport:
         self._ep: Optional[AudioStreamEndpoint] = None
         self._active_sessions: dict[str, asyncio.Task] = {}
         self._session_start_times: dict[str, float] = {}
+        # Per-session event queues — server dispatches events to the right session
+        self._session_event_queues: dict[str, asyncio.Queue] = {}
 
     @property
     def endpoint(self) -> Optional[AudioStreamEndpoint]:
@@ -201,7 +211,7 @@ class WebsocketServerTransport:
             http_task = asyncio.create_task(self._run_http_server())
 
         try:
-            await self._session_loop()
+            await self._event_loop()
         except asyncio.CancelledError:
             pass
         except KeyboardInterrupt:
@@ -222,38 +232,79 @@ class WebsocketServerTransport:
                 self._ep.shutdown()
             logger.info("Server shut down")
 
-    async def _session_loop(self) -> None:
+    async def _event_loop(self) -> None:
+        """Single event dispatcher — reads ALL events, routes to correct session.
+
+        Avoids event-stealing race between server loop and per-session loops.
+        Matches LiveKit AgentServer._sip_event_loop pattern.
+        """
         loop = asyncio.get_running_loop()
+        # Sessions waiting for call_media_active after incoming_call
+        pending_sessions: dict[str, dict] = {}  # session_id → session_data
 
         while True:
             event = await loop.run_in_executor(
                 None, lambda: self._ep.wait_for_event(timeout_ms=0)
             )
-            if not event or event["type"] != "incoming_call":
+            if not event:
                 continue
 
-            session = event.get("session", {})
-            session_id = session.get("call_id", "")
-            logger.info("Session %s connected (call_uuid=%s)",
-                        session_id, session.get("call_uuid", ""))
+            ev_type = event["type"]
 
-            # Wait for media active
-            await loop.run_in_executor(
-                None, lambda: self._ep.wait_for_event(timeout_ms=5000)
-            )
+            if ev_type == "incoming_call":
+                session = event["session"]
+                session_id = session.call_id
+                session_data = _session_to_dict(session)
+                logger.info("Session %s connected (call_uuid=%s)",
+                            session_id, session_data.get("call_uuid", ""))
+                pending_sessions[session_id] = session_data
 
-            transport = AudioStreamTransport(
-                self._ep, session_id,
-                session_data=session,
-                params=self._transport_params or TransportParams(
-                    audio_in_enabled=True,
-                    audio_out_enabled=True,
-                ),
-            )
+            elif ev_type == "call_media_active":
+                call_id = event.get("call_id", "")
+                if call_id in pending_sessions:
+                    session_data = pending_sessions.pop(call_id)
+                    self._start_session(call_id, session_data)
 
-            task = asyncio.create_task(self._run_session(session_id, transport))
-            self._active_sessions[session_id] = task
-            self._session_start_times[session_id] = time.monotonic()
+            elif ev_type == "call_terminated":
+                session = event["session"]
+                call_id = session.call_id
+                pending_sessions.pop(call_id, None)
+                # Route to per-session queue
+                q = self._session_event_queues.get(call_id)
+                if q:
+                    await q.put(event)
+
+            elif ev_type == "dtmf_received":
+                call_id = event.get("call_id", "")
+                q = self._session_event_queues.get(call_id)
+                if q:
+                    await q.put(event)
+
+            elif ev_type in ("beep_detected", "beep_timeout"):
+                call_id = event.get("call_id", "")
+                q = self._session_event_queues.get(call_id)
+                if q:
+                    await q.put(event)
+
+    def _start_session(self, session_id: str, session_data: dict) -> None:
+        """Create transport and spawn session handler task."""
+        # Create per-session event queue
+        event_queue: asyncio.Queue = asyncio.Queue()
+        self._session_event_queues[session_id] = event_queue
+
+        transport = AudioStreamTransport(
+            self._ep, session_id,
+            session_data=session_data,
+            params=self._transport_params or TransportParams(
+                audio_in_enabled=True,
+                audio_out_enabled=True,
+            ),
+            _event_queue=event_queue,
+        )
+
+        task = asyncio.create_task(self._run_session(session_id, transport))
+        self._active_sessions[session_id] = task
+        self._session_start_times[session_id] = time.monotonic()
 
     async def _run_session(self, session_id: str, transport: AudioStreamTransport) -> None:
         if HAS_PROMETHEUS:
@@ -273,6 +324,7 @@ class WebsocketServerTransport:
         finally:
             duration = time.monotonic() - self._session_start_times.pop(session_id, time.monotonic())
             self._active_sessions.pop(session_id, None)
+            self._session_event_queues.pop(session_id, None)
             if HAS_PROMETHEUS:
                 RUNNING_SESSIONS_GAUGE.dec()
                 STREAM_SESSION_DURATION.observe(duration)
