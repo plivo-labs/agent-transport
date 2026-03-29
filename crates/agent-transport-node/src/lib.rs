@@ -393,15 +393,18 @@ impl SipEndpoint {
         self.inner.is_registered()
     }
 
-    /// Make an outbound call. Optional headers object adds custom SIP headers.
+    /// Make an outbound call. Optional `from_uri` sets the SIP From header
+    /// (e.g. "sip:+15551234567@provider.com"). If omitted, uses the registered contact URI.
+    /// Optional `headers` adds custom SIP headers.
     #[napi]
     pub fn call(
         &self,
         dest_uri: String,
+        from_uri: Option<String>,
         headers: Option<HashMap<String, String>>,
     ) -> Result<String> {
         self.inner
-            .call(&dest_uri, headers)
+            .call_with_from(&dest_uri, from_uri.as_deref(), headers)
             .map_err(napi_err)
     }
 
@@ -513,7 +516,7 @@ impl SipEndpoint {
     /// Send raw PCM bytes with async completion notification (backpressure).
     /// The callback fires when the buffer drains below threshold.
     /// Matches Python's send_audio_notify pattern.
-    #[napi(ts_args_type = "callId: number, audio: Buffer, sampleRate: number, numChannels: number, notifyFn: () => void")]
+    #[napi(ts_args_type = "callId: string, audio: Buffer, sampleRate: number, numChannels: number, notifyFn: () => void")]
     pub fn send_audio_notify(&self, call_id: String, audio: Vec<u8>, sample_rate: u32, num_channels: u32, notify_fn: JsFunction) -> Result<()> {
         let frame = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
         let tsfn: ThreadsafeFunction<(), ErrorStrategy::CalleeHandled> =
@@ -759,7 +762,7 @@ impl AudioStreamEndpoint {
 
     /// Send raw PCM bytes with async completion notification (backpressure).
     /// Matches SipEndpoint.send_audio_notify — used by SipAudioSource adapters.
-    #[napi(ts_args_type = "sessionId: number, audio: Buffer, sampleRate: number, numChannels: number, notifyFn: () => void")]
+    #[napi(ts_args_type = "sessionId: string, audio: Buffer, sampleRate: number, numChannels: number, notifyFn: () => void")]
     pub fn send_audio_notify(&self, session_id: String, audio: Vec<u8>, sample_rate: u32, num_channels: u32, notify_fn: JsFunction) -> Result<()> {
         let frame = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
         let tsfn: ThreadsafeFunction<(), ErrorStrategy::CalleeHandled> =

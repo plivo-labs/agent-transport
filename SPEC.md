@@ -84,7 +84,7 @@ Matches LiveKit's `rtc.AudioFrame` format for drop-in compatibility.
 ```rust
 pub struct CallSession {
     pub call_uuid: String,
-    pub call_id: i32,            // Internal call ID
+    pub call_id: String,         // Internal call ID
     pub direction: CallDirection, // Inbound | Outbound
     pub state: CallState,
     pub remote_uri: String,
@@ -120,15 +120,15 @@ pub enum EndpointEvent {
     // Call lifecycle
     IncomingCall { session: CallSession },
     CallStateChanged { session: CallSession },
-    CallMediaActive { call_id: i32 },
+    CallMediaActive { call_id: String },
     CallTerminated { session: CallSession, reason: String },
 
     // DTMF
-    DtmfReceived { call_id: i32, digit: char, method: String },
+    DtmfReceived { call_id: String, digit: char, method: String },
 
     // Beep detection
-    BeepDetected { call_id: i32, frequency_hz: f64, duration_ms: u32 },
-    BeepTimeout { call_id: i32 },
+    BeepDetected { call_id: String, frequency_hz: f64, duration_ms: u32 },
+    BeepTimeout { call_id: String },
 }
 ```
 
@@ -176,58 +176,114 @@ impl SipEndpoint {
         &self,
         dest_uri: &str,
         headers: Option<HashMap<String, String>>,
-    ) -> Result<i32>; // returns call_id
+    ) -> Result<String>; // returns call_id
 
     /// Answer an incoming call
-    pub fn answer(&self, call_id: i32, code: u16) -> Result<()>; // 200 = accept
+    pub fn answer(&self, call_id: &str, code: u16) -> Result<()>; // 200 = accept
 
     /// Reject/decline an incoming call
-    pub fn reject(&self, call_id: i32, code: u16) -> Result<()>; // 486, 603, etc.
+    pub fn reject(&self, call_id: &str, code: u16) -> Result<()>; // 486, 603, etc.
 
     /// Hang up an active call
-    pub fn hangup(&self, call_id: i32) -> Result<()>;
+    pub fn hangup(&self, call_id: &str) -> Result<()>;
 
     /// Send DTMF digits (RFC 2833)
-    pub fn send_dtmf(&self, call_id: i32, digits: &str) -> Result<()>;
+    pub fn send_dtmf(&self, call_id: &str, digits: &str) -> Result<()>;
 
     /// Transfer call via SIP REFER
-    pub fn transfer(&self, call_id: i32, dest_uri: &str) -> Result<()>;
+    pub fn transfer(&self, call_id: &str, dest_uri: &str) -> Result<()>;
 
     /// Attended transfer (two calls)
     pub fn transfer_attended(
         &self,
-        call_id: i32,
-        target_call_id: i32,
+        call_id: &str,
+        target_call_id: &str,
     ) -> Result<()>;
 
     /// Mute/unmute outgoing audio
-    pub fn mute(&self, call_id: i32) -> Result<()>;
-    pub fn unmute(&self, call_id: i32) -> Result<()>;
+    pub fn mute(&self, call_id: &str) -> Result<()>;
+    pub fn unmute(&self, call_id: &str) -> Result<()>;
 
     /// SIP hold/unhold via Re-INVITE
-    pub fn hold(&self, call_id: i32) -> Result<()>;
-    pub fn unhold(&self, call_id: i32) -> Result<()>;
+    pub fn hold(&self, call_id: &str) -> Result<()>;
+    pub fn unhold(&self, call_id: &str) -> Result<()>;
 
     /// Send an audio frame into the call
-    pub fn send_audio(&self, call_id: i32, frame: &AudioFrame) -> Result<()>;
+    pub fn send_audio(&self, call_id: &str, frame: &AudioFrame) -> Result<()>;
 
     /// Receive the next audio frame from the call
     /// Returns None if no frame is available (non-blocking)
-    pub fn recv_audio(&self, call_id: i32) -> Result<Option<AudioFrame>>;
+    pub fn recv_audio(&self, call_id: &str) -> Result<Option<AudioFrame>>;
 
     /// Receive audio frame, blocking until available or timeout
-    pub fn recv_audio_blocking(&self, call_id: i32, timeout_ms: u64) -> Result<Option<AudioFrame>>;
+    pub fn recv_audio_blocking(&self, call_id: &str, timeout_ms: u64) -> Result<Option<AudioFrame>>;
 
     /// Playback control
-    pub fn flush(&self, call_id: i32) -> Result<()>;
-    pub fn clear_buffer(&self, call_id: i32) -> Result<()>;
-    pub fn wait_for_playout(&self, call_id: i32, timeout_ms: u64) -> Result<bool>;
-    pub fn pause(&self, call_id: i32) -> Result<()>;
-    pub fn resume(&self, call_id: i32) -> Result<()>;
-    pub fn queued_frames(&self, call_id: i32) -> Result<usize>;
+    pub fn flush(&self, call_id: &str) -> Result<()>;
+    pub fn clear_buffer(&self, call_id: &str) -> Result<()>;
+    pub fn wait_for_playout(&self, call_id: &str, timeout_ms: u64) -> Result<bool>;
+    pub fn pause(&self, call_id: &str) -> Result<()>;
+    pub fn resume(&self, call_id: &str) -> Result<()>;
+    pub fn queued_frames(&self, call_id: &str) -> Result<usize>;
 
     /// Get the event receiver channel
     pub fn events(&self) -> crossbeam_channel::Receiver<EndpointEvent>;
+
+    /// Shut down the endpoint
+    pub fn shutdown(&self) -> Result<()>;
+}
+```
+
+### AudioStreamEndpoint
+
+```rust
+impl AudioStreamEndpoint {
+    /// Create a new audio streaming endpoint
+    pub fn new(config: AudioStreamConfig) -> Result<Self>;
+
+    /// Send an audio frame to a session
+    pub fn send_audio(&self, session_id: &str, frame: &AudioFrame) -> Result<()>;
+
+    /// Send audio with completion callback (for backpressure)
+    pub fn send_audio_with_callback(&self, session_id: &str, frame: &AudioFrame, on_complete: CompletionCallback) -> Result<()>;
+
+    /// Receive the next audio frame (non-blocking)
+    pub fn recv_audio(&self, session_id: &str) -> Result<Option<AudioFrame>>;
+
+    /// Receive audio frame, blocking until available or timeout
+    pub fn recv_audio_blocking(&self, session_id: &str, timeout_ms: u64) -> Result<Option<AudioFrame>>;
+
+    /// Playback control
+    pub fn flush(&self, session_id: &str) -> Result<()>;
+    pub fn clear_buffer(&self, session_id: &str) -> Result<()>;
+    pub fn checkpoint(&self, session_id: &str, name: Option<&str>) -> Result<String>;
+    pub fn wait_for_playout(&self, session_id: &str, timeout_ms: u64) -> Result<bool>;
+    pub fn pause(&self, session_id: &str) -> Result<()>;
+    pub fn resume(&self, session_id: &str) -> Result<()>;
+    pub fn queued_frames(&self, session_id: &str) -> Result<usize>;
+
+    /// Mute/unmute
+    pub fn mute(&self, session_id: &str) -> Result<()>;
+    pub fn unmute(&self, session_id: &str) -> Result<()>;
+
+    /// Send DTMF digits
+    pub fn send_dtmf(&self, session_id: &str, digits: &str) -> Result<()>;
+
+    /// Send arbitrary WebSocket message
+    pub fn send_raw_message(&self, session_id: &str, message: &str) -> Result<()>;
+
+    /// OGG/Opus recording
+    pub fn start_recording(&self, session_id: &str, path: &str, stereo: bool) -> Result<()>;
+    pub fn stop_recording(&self, session_id: &str) -> Result<()>;
+
+    /// Hang up a session
+    pub fn hangup(&self, session_id: &str) -> Result<()>;
+
+    /// Get the event receiver channel
+    pub fn events(&self) -> Receiver<EndpointEvent>;
+
+    /// Get the configured sample rate
+    pub fn sample_rate(&self) -> u32;
 
     /// Shut down the endpoint
     pub fn shutdown(&self) -> Result<()>;
@@ -321,11 +377,12 @@ The `AudioFrame` format matches LiveKit's `rtc.AudioFrame`:
 | num_channels | `u32` (1) | `int` (1) | Yes |
 | samples_per_channel | `u32` (320) | `int` (320) | Yes |
 
-To use with LiveKit agents, replace `RoomIO` with a `SipIO` adapter that:
-1. Wraps `SipEndpoint` as the transport
-2. Implements `AudioInput` (async iterator yielding our `AudioFrame`)
-3. Implements `AudioOutput` (`push(frame)` calls `send_audio()`)
-4. Maps `IncomingCall` / `CallTerminated` to participant lifecycle events
+LiveKit Agents adapters are provided for both SIP and Audio Streaming:
+- `AgentServer` (SIP) and `AudioStreamServer` wrap the Rust endpoints
+- `JobContext` with `ctx.session = session` wires audio I/O automatically
+- `TransportRoom` facade provides `room.on("sip_dtmf_received")`, `local_participant.publish_dtmf()`, background audio mixing
+- `JobProcess` + `ctx.proc.userdata` matches LiveKit's prewarm pattern
+- OGG/Opus recording via Rust transport layer
 
 ## Testing Strategy
 
@@ -359,7 +416,7 @@ agent_transport/
 │   │       ├── audio.rs              # AudioFrame
 │   │       ├── events.rs             # EndpointEvent
 │   │       ├── error.rs              # Error types
-│   │       └── recorder.rs           # WAV recording
+│   │       └── recorder.rs           # OGG/Opus recording
 │   │
 │   ├── agent-transport-python/       # Python bindings (PyO3)
 │   │   ├── Cargo.toml
@@ -373,18 +430,30 @@ agent_transport/
 │   └── beep-detector/                # Standalone beep/AMD detection
 │
 ├── python/                           # Python adapters
-│   └── agent_transport_adapters/
-│       ├── livekit/                   # LiveKit AudioInput/AudioOutput
-│       └── pipecat/                   # Pipecat BaseTransport
+│   └── agent_transport/
+│       ├── sip/
+│       │   ├── pipecat/              # Pipecat SipTransport adapter
+│       │   └── livekit/              # LiveKit AgentServer + SIP I/O adapters
+│       └── audio_stream/
+│           ├── pipecat/              # Pipecat AudioStreamTransport + AudioStreamServer
+│           └── livekit/              # LiveKit AudioStreamServer + audio stream I/O adapters
 │
-├── node/                             # Node.js adapter types
+├── node/
+│   └── agent-transport-sip-livekit/  # TypeScript LiveKit adapters (SIP + AudioStream)
 │
 └── examples/
-    ├── livekit_sip_agent.py
-    ├── livekit_audio_stream_agent.py
-    ├── pipecat_sip_agent.py
-    ├── pipecat_audio_stream_agent.py
-    ├── cli_phone.py
-    ├── cli_phone_advanced.py
-    └── cli_phone.js
+    ├── livekit/
+    │   ├── sip_agent.py              # SIP voice agent (Python)
+    │   ├── sip_agent.ts              # SIP voice agent (TypeScript)
+    │   ├── sip_multi_agent.py        # Multi-agent handoff (Python)
+    │   ├── sip_multi_agent.ts        # Multi-agent handoff (TypeScript)
+    │   ├── audio_stream_agent.py     # Audio streaming agent (Python)
+    │   ├── audio_stream_agent.ts     # Audio streaming agent (TypeScript)
+    │   ├── audio_stream_multi_agent.py   # Audio streaming multi-agent (Python)
+    │   └── audio_stream_multi_agent.ts   # Audio streaming multi-agent (TypeScript)
+    ├── pipecat/
+    │   ├── sip_agent.py
+    │   └── audio_stream_agent.py
+    └── cli/
+        └── phone.py
 ```

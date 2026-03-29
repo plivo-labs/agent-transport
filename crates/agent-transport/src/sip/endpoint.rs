@@ -332,7 +332,14 @@ impl SipEndpoint {
     // ─── Outbound call ───────────────────────────────────────────────────────
 
     pub fn call(&self, dest_uri: &str, headers: Option<HashMap<String, String>>) -> Result<String> {
+        self.call_with_from(dest_uri, None, headers)
+    }
+
+    /// Make an outbound call with an optional From URI.
+    /// If `from_uri` is None, uses the registered contact URI.
+    pub fn call_with_from(&self, dest_uri: &str, from_uri: Option<&str>, headers: Option<HashMap<String, String>>) -> Result<String> {
         let (dest, cfg, st, etx) = (dest_uri.to_string(), self.config.clone(), self.state.clone(), self.event_tx.clone());
+        let from_override = from_uri.map(|s| s.to_string());
         self.runtime.block_on(async {
             let (dl, cred, contact, la, pa) = {
                 let s = st.lock().unwrap();
@@ -344,6 +351,13 @@ impl SipEndpoint {
             };
             let la_str = la.addr.host.to_string();
 
+            // Resolve the From/caller URI
+            let caller: rsip::Uri = if let Some(ref from) = from_override {
+                from.clone().try_into().map_err(|e| err(format!("invalid from_uri: {:?}", e)))?
+            } else {
+                contact.clone()
+            };
+
             // SDP offer for the INVITE
             let rtp_sock = UdpSocket::bind("0.0.0.0:0").await.map_err(err)?;
             let rtp_port = rtp_sock.local_addr().unwrap().port();
@@ -352,7 +366,7 @@ impl SipEndpoint {
 
             let custom_hdrs = headers.map(|h| h.into_iter().map(|(k, v)| rsip::Header::Other(k, v)).collect());
             let callee: rsip::Uri = dest.clone().try_into().map_err(|e| err(format!("{:?}", e)))?;
-            let opt = InviteOption { caller: contact.clone(), callee, contact, credential: Some(cred), offer: Some(offer.into_bytes()), content_type: Some("application/sdp".into()), headers: custom_hdrs, ..Default::default() };
+            let opt = InviteOption { caller, callee, contact, credential: Some(cred), offer: Some(offer.into_bytes()), content_type: Some("application/sdp".into()), headers: custom_hdrs, ..Default::default() };
 
             let (ds, dr) = dl.new_dialog_state_channel();
             let (dialog, resp) = dl.do_invite(opt, ds).await.map_err(err)?;

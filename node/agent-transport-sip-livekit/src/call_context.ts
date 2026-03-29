@@ -16,7 +16,8 @@
 import type { SipEndpoint } from 'agent-transport';
 import { SipAudioInput } from './sip_audio_input.js';
 import { SipAudioOutput } from './sip_audio_output.js';
-import { TransportRoom } from '../../adapters/livekit.js';
+import { TransportRoom } from './livekit_adapters.js';
+import { JobProcess } from './agent_server.js';
 
 export interface JobContextOptions {
   callId: string;
@@ -27,6 +28,7 @@ export interface JobContextOptions {
   agentName?: string;
   callEnded: Promise<void>;
   resolveCallEnded: () => void;
+  proc?: JobProcess;
 }
 
 export class JobContext {
@@ -36,16 +38,19 @@ export class JobContext {
   readonly endpoint: SipEndpoint;
   readonly userdata: Record<string, unknown>;
   readonly room: TransportRoom;
+  readonly proc: JobProcess;
 
   private _session: any = null;
   private _callEnded: Promise<void>;
   private _resolveCallEnded: () => void;
+  private _shutdownCallbacks: Array<() => void | Promise<void>> = [];
 
   constructor(opts: JobContextOptions) {
     this.callId = opts.callId;
     this.remoteUri = opts.remoteUri;
     this.direction = opts.direction;
     this.endpoint = opts.endpoint;
+    this.proc = opts.proc ?? new JobProcess();
     this.userdata = opts.userdata;
     this._callEnded = opts.callEnded;
     this._resolveCallEnded = opts.resolveCallEnded;
@@ -80,6 +85,10 @@ export class JobContext {
       this._resolveCallEnded();
       try { this.endpoint.hangup(this.callId); } catch {}
     });
+  }
+
+  addShutdownCallback(callback: () => void | Promise<void>): void {
+    this._shutdownCallbacks.push(callback);
   }
 
   /** @internal Wait for call to end — called by server after entrypoint returns */

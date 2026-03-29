@@ -4,13 +4,6 @@
  * Plivo connects to your WebSocket server and streams audio bidirectionally.
  * No SIP credentials needed — configure Plivo XML to point to your server.
  *
- * Uses the same LiveKit Agents patterns as WebRTC — getJobContext().room works,
- * DTMF events come through room.on("sip_dtmf_received"), built-in tools work.
- *
- * Same Agent code works with both SIP and audio streaming.
- * TS uses AgentServer for both transports; Python has separate
- * AgentServer (SIP) and AudioStreamServer (Plivo WebSocket).
- *
  * Setup:
  *   Configure Plivo XML answer URL to return:
  *   <Response>
@@ -21,29 +14,27 @@
  *   </Response>
  *
  * Usage:
- *   npx ts-node examples/livekit/audio_stream_agent.ts start
- *   npx ts-node examples/livekit/audio_stream_agent.ts dev
+ *   npx ts-node examples/livekit/audio_stream_agent.ts
  */
 
-import { AgentServer, type JobContext } from '@agent-transport/sip-livekit';
-import { voice, llm, metrics } from '@livekit/agents';
-import { getJobContext } from '@livekit/agents';
+import { AudioStreamServer, JobProcess, type AudioStreamJobContext } from '@agent-transport/sip-livekit';
+import { voice, llm, metrics, getJobContext } from '@livekit/agents';
 import * as deepgram from '@livekit/agents-plugin-deepgram';
 import * as openai from '@livekit/agents-plugin-openai';
 import * as silero from '@livekit/agents-plugin-silero';
 import * as livekit from '@livekit/agents-plugin-livekit';
 import { z } from 'zod';
 
-const server = new AgentServer({
-  sipUsername: process.env.SIP_USERNAME ?? '',
-  sipPassword: process.env.SIP_PASSWORD ?? '',
-  sipServer: process.env.SIP_DOMAIN ?? 'phone.plivo.com',
+const server = new AudioStreamServer({
+  listenAddr: process.env.AUDIO_STREAM_ADDR ?? '0.0.0.0:8765',
+  plivoAuthId: process.env.PLIVO_AUTH_ID ?? '',
+  plivoAuthToken: process.env.PLIVO_AUTH_TOKEN ?? '',
 });
 
-server.setup(() => ({
-  vad: silero.VAD.load(),
-  turnDetector: new livekit.turnDetector.MultilingualModel(),
-}));
+server.setupFnc = (proc: JobProcess) => {
+  proc.userData.vad = silero.VAD.load();
+  proc.userData.turnDetector = new livekit.turnDetector.MultilingualModel();
+};
 
 const agent = new voice.Agent({
   instructions:
@@ -62,9 +53,7 @@ const agent = new voice.Agent({
       },
     }),
     endCall: llm.tool({
-      description:
-        'End the call when the user is done. ' +
-        'Call when the user says goodbye or indicates they are finished.',
+      description: 'End the call when the user is done.',
       parameters: z.object({}),
       execute: async (_, ctx) => {
         console.log('End call requested');
@@ -75,14 +64,14 @@ const agent = new voice.Agent({
   },
 });
 
-server.sipSession(async (ctx: JobContext) => {
+server.audioStreamSession(async (ctx: AudioStreamJobContext) => {
   const session = new voice.AgentSession({
-    vad: ctx.userdata.vad as silero.VAD,
+    vad: ctx.proc.userData.vad as silero.VAD,
     stt: new deepgram.STT({ model: 'nova-3' }),
     llm: new openai.LLM({ model: 'gpt-4.1-mini' }),
     tts: new openai.TTS({ voice: 'alloy' }),
     turnHandling: {
-      turnDetection: ctx.userdata.turnDetector as livekit.turnDetector.MultilingualModel,
+      turnDetection: ctx.proc.userData.turnDetector as livekit.turnDetector.MultilingualModel,
     },
     preemptiveGeneration: true,
     aecWarmupDuration: 3000,
