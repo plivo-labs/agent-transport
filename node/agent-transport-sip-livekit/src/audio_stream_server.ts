@@ -245,7 +245,10 @@ export class AudioStreamServer {
         const streamId = ev.session.localUri ?? '';
         const extraHeaders = ev.session.extraHeaders ?? {};
         console.log(`Audio stream session ${sessionId} started (call_id=${callId})`);
-        this.startSession(sessionId, callId, streamId, extraHeaders);
+        this.startSession(sessionId, callId, streamId, extraHeaders).catch((err) => {
+          console.error(`Session ${sessionId} startup failed:`, err);
+          try { this.ep!.hangup(sessionId); } catch {}
+        });
 
       } else if (ev.eventType === 'call_media_active') {
         // Consumed — audio stream fires this together with incoming_call

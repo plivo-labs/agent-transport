@@ -308,7 +308,10 @@ export class AgentServer {
         if (this.pendingInbound.has(callId)) {
           const remoteUri = this.pendingInbound.get(callId)!;
           this.pendingInbound.delete(callId);
-          this.startCall(callId, remoteUri, 'inbound');
+          this.startCall(callId, remoteUri, 'inbound').catch((err) => {
+            console.error(`Inbound call ${callId} failed:`, err);
+            try { this.ep!.hangup(callId); } catch {}
+          });
         } else if (this.pendingOutbound.has(callId)) {
           const pending = this.pendingOutbound.get(callId)!;
           this.pendingOutbound.delete(callId);
@@ -547,6 +550,9 @@ export class AgentServer {
                 console.warn(`Outbound call ${callId} timed out waiting for media`);
                 try { this.ep!.hangup(callId); } catch {}
               }
+            }).catch((err) => {
+              console.error(`Outbound call ${callId} failed:`, err);
+              try { this.ep!.hangup(callId); } catch {}
             });
 
             res.writeHead(200, { 'Content-Type': 'application/json' });
