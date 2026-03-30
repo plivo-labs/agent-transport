@@ -38,6 +38,7 @@ from livekit.agents.utils import MovingAverage
 from livekit.rtc.room import SipDTMF
 from .sip_io import SipAudioInput, SipAudioOutput
 from ._room_facade import TransportRoom, create_transport_context
+from .observability import setup_observability, shutdown_observability, _get_observability_url
 
 logger = logging.getLogger("agent_transport.server")
 
@@ -383,6 +384,12 @@ class AgentServer:
     async def _run(self, *, log_mode: str = "start") -> None:
         self._configure_logging(log_mode)
 
+        # Set up observability if LIVEKIT_OBSERVABILITY_URL is configured.
+        # This replicates what JobContext._setup_cloud_tracer() does in
+        # standard LiveKit — all SDK-instrumented spans (LLM, STT, TTS)
+        # are exported to the configured endpoint automatically.
+        setup_observability()
+
         if not self._sip_username or not self._sip_password:
             logger.error("Set SIP_USERNAME and SIP_PASSWORD environment variables")
             sys.exit(1)
@@ -467,6 +474,7 @@ class AgentServer:
         if self._inference_executor:
             await self._inference_executor.aclose()
         self._ep.shutdown()
+        shutdown_observability()
 
     def _configure_logging(self, mode: str) -> None:
         if mode == "debug":
@@ -708,6 +716,40 @@ class AgentServer:
                     if ctx._room:
                         ctx._room.emit("beep_timeout", {})
 
+    async def _upload_report(
+        self, session, call_id: str, obs_url: str,
+        recording_path: str | None = None, recording_started_at: float | None = None,
+    ) -> None:
+        """Build a SessionReport from the AgentSession and upload it."""
+        from pathlib import Path
+        from livekit.agents.voice.report import SessionReport
+        from livekit.agents.observability import Tagger
+        from livekit.agents.telemetry import _upload_session_report
+        from livekit.agents.utils import http_context
+
+        has_audio = recording_path and os.path.exists(recording_path)
+        report = SessionReport(
+            recording_options={"audio": bool(has_audio), "traces": True, "logs": True, "transcript": True},
+            job_id=str(call_id),
+            room_id=str(call_id),
+            room=str(call_id),
+            options=session.options,
+            events=session._recorded_events,
+            chat_history=session.history.copy(),
+            audio_recording_path=Path(recording_path) if has_audio else None,
+            audio_recording_started_at=recording_started_at if has_audio else None,
+            started_at=session._started_at,
+            model_usage=session.usage.model_usage if session.usage else None,
+        )
+
+        await _upload_session_report(
+            agent_name=self._agent_name,
+            observability_url=obs_url,
+            report=report,
+            tagger=Tagger(),
+            http_session=http_context.http_session(),
+        )
+
     async def _start_call(self, call_id: str, remote_uri: str, direction: str) -> None:
         call_ended = asyncio.Event()
         self._call_ended_events[call_id] = call_ended
@@ -740,6 +782,19 @@ class AgentServer:
             SIP_CALLS_TOTAL.labels(nodename=node, direction=direction).inc()
             call_start = time.monotonic()
 
+            # Start recording if enabled
+            rec_path = None
+            rec_started_at = None
+            if self._recording:
+                try:
+                    os.makedirs(self._recording_dir, exist_ok=True)
+                    rec_path = os.path.join(self._recording_dir, f"call_{call_id}.wav")
+                    self._ep.start_recording(call_id, rec_path, self._recording_stereo)
+                    rec_started_at = time.time()
+                except Exception:
+                    rec_path = None
+                    logger.warning("Failed to start recording for call %s", call_id, exc_info=True)
+
             try:
                 await self._entrypoint_fnc(ctx)
                 # Entrypoint returned — session.start() is non-blocking,
@@ -758,6 +813,15 @@ class AgentServer:
                             logger.info("Call %s usage: %s", call_id, usage)
                     except Exception:
                         pass
+
+                    # Upload session report (transcript, audio, metrics)
+                    obs_url = _get_observability_url()
+                    if obs_url:
+                        try:
+                            await self._upload_report(ctx._session, call_id, obs_url, rec_path, rec_started_at)
+                        except Exception:
+                            logger.warning("Failed to upload session report for call %s", call_id, exc_info=True)
+
                     try:
                         await ctx._session.aclose()
                     except Exception:
