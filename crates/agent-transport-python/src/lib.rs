@@ -920,7 +920,7 @@ fn init_logging(filter: &str) -> PyResult<()> {
     let raw = std::env::var("RUST_LOG").unwrap_or_else(|_| filter.to_string());
     // Expand shorthand levels to filtered versions that skip DNS/transport noise
     let f = match raw.as_str() {
-        "debug" => "agent_transport=debug,rsipstack::transport::udp=debug,rsipstack::dialog=debug,rsipstack::transaction::transaction=debug,rsipstack=warn,hickory=warn".to_string(),
+        "debug" => "agent_transport=debug,rsipstack::transport::stream=debug,rsipstack::transport::tcp=debug,rsipstack::dialog=debug,rsipstack::transaction::transaction=debug,rsipstack=warn,hickory=warn".to_string(),
         "trace" => "agent_transport=trace,rsipstack=debug,hickory=warn".to_string(),
         other => other.to_string(),
     };

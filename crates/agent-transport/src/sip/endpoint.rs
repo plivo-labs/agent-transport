@@ -18,7 +18,7 @@ use rsipstack::dialog::dialog::{DialogState, DialogStateReceiver};
 use rsipstack::dialog::dialog_layer::DialogLayer;
 use rsipstack::dialog::invitation::InviteOption;
 use rsipstack::dialog::registration::Registration;
-use rsipstack::transport::udp::UdpConnection;
+use rsipstack::transport::tcp::TcpConnection;
 use rsipstack::transport::{SipAddr, TransportLayer};
 use rsipstack::EndpointBuilder;
 
@@ -69,8 +69,8 @@ struct EndpointState {
     aor: Option<rsip::Uri>,
     local_addr: Option<SipAddr>,
     public_addr: Option<SocketAddr>,
-    /// UDP connection for SIP signaling NAT keepalive.
-    udp_conn: Option<Arc<UdpConnection>>,
+    /// Resolved SIP server address (pinned for TCP connection reuse).
+    sip_server_addr: Option<SocketAddr>,
 }
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
@@ -233,17 +233,30 @@ impl SipEndpoint {
         let state = Arc::new(Mutex::new(EndpointState {
             registered: false, calls: HashMap::new(),
             dialog_layer: None, credential: None, contact_uri: None, aor: None,
-            local_addr: None, public_addr: None, udp_conn: None,
+            local_addr: None, public_addr: None, sip_server_addr: None,
         }));
 
-        let (st, cc, etx2, lp, ua, isr, osr) = (state.clone(), cancel.clone(), etx.clone(), config.local_port, config.user_agent.clone(), config.input_sample_rate, config.output_sample_rate);
+        let (st, cc, etx2, ua, isr, osr) = (state.clone(), cancel.clone(), etx.clone(), config.user_agent.clone(), config.input_sample_rate, config.output_sample_rate);
+        let sip_server = config.sip_server.clone();
+        let sip_port = config.sip_port;
         rt.block_on(async {
-            let addr: SocketAddr = format!("0.0.0.0:{}", lp).parse().unwrap();
-            let udp = UdpConnection::create_connection(addr, None, Some(cc.clone())).await.map_err(err)?;
-            let la = udp.get_addr().clone();
-            let udp_for_keepalive = udp.clone();
+            // SIP signaling over TCP with Via alias (RFC 5923) for NAT traversal.
+            // The proxy reuses the TCP connection to send INVITEs back to us.
+            let remote_addr: SocketAddr = tokio::net::lookup_host(format!("{}:{}", sip_server, sip_port)).await
+                .map_err(|e| err(format!("DNS resolve {}:{}: {}", sip_server, sip_port, e)))?
+                .next().ok_or_else(|| err(format!("DNS returned no results for {}", sip_server)))?;
+            info!("SIP server {} resolved to {} (TCP)", sip_server, remote_addr);
+            let remote_sip = SipAddr::new(rsip::Transport::Tcp, format!("{}:{}", remote_addr.ip(), remote_addr.port()).try_into().map_err(|e| err(format!("{:?}", e)))?);
+            let tcp = TcpConnection::connect(&remote_sip, Some(cc.clone())).await.map_err(|e| err(format!("TCP connect to {}: {}", remote_addr, e)))?;
+            let la = tcp.inner.local_addr.clone();
+            info!("TCP connected to {} (local: {})", remote_addr, la);
+
             let tl = TransportLayer::new(cc.clone());
-            tl.add_transport(udp.into());
+            let tcp_conn: rsipstack::transport::SipConnection = tcp.into();
+            // add_connection: stores by remote_addr for lookup (reuses existing connection).
+            // Also starts serve_connection internally (read loop for incoming SIP).
+            tl.add_connection(tcp_conn);
+
             let mut b = EndpointBuilder::new();
             let mut ep_option = rsipstack::transaction::endpoint::EndpointOption::default();
             ep_option.callid_suffix = Some("agent-transport".to_string());
@@ -255,8 +268,7 @@ impl SipEndpoint {
             let cc2 = cc.clone();
             tokio::spawn(async move { tokio::select! { _ = ep.serve() => {}, _ = cc2.cancelled() => {} } });
 
-            // Incoming transaction handler — routes INVITEs to handle_incoming,
-            // and in-dialog requests (BYE, INFO, etc.) to the existing dialog.
+            // Incoming transaction handler
             let (dl2, st2, etx3) = (dl.clone(), st.clone(), etx2.clone());
             let mut rx = rx;
             tokio::spawn(async move {
@@ -264,7 +276,6 @@ impl SipEndpoint {
                     if tx.original.method == rsip::Method::Invite {
                         handle_incoming(&dl2, &st2, &etx3, tx, isr, osr).await;
                     } else if let Some(dialog) = dl2.match_dialog(&tx) {
-                        // Route in-dialog requests (BYE, INFO, REFER, etc.) to the dialog
                         match dialog {
                             rsipstack::dialog::dialog::Dialog::ServerInvite(mut d) => { let _ = d.handle(&mut tx).await; }
                             rsipstack::dialog::dialog::Dialog::ClientInvite(mut d) => { let _ = d.handle(&mut tx).await; }
@@ -277,7 +288,7 @@ impl SipEndpoint {
             let mut s = st.lock().unwrap();
             s.dialog_layer = Some(dl);
             s.local_addr = Some(la);
-            s.udp_conn = Some(Arc::new(udp_for_keepalive));
+            s.sip_server_addr = Some(remote_addr);
             Ok::<_, EndpointError>(())
         })?;
 
@@ -286,7 +297,7 @@ impl SipEndpoint {
     }
 
     pub fn register(&self, username: &str, password: &str) -> Result<()> {
-        let (srv, port, exp, stun) = (self.config.sip_server.clone(), self.config.sip_port, self.config.register_expires, self.config.stun_server.clone());
+        let (srv, exp, stun) = (self.config.sip_server.clone(), self.config.register_expires, self.config.stun_server.clone());
         let (user, pass) = (username.to_string(), password.to_string());
         let (st, etx, cc) = (self.state.clone(), self.event_tx.clone(), self.cancel.clone());
 
@@ -294,55 +305,48 @@ impl SipEndpoint {
             let cred = Credential { username: user.clone(), password: pass.clone(), realm: None };
             let (ei, la) = { let s = st.lock().unwrap(); (s.dialog_layer.as_ref().unwrap().endpoint.clone(), s.local_addr.clone().unwrap()) };
 
+            // STUN for SDP/RTP (media path still uses UDP)
             let pa = sdp::stun_binding(&stun).ok();
-            if let Some(a) = pa { info!("STUN: public {}", a); }
+            if let Some(a) = pa { info!("STUN: public {} (for RTP/SDP)", a); }
 
+            // Contact with transport=tcp — proxy sends INVITEs over our TCP connection
             let (ch, cp) = pa.map(|a| (a.ip().to_string(), a.port())).unwrap_or((la.addr.host.to_string(), la.addr.port.map(u16::from).unwrap_or(5060)));
-            let contact_uri: rsip::Uri = format!("sip:{}@{}:{}", user, ch, cp).try_into().map_err(|e| err(format!("{:?}", e)))?;
+            let contact_uri: rsip::Uri = format!("sip:{}@{}:{};transport=tcp", user, ch, cp).try_into().map_err(|e| err(format!("{:?}", e)))?;
             let mut reg = Registration::new(ei, Some(cred.clone()));
-            // Set STUN address as initial public_address. Don't pin reg.contact —
-            // let rsipstack's fallback use public_address, which gets updated from
-            // the Via rport/received after 401 challenge. This ensures the Contact
-            // in the auth'd retry matches the actual source port seen by the server.
             let stun_hp: rsip::HostWithPort = format!("{}:{}", ch, cp).try_into().map_err(|e| err(format!("{:?}", e)))?;
             reg.public_address = Some(stun_hp);
+            // Set explicit Contact with transport=tcp so it's preserved through 401 auth retry
+            reg.contact = Some(rsip::typed::Contact {
+                display_name: None,
+                uri: contact_uri.clone(),
+                params: vec![],
+            });
 
-            // Pin outbound proxy to resolved IP for NAT consistency.
-            // Resolve SIP server DNS once and pin the IP for NAT consistency.
-            // SIP domains may resolve to different proxy cluster IPs each time.
-            // Behind NAT, the UDP mapping is per-destination-IP — if we send to
-            // different IPs, the NAT mapping breaks and incoming INVITEs get dropped.
-            // We set outbound_proxy on the Registration to pin all SIP signaling
-            // to one proxy node while keeping the domain in SIP headers.
-            let resolved_addr = tokio::net::lookup_host(format!("{}:{}", srv, port)).await
-                .map_err(|e| err(format!("DNS resolve failed for {}:{}: {}", srv, port, e)))?
-                .next().ok_or_else(|| err(format!("DNS returned no results for {}", srv)))?;
-            info!("SIP server {} resolved to {}", srv, resolved_addr);
-            let server_uri: rsip::Uri = format!("sip:{}:{}", resolved_addr.ip(), resolved_addr.port()).try_into().map_err(|e| err(format!("{:?}", e)))?;
-            // AOR (Address of Record) — sip:user@domain — used as From in outbound calls
+            // server_uri with transport=tcp so rsipstack routes via TCP
+            let server_uri: rsip::Uri = format!("sip:{};transport=tcp", srv).try_into().map_err(|e| err(format!("{:?}", e)))?;
+            // Pin re-registration to the resolved IP so it reuses the existing TCP connection.
+            // Without this, DNS re-resolution may return a different IP, causing lookup() to
+            // open a new TCP connection and breaking the Via alias mapping.
+            let sip_addr = st.lock().unwrap().sip_server_addr;
+            if let Some(addr) = sip_addr {
+                reg.outbound_proxy = Some(addr);
+            }
             let aor: rsip::Uri = format!("sip:{}@{}", user, srv).try_into().map_err(|e| err(format!("{:?}", e)))?;
             let resp = reg.register(server_uri.clone(), Some(exp)).await.map_err(err)?;
 
             if resp.status_code == rsip::StatusCode::OK {
                 let discovered = reg.discovered_public_address();
-                let _final_contact = if let Some(ref hp) = discovered {
-                    let h = hp.host.to_string();
-                    let p = hp.port.as_ref().map(|p| u16::from(p.clone())).unwrap_or(cp);
-                    info!("Registered {}@{} (NAT: {}:{})", user, srv, h, p);
-                    let uri: rsip::Uri = format!("sip:{}@{}:{}", user, h, p).try_into().map_err(|e| err(format!("{:?}", e)))?;
-                    let nat_addr = format!("{}:{}", h, p).parse::<std::net::SocketAddr>().ok();
-                    { let mut s = st.lock().unwrap(); s.registered = true; s.credential = Some(cred); s.contact_uri = Some(uri.clone()); s.aor = Some(aor.clone()); s.public_addr = nat_addr.or(pa); }
-                    uri
+                if let Some(ref hp) = discovered {
+                    info!("Registered {}@{} (TCP, discovered: {})", user, srv, hp);
                 } else {
-                    info!("Registered {}@{}", user, srv);
-                    { let mut s = st.lock().unwrap(); s.registered = true; s.credential = Some(cred); s.contact_uri = Some(contact_uri.clone()); s.aor = Some(aor.clone()); s.public_addr = pa; }
-                    contact_uri
-                };
+                    info!("Registered {}@{} (TCP)", user, srv);
+                }
+                { let mut s = st.lock().unwrap(); s.registered = true; s.credential = Some(cred); s.contact_uri = Some(contact_uri.clone()); s.aor = Some(aor.clone()); s.public_addr = pa; }
                 let _ = etx.try_send(EndpointEvent::Registered);
 
+                // Re-registration loop (TCP keepalive is handled by the persistent connection)
                 let re = reg.expires().max(50) as u64;
                 let (st2, etx2) = (st.clone(), etx.clone());
-                let cc2 = cc.clone();
                 tokio::spawn(async move {
                     loop {
                         tokio::select! { _ = cc.cancelled() => break, _ = tokio::time::sleep(std::time::Duration::from_secs(re)) => {} }
@@ -353,23 +357,6 @@ impl SipEndpoint {
                         }
                     }
                 });
-
-                // SIP signaling NAT keepalive — send CRLF pings to the registration proxy
-                // every 15s to keep the UDP NAT mapping alive between re-registrations.
-                // Without this, symmetric NAT may drop the mapping (typical 30s timeout)
-                // before the next re-registration, causing incoming INVITEs to be lost.
-                let udp_ka = st.lock().unwrap().udp_conn.clone();
-                if let Some(udp_ka) = udp_ka {
-                    // Keepalive to the same resolved proxy IP as registration
-                    let sip_dest = SipAddr::from(resolved_addr);
-                    tokio::spawn(async move {
-                        let mut iv = tokio::time::interval(std::time::Duration::from_secs(15));
-                        loop {
-                            tokio::select! { _ = cc2.cancelled() => break, _ = iv.tick() => {} }
-                            let _ = udp_ka.send_raw(b"\r\n\r\n", &sip_dest).await;
-                        }
-                    });
-                }
 
                 Ok(())
             } else {
@@ -426,7 +413,11 @@ impl SipEndpoint {
             let offer = sdp::build_offer(sdp_ip, rtp_port, &cfg.codecs);
 
             let custom_hdrs = headers.map(|h| h.into_iter().map(|(k, v)| rsip::Header::Other(k, v)).collect());
-            let callee: rsip::Uri = dest.clone().try_into().map_err(|e| err(format!("{:?}", e)))?;
+            // Add transport=tcp to callee URI so the INVITE routes over TCP
+            let dest_tcp = if !dest.contains("transport=") {
+                format!("{};transport=tcp", dest)
+            } else { dest.clone() };
+            let callee: rsip::Uri = dest_tcp.try_into().map_err(|e| err(format!("{:?}", e)))?;
             let opt = InviteOption { caller, callee, contact, credential: Some(cred), offer: Some(offer.into_bytes()), content_type: Some("application/sdp".into()), headers: custom_hdrs, ..Default::default() };
 
             let (ds, dr) = dl.new_dialog_state_channel();

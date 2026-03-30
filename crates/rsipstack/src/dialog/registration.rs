@@ -427,7 +427,12 @@ impl Registration {
         // This keeps the domain in SIP headers (Request-URI, From, To) while
         // sending all packets to the pinned proxy IP for NAT consistency.
         if let Some(proxy) = &self.outbound_proxy {
-            tx.destination = Some(SipAddr::from(*proxy));
+            let mut dest = SipAddr::from(*proxy);
+            // Inherit transport type from the request URI (e.g., TCP)
+            if let Some(rsip::Param::Transport(t)) = tx.original.uri().params.iter().find(|p| matches!(p, rsip::Param::Transport(_))) {
+                dest.r#type = Some(t.clone());
+            }
+            tx.destination = Some(dest);
         }
 
         tx.send().await?;
@@ -448,7 +453,15 @@ impl Registration {
                                 "updated public address from 401 response"
                             );
                             self.public_address = received;
-                            self.contact = None;
+                            // Update the Contact's host/port but preserve URI params
+                            // (e.g., transport=tcp) so they persist across re-registrations.
+                            if let Some(ref mut contact) = self.contact {
+                                if let Some(ref pa) = self.public_address {
+                                    contact.uri.host_with_port = pa.clone();
+                                }
+                            } else {
+                                self.contact = None;
+                            }
                         }
 
                         if auth_sent {
@@ -470,7 +483,8 @@ impl Registration {
                                     auth: contact_for_retry.uri.auth.clone(),
                                     scheme: Some(rsip::Scheme::Sip),
                                     host_with_port: pa.clone(),
-                                    params: vec![],
+                                    // Preserve URI params (e.g., transport=tcp) from original Contact
+                                    params: contact_for_retry.uri.params.clone(),
                                     headers: vec![],
                                 };
                                 let mut new_contact = contact_for_retry.clone();
@@ -494,11 +508,10 @@ impl Registration {
                         // Do NOT adopt the Contact from the 200 OK response.
                         // The response may contain Contact bindings from OTHER
                         // devices sharing the same AOR (Address of Record).
-                        // Blindly reusing it would corrupt our Contact in
-                        // subsequent re-registrations, routing calls to the
-                        // wrong host. Instead, always derive Contact from
-                        // self.public_address (set from Via received parameter).
-                        self.contact = None;
+                        // Keep self.contact as-is — if explicitly set by the caller
+                        // (e.g., with transport=tcp), it should persist across
+                        // re-registrations. The Contact is rebuilt from
+                        // public_address only when self.contact is None.
 
                         if self.public_address != received {
                             debug!(

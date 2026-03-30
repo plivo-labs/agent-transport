@@ -592,14 +592,21 @@ impl EndpointInner {
                 .cloned()?,
         };
 
+        let transport = first_addr.r#type.unwrap_or_default();
+        let mut params = vec![
+            branch.unwrap_or_else(make_via_branch),
+            rsip::Param::Other("rport".into(), None),
+        ];
+        // RFC 5923: alias parameter tells the proxy to reuse this TCP connection
+        // for sending requests back to us (essential for NAT traversal over TCP).
+        if transport == rsip::Transport::Tcp || transport == rsip::Transport::Tls {
+            params.push(rsip::Param::Other("alias".into(), None));
+        }
         let via = rsip::typed::Via {
             version: rsip::Version::V2,
-            transport: first_addr.r#type.unwrap_or_default(),
+            transport,
             uri: first_addr.addr.into(),
-            params: vec![
-                branch.unwrap_or_else(make_via_branch),
-                rsip::Param::Other("rport".into(), None),
-            ],
+            params,
         };
         Ok(via)
     }

@@ -72,9 +72,6 @@ pub struct EndpointConfig {
     /// User-Agent header string
     pub user_agent: String,
 
-    /// Local SIP port to bind (0 = auto)
-    pub local_port: u16,
-
     /// Registration expiry in seconds
     pub register_expires: u32,
 
@@ -132,7 +129,6 @@ impl Default for EndpointConfig {
             codecs: vec![Codec::PCMU, Codec::PCMA],
             log_level: 3,
             user_agent: "agent-transport/0.1.0".into(),
-            local_port: 0,
             register_expires: 120,
             input_sample_rate: 8000,
             output_sample_rate: 8000,
