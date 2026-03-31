@@ -201,7 +201,8 @@ class WebsocketServerTransport:
             listen_addr=self._listen_addr,
             plivo_auth_id=self._plivo_auth_id,
             plivo_auth_token=self._plivo_auth_token,
-            sample_rate=self._sample_rate,
+            input_sample_rate=self._sample_rate,
+            output_sample_rate=self._sample_rate,
         )
         logger.info("WebSocket server listening on %s", self._listen_addr)
 
