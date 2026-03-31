@@ -200,9 +200,11 @@ cargo build --features audio-processing         # + jitter buffer, PLC, comfort 
 ```bash
 # 1. Build the native Rust binding
 cd crates/agent-transport-node && npm run build
+cd ../..
 
 # 2. Install the SIP adapter
 cd node/agent-transport-sip-livekit && npm install && npm run build
+cd ../..
 
 # 3. Install LiveKit plugins
 npm install @livekit/agents @livekit/agents-plugin-silero \
