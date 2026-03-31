@@ -11,3 +11,8 @@ license = "MIT"
 
 [tool.maturin]
 features = []
+
+[tool.maturin.environment]
+# CMake 4.x removed compatibility with cmake_minimum_required < 3.5.
+# The bundled opus source (audiopus_sys) uses an older version spec.
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

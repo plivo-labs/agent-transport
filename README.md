@@ -106,13 +106,15 @@ Full examples: [`audio_stream_agent.py`](examples/pipecat/audio_stream_agent.py)
 
 ### Rust Core
 
-No system dependencies — pure Rust.
+Requires CMake for the bundled Opus codec. No other system dependencies.
 
 ```bash
 cargo build                                     # Core library (SIP transport)
 cargo build --features audio-stream             # + Plivo audio streaming
 cargo build --features audio-processing         # + jitter buffer, PLC, comfort noise
 ```
+
+> **CMake 4.x note:** If you see `Compatibility with CMake < 3.5 has been removed`, set `CMAKE_POLICY_VERSION_MINIMUM=3.5` in your environment before building.
 
 ### Python
 

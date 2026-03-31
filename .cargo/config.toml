@@ -1,0 +1,4 @@
+[env]
+# CMake 4.x removed compatibility with cmake_minimum_required < 3.5.
+# The bundled opus (audiopus_sys) and aws-lc-sys use older version specs.
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

@@ -38,13 +38,15 @@ node/
 
 No system dependencies — pure Rust.
 
+Requires: Rust, C compiler, CMake. On CMake 4.x, set `CMAKE_POLICY_VERSION_MINIMUM=3.5`.
+
 ```bash
 cargo build                                     # Core library
 cargo build --features audio-stream             # + Plivo audio streaming
 cargo build --features audio-processing         # + jitter buffer, PLC, comfort noise
-cd crates/agent-transport-python && maturin develop  # Python binding
-cd crates/agent-transport-node && npm run build      # Node binding
-cd python && pip install -e ".[all]"                 # Python adapters
+cd crates/agent-transport-python && pip install -e .  # Python binding (sets CMAKE env automatically)
+cd crates/agent-transport-node && npm run build       # Node binding (sets CMAKE env automatically)
+cd python && pip install -e ".[all]"                  # Python adapters
 ```
 
 ## Key Design Principles

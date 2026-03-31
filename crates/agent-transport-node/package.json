@@ -15,8 +15,8 @@
     ]
   },
   "scripts": {
-    "build": "napi build --release",
-    "build:debug": "napi build"
+    "build": "CMAKE_POLICY_VERSION_MINIMUM=3.5 napi build --release",
+    "build:debug": "CMAKE_POLICY_VERSION_MINIMUM=3.5 napi build"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3"
