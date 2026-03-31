@@ -1,0 +1,16 @@
+{
+  "name": "agent-transport-win32-arm64-msvc",
+  "version": "0.1.0",
+  "cpu": [
+    "arm64"
+  ],
+  "main": "agent-transport.win32-arm64-msvc.node",
+  "files": [
+    "agent-transport.win32-arm64-msvc.node"
+  ],
+  "description": "SIP and audio streaming transport for AI voice agents (pure Rust)",
+  "license": "MIT",
+  "os": [
+    "win32"
+  ]
+}
