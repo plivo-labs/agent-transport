@@ -39,3 +39,4 @@ audio/temp/
 testing/
 todos/
 real_tests/
+**/python/build/
