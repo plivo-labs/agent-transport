@@ -20,7 +20,7 @@ import { cpus } from 'node:os';
 import { hostname } from 'node:os';
 import { mkdirSync } from 'node:fs';
 import { SipEndpoint } from 'agent-transport';
-import { initializeLogger, InferenceRunner, runWithJobContext } from '@livekit/agents';
+import { initializeLogger, InferenceRunner, runWithJobContext, log as agentLog, voice } from '@livekit/agents';
 import { JobContext } from './call_context.js';
 
 export class JobProcess {
@@ -428,19 +428,6 @@ export class AgentServer {
           await runWithJobContext(stub as any, () => this.entrypointFn!(ctx));
         } else {
           await this.entrypointFn!(ctx);
-        }
-
-        // Log agent state transitions (matching Python AgentServer behavior)
-        if (ctx.session) {
-          const session = ctx.session as any;
-          if (typeof session.on === 'function') {
-            session.on('agent_state_changed', (ev: any) => {
-              console.log(`Call ${callId} agent: ${ev.oldState ?? ev.old_state} -> ${ev.newState ?? ev.new_state}`);
-            });
-            session.on('user_state_changed', (ev: any) => {
-              console.log(`Call ${callId} user: ${ev.oldState ?? ev.old_state} -> ${ev.newState ?? ev.new_state}`);
-            });
-          }
         }
 
         // Entrypoint returned — session.start() is non-blocking,

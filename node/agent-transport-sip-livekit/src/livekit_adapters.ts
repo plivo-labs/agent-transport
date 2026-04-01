@@ -210,7 +210,18 @@ export class TransportLocalParticipant {
   async setMetadata(metadata: string): Promise<void> { this.metadata = metadata; }
   async setName(name: string): Promise<void> { this.name = name; }
   async setAttributes(attributes: Record<string, string>): Promise<void> {
+    const oldState = this.attributes['lk.agent.state'];
     Object.assign(this.attributes, attributes);
+    // Log agent state transitions (matches Python AgentServer behavior)
+    const newState = this.attributes['lk.agent.state'];
+    if (newState && newState !== oldState) {
+      try {
+        const { log } = await import('@livekit/agents');
+        log().info(`Call ${this._sessionId} agent: ${oldState ?? 'initializing'} -> ${newState}`);
+      } catch {
+        console.log(`Call ${this._sessionId} agent: ${oldState ?? 'initializing'} -> ${newState}`);
+      }
+    }
   }
   registerRpcMethod(methodName: string, handler?: any): any { return handler; }
   unregisterRpcMethod(method: string): void {}
