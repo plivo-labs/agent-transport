@@ -151,8 +151,17 @@ npm install @livekit/agents @livekit/agents-plugin-silero \
   @livekit/agents-plugin-deepgram @livekit/agents-plugin-openai \
   @livekit/agents-plugin-livekit zod
 
-# 4. Download turn detection models (required for MultilingualModel)
+# 4. Set up npm workspaces and install LiveKit plugins
+cd ../.. && npm install  # root package.json links workspaces
+npm install @livekit/agents @livekit/agents-plugin-silero \
+  @livekit/agents-plugin-deepgram @livekit/agents-plugin-openai \
+  @livekit/agents-plugin-livekit zod
+
+# 5. Download turn detection models
 npx tsx examples/livekit/sip_agent.ts download-files
+
+# 6. Run
+npx tsx examples/livekit/sip_agent.ts dev
 ```
 
 ## Examples

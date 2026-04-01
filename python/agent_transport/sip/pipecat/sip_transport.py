@@ -25,6 +25,7 @@ Pipecat's BaseOutputTransport MediaSender infrastructure.
 import asyncio
 import json
 import logging
+import time
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -219,6 +220,9 @@ class SipOutputTransport(BaseOutputTransport):
             return
         self._started = True
         await super().start(frame)
+        # Compute send interval for clock-based pacing (matches Pipecat WebSocket transport)
+        self._send_interval = (self.audio_chunk_size / self.sample_rate) / 2
+        self._next_send_time = 0.0
         await self.set_transport_ready(frame)
 
     def _supports_native_dtmf(self) -> bool:
@@ -230,12 +234,26 @@ class SipOutputTransport(BaseOutputTransport):
         await loop.run_in_executor(None, lambda: self._ep.send_dtmf(self._cid, digit))
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
-        """Send audio frame to SIP call."""
+        """Send audio frame to SIP call with clock-based pacing.
+
+        Matches Pipecat's WebSocket transport _write_audio_sleep() pattern:
+        simulate audio device timing so frames are paced at real-time rate.
+        The Rust RTP loop handles the actual 20ms packetization and sending.
+        """
         try:
             self._ep.send_audio_bytes(self._cid, frame.audio, frame.sample_rate, frame.num_channels)
-            return True
         except Exception:
             return False
+
+        # Clock-based pacing (same as Pipecat WebSocket transport _write_audio_sleep)
+        current_time = time.monotonic()
+        sleep_duration = max(0, self._next_send_time - current_time)
+        await asyncio.sleep(sleep_duration)
+        if sleep_duration == 0:
+            self._next_send_time = time.monotonic() + self._send_interval
+        else:
+            self._next_send_time += self._send_interval
+        return True
 
     def queued_frames(self) -> int:
         """Number of 20ms audio frames buffered in the Rust outgoing queue."""
@@ -267,6 +285,8 @@ class SipOutputTransport(BaseOutputTransport):
                 self._ep.clear_buffer(self._cid)
             except Exception as e:
                 logger.debug("clear_buffer on interruption failed: %s", e)
+            # Reset pacing clock on interruption (matches Pipecat WebSocket transport)
+            self._next_send_time = 0.0
 
         await super().process_frame(frame, direction)
 

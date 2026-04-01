@@ -26,6 +26,7 @@ chunking, and bot speaking detection.
 import asyncio
 import json
 import logging
+import time
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -221,6 +222,9 @@ class AudioStreamOutputTransport(BaseOutputTransport):
             return
         self._started = True
         await super().start(frame)
+        # Clock-based pacing (matches Pipecat WebSocket transport)
+        self._send_interval = (self.audio_chunk_size / self.sample_rate) / 2
+        self._next_send_time = 0.0
         await self.set_transport_ready(frame)
 
     def _supports_native_dtmf(self) -> bool:
@@ -232,17 +236,25 @@ class AudioStreamOutputTransport(BaseOutputTransport):
         await loop.run_in_executor(None, lambda: self._ep.send_dtmf(self._sid, digit))
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
-        """Send audio frame to audio stream.
+        """Send audio frame to audio stream with clock-based pacing.
 
-        Audio is pushed to the Rust AudioBuffer which handles pacing
-        (20ms intervals via tokio::time::interval). No Python-side
-        backpressure needed — matches Pipecat's WebSocket transport pattern.
+        Matches Pipecat's WebSocket transport _write_audio_sleep() pattern.
+        The Rust send loop handles actual 20ms packetization and sending.
         """
         try:
             self._ep.send_audio_bytes(self._sid, frame.audio, frame.sample_rate, frame.num_channels)
-            return True
         except Exception:
             return False
+
+        # Clock-based pacing (same as Pipecat WebSocket transport _write_audio_sleep)
+        current_time = time.monotonic()
+        sleep_duration = max(0, self._next_send_time - current_time)
+        await asyncio.sleep(sleep_duration)
+        if sleep_duration == 0:
+            self._next_send_time = time.monotonic() + self._send_interval
+        else:
+            self._next_send_time += self._send_interval
+        return True
 
     def queued_frames(self) -> int:
         """Number of 20ms audio frames buffered in the Rust outgoing queue.
@@ -282,6 +294,8 @@ class AudioStreamOutputTransport(BaseOutputTransport):
                 self._ep.clear_buffer(self._sid)
             except Exception as e:
                 logger.debug("clear_buffer on interruption failed: %s", e)
+            # Reset pacing clock on interruption (matches Pipecat WebSocket transport)
+            self._next_send_time = 0.0
 
         await super().process_frame(frame, direction)
 

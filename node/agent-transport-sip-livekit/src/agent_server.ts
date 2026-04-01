@@ -20,7 +20,7 @@ import { cpus } from 'node:os';
 import { hostname } from 'node:os';
 import { mkdirSync } from 'node:fs';
 import { SipEndpoint } from 'agent-transport';
-import { initializeLogger, InferenceRunner, runWithJobContext } from '@livekit/agents';
+import { initializeLogger, InferenceRunner, runWithJobContext, log as agentLog, voice } from '@livekit/agents';
 import { JobContext } from './call_context.js';
 
 export class JobProcess {
@@ -429,6 +429,7 @@ export class AgentServer {
         } else {
           await this.entrypointFn!(ctx);
         }
+
         // Entrypoint returned — session.start() is non-blocking,
         // so wait for call to actually end (BYE or agent shutdown)
         await ctx.callEnded;
