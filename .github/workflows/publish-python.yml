@@ -5,6 +5,11 @@ on:
     workflows: ["Build Python"]
     types: [completed]
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      run-id:
+        description: 'Build workflow run ID to publish from'
+        required: true
 
 permissions:
   contents: read
@@ -12,34 +17,41 @@ permissions:
 
 jobs:
   check:
-    if: github.event.workflow_run.conclusion == 'success'
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     outputs:
       should-publish: ${{ steps.check.outputs.should-publish }}
       version: ${{ steps.check.outputs.version }}
+      run-id: ${{ steps.check.outputs.run-id }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Check for release label on merged PR
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          SHA="${{ github.event.workflow_run.head_sha }}"
-          LABELS=$(gh api "repos/${{ github.repository }}/commits/$SHA/pulls" \
-            --jq 'if length > 0 then .[0].labels[].name else empty end' 2>/dev/null || echo "")
-          if echo "$LABELS" | grep -q "release-python-sdk"; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "should-publish=true" >> $GITHUB_OUTPUT
-            VERSION=$(grep '^version' crates/agent-transport-python/pyproject.toml \
-              | head -1 | sed 's/.*"\(.*\)"/\1/')
-            echo "version=$VERSION" >> $GITHUB_OUTPUT
-            echo "Publishing agent-transport v$VERSION to PyPI"
+            echo "run-id=${{ inputs.run-id }}" >> $GITHUB_OUTPUT
           else
-            echo "should-publish=false" >> $GITHUB_OUTPUT
-            echo "No release-python-sdk label found, skipping"
+            SHA="${{ github.event.workflow_run.head_sha }}"
+            LABELS=$(gh api "repos/${{ github.repository }}/commits/$SHA/pulls" \
+              --jq 'if length > 0 then .[0].labels[].name else empty end' 2>/dev/null || echo "")
+            if echo "$LABELS" | grep -q "release-python-sdk"; then
+              echo "should-publish=true" >> $GITHUB_OUTPUT
+            else
+              echo "should-publish=false" >> $GITHUB_OUTPUT
+              echo "No release-python-sdk label found, skipping"
+            fi
+            echo "run-id=${{ github.event.workflow_run.id }}" >> $GITHUB_OUTPUT
           fi
+          VERSION=$(grep '^version' crates/agent-transport-python/pyproject.toml \
+            | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Publishing agent-transport v$VERSION to PyPI"
 
   publish:
     needs: check
@@ -54,7 +66,7 @@ jobs:
       - name: Download wheel artifacts
         uses: actions/download-artifact@v4
         with:
-          run-id: ${{ github.event.workflow_run.id }}
+          run-id: ${{ needs.check.outputs.run-id }}
           github-token: ${{ github.token }}
           pattern: wheels-*
           path: dist
