@@ -8,7 +8,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -65,3 +65,11 @@ jobs:
             else
               apt-get update && apt-get install -y cmake libopus-dev
             fi
+
+      - name: Upload wheels
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: crates/agent-transport-python/dist/*.whl
+          retention-days: 1

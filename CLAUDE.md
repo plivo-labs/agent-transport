@@ -57,6 +57,26 @@ cd python && pip install -e ".[all]"                  # Python adapters
 - **Feature-gated optional modules**: jitter-buffer, plc, comfort-noise, audio-stream
 - **Backward-compatible exports**: SipEndpoint re-exported at crate root for bindings
 
+## Releasing
+
+Publish is triggered by PR labels — no tags or GitHub Releases needed.
+
+1. Bump the version in the relevant file:
+   - **Python**: `crates/agent-transport-python/pyproject.toml`
+   - **Node**: `crates/agent-transport-node/package.json` + all `crates/agent-transport-node/npm/*/package.json`
+2. Add the label to the PR:
+   - `release-python-sdk` — publishes to PyPI
+   - `release-node-sdk` — publishes to npm
+3. Merge the PR to `main`. The build workflow runs, then the publish workflow picks up artifacts and publishes.
+
+Python and Node releases are independent — you can release one without the other.
+
+### Prerequisites (one-time setup)
+
+- **PyPI**: Configure trusted publisher at pypi.org for `agent-transport` (workflow: `publish-python.yml`, environment: `pypi`)
+- **npm**: Create automation token, store as `NPM_TOKEN` in GitHub Environment `npm`
+- **GitHub**: Create environments `pypi` and `npm`, create labels `release-python-sdk` and `release-node-sdk`
+
 ## Git Conventions
 
 - Do NOT include "Co-Authored-By" lines or any mention of Claude/Anthropic in commit messages.

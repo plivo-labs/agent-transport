@@ -8,7 +8,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -54,3 +54,11 @@ jobs:
       - name: Build native package
         working-directory: crates/agent-transport-node
         run: bunx napi build --release --platform --target ${{ matrix.target }}
+
+      - name: Upload bindings
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: crates/agent-transport-node/agent-transport.*.node
+          retention-days: 1

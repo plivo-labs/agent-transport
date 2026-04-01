@@ -175,6 +175,17 @@ npx tsx examples/livekit/sip_agent.ts download-files
 
 See also: [Feature Flags & CLI Phone docs](docs/features.md)
 
+## Releasing
+
+Publishing is label-driven. Add a label to your PR before merging to `main`:
+
+| Label | Registry | Version file |
+|-------|----------|-------------|
+| `release-python-sdk` | PyPI | `crates/agent-transport-python/pyproject.toml` |
+| `release-node-sdk` | npm | `crates/agent-transport-node/package.json` |
+
+Python and Node releases are independent. Bump the version, add the label, merge — the CI handles the rest.
+
 ## License
 
 MIT

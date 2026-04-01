@@ -1,0 +1,90 @@
+name: Publish Node SDK
+
+on:
+  workflow_run:
+    workflows: ["Build Node"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  check:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      should-publish: ${{ steps.check.outputs.should-publish }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Check for release label on merged PR
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA="${{ github.event.workflow_run.head_sha }}"
+          LABELS=$(gh api "repos/${{ github.repository }}/commits/$SHA/pulls" \
+            --jq 'if length > 0 then .[0].labels[].name else empty end' 2>/dev/null || echo "")
+          if echo "$LABELS" | grep -q "release-node-sdk"; then
+            echo "should-publish=true" >> $GITHUB_OUTPUT
+            VERSION=$(node -p "require('./crates/agent-transport-node/package.json').version")
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "Publishing agent-transport v$VERSION to npm"
+          else
+            echo "should-publish=false" >> $GITHUB_OUTPUT
+            echo "No release-node-sdk label found, skipping"
+          fi
+
+  publish:
+    needs: check
+    if: needs.check.outputs.should-publish == 'true'
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        working-directory: crates/agent-transport-node
+        run: bun install
+
+      - name: Download binding artifacts
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          pattern: bindings-*
+          path: crates/agent-transport-node
+          merge-multiple: true
+
+      - name: Move artifacts to platform package dirs
+        working-directory: crates/agent-transport-node
+        run: |
+          for file in agent-transport.*.node; do
+            platform="${file%.node}"
+            platform="${platform#agent-transport.}"
+            if [ -d "npm/${platform}" ]; then
+              cp "$file" "npm/${platform}/"
+              echo "Placed $file -> npm/${platform}/"
+            fi
+          done
+
+      - name: Prepare and publish packages
+        working-directory: crates/agent-transport-node
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          bunx napi prepublish --no-gh-release
+          npm publish --access public
