@@ -429,6 +429,20 @@ export class AgentServer {
         } else {
           await this.entrypointFn!(ctx);
         }
+
+        // Log agent state transitions (matching Python AgentServer behavior)
+        if (ctx.session) {
+          const session = ctx.session as any;
+          if (typeof session.on === 'function') {
+            session.on('agent_state_changed', (ev: any) => {
+              console.log(`Call ${callId} agent: ${ev.oldState ?? ev.old_state} -> ${ev.newState ?? ev.new_state}`);
+            });
+            session.on('user_state_changed', (ev: any) => {
+              console.log(`Call ${callId} user: ${ev.oldState ?? ev.old_state} -> ${ev.newState ?? ev.new_state}`);
+            });
+          }
+        }
+
         // Entrypoint returned — session.start() is non-blocking,
         // so wait for call to actually end (BYE or agent shutdown)
         await ctx.callEnded;

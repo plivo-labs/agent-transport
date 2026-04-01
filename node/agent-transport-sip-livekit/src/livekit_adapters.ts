@@ -195,8 +195,11 @@ export class TransportLocalParticipant {
   }
 
   async publishTranscription(transcription: any): Promise<void> {}
-  async streamText(opts?: any): Promise<{ write(text: string): Promise<void>; aclose(): Promise<void> }> {
-    return { async write() {}, async aclose() {} };
+  async streamText(opts?: any): Promise<{ write(text: string): Promise<void>; close(): Promise<void>; aclose(): Promise<void> }> {
+    return { async write() {}, async close() {}, async aclose() {} };
+  }
+  async streamBytes(name: string, opts?: any): Promise<{ write(data: Uint8Array): Promise<void>; close(): Promise<void>; aclose(): Promise<void> }> {
+    return { async write() {}, async close() {}, async aclose() {} };
   }
   async sendText(text: string, opts?: any): Promise<void> {}
   async publishData(payload: string | Uint8Array, opts?: any): Promise<void> {
@@ -213,6 +216,7 @@ export class TransportLocalParticipant {
   unregisterRpcMethod(method: string): void {}
   setTrackSubscriptionPermissions(opts: any): void {}
   async performRpc(opts: any): Promise<string> { return ''; }
+  async sendFile(filePath: string, opts?: any): Promise<void> {}
 }
 
 // ─── Transport Room ─────────────────────────────────────────────────────────
