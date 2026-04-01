@@ -30,6 +30,7 @@ __pycache__/
 *.egg-info/
 dist/
 *.whl
+.venv/
 
 # PJSIP build artifacts (within submodule — git ignores submodule contents anyway)
 pjproject/pjlib/include/pj/config_site.h
@@ -39,3 +40,4 @@ audio/temp/
 testing/
 todos/
 real_tests/
+python/build/

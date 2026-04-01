@@ -64,9 +64,8 @@ fn generate_test_cert(subject_cn: &str) -> std::result::Result<(String, String),
 /// Get the default crypto provider for testing
 #[cfg(feature = "rustls")]
 fn get_test_provider() -> Arc<rustls::crypto::CryptoProvider> {
-    let temp_builder = rustls::ServerConfig::builder();
-    let provider = temp_builder.crypto_provider().clone();
-    provider
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
 }
 
 /// Test ReloadableCertResolver creation with valid certificate

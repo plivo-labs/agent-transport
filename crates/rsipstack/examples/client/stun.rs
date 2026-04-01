@@ -1,4 +1,4 @@
-use get_if_addrs::get_if_addrs;
+use if_addrs::get_if_addrs;
 use rsipstack::transport::{udp::UdpConnection, SipAddr};
 use rsipstack::{Error, Result};
 use std::net::{IpAddr, SocketAddr};
@@ -16,7 +16,7 @@ pub fn get_first_non_loopback_interface() -> Result<IpAddr> {
     for i in get_if_addrs()? {
         if !i.is_loopback() {
             match i.addr {
-                get_if_addrs::IfAddr::V4(ref addr) => return Ok(std::net::IpAddr::V4(addr.ip)),
+                if_addrs::IfAddr::V4(ref addr) => return Ok(std::net::IpAddr::V4(addr.ip)),
                 _ => continue,
             }
         }

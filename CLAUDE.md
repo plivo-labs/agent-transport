@@ -36,7 +36,7 @@ node/
 
 ## Build
 
-No system dependencies — pure Rust.
+System dependencies: `cmake` (for audiopus_sys/aws-lc-sys).
 
 Requires: Rust, C compiler, CMake. On CMake 4.x, set `CMAKE_POLICY_VERSION_MINIMUM=3.5`.
 

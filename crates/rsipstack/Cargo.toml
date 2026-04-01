@@ -29,7 +29,7 @@ tracing-subscriber = { version = "0.3.22", features = ["local-time"] }
 rand = { version = "0.10.0" }
 md-5 = "0.10.6"
 sha2 = "0.10.9"
-get_if_addrs = "0.5.3"
+if-addrs = "0.15.0"
 hickory-resolver = { version = "0.25.2", features = [
     "system-config",
     "tokio",
