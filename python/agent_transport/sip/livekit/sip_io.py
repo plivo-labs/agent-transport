@@ -118,9 +118,8 @@ class SipAudioInput(AudioInput):
                     result = await loop.run_in_executor(
                         None, self._ep.recv_audio_bytes_blocking, self._cid, 20
                     )
-                except Exception as e:
-                    logger.debug("SipAudioInput recv error: %s", e)
-                    break
+                except Exception:
+                    break  # call ended (BYE received / stream closed)
                 if result is not None and self._attached:
                     ab, sr, nc = result
                     frame = _to_livekit_frame(bytes(ab), sr, nc)
@@ -130,6 +129,8 @@ class SipAudioInput(AudioInput):
                         logger.info("SipAudioInput: first frame received sr=%d samples=%d", sr, frame.samples_per_channel)
                     elif frame_count % 250 == 0:  # every 5 seconds
                         logger.info("SipAudioInput: %d frames forwarded to pipeline (%.1fs)", frame_count, frame_count * 0.02)
+
+            logger.debug("stream closed")
         finally:
             # Push 0.5s silence to flush STT (matches LiveKit exactly)
             silent_samples = int(self._sample_rate * 0.5)
