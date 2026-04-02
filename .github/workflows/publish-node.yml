@@ -56,7 +56,6 @@ jobs:
     needs: check
     if: needs.check.outputs.should-publish == 'true'
     runs-on: ubuntu-latest
-    environment: npm
     permissions:
       contents: read
       actions: read
