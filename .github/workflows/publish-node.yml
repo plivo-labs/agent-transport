@@ -91,6 +91,9 @@ jobs:
             fi
           done
 
+      - name: Copy root README into package
+        run: cp README.md crates/agent-transport-node/README.md
+
       - name: Prepare and publish packages
         working-directory: crates/agent-transport-node
         env:
