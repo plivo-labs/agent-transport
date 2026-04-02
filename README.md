@@ -1,5 +1,11 @@
 # Agent Transport
 
+<div align="center">
+
+[![PyPI](https://img.shields.io/pypi/v/agent-transport)](https://pypi.org/project/agent-transport/) [![npm](https://img.shields.io/npm/v/agent-transport)](https://www.npmjs.com/package/agent-transport) [![Build Python](https://github.com/plivo-labs/agent-transport/actions/workflows/build-python.yml/badge.svg)](https://github.com/plivo-labs/agent-transport/actions/workflows/build-python.yml) [![Build Node](https://github.com/plivo-labs/agent-transport/actions/workflows/build-node.yml/badge.svg)](https://github.com/plivo-labs/agent-transport/actions/workflows/build-node.yml) [![Test](https://github.com/plivo-labs/agent-transport/actions/workflows/test.yml/badge.svg)](https://github.com/plivo-labs/agent-transport/actions/workflows/test.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+</div>
+
 Transport library (SIP/RTP & Audio Streaming) for voice AI agents to be used with frameworks like [LiveKit Agents](https://github.com/livekit/agents/) and [Pipecat](https://github.com/pipecat-ai/pipecat). 
 
 Agent Transport provides signaling and media primitives that AI agent frameworks need to make and receive voice calls. The core is written in Rust for efficient, low-jitter packet processing — audio pacing, RTP handling, and jitter buffering. Framework adapters for LiveKit Agents and Pipecat are provided as drop-in plugins. Bindings in Python and TypeScript/Node.js are also available for other use cases.
