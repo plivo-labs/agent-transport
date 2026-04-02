@@ -63,7 +63,11 @@ For **Node**: edit the `"version"` field in ALL of these files:
 - `crates/agent-transport-node/npm/win32-arm64-msvc/package.json`
 - `crates/agent-transport-node/npm/win32-x64-msvc/package.json`
 
-### 6. Verify
+### 6. Update lockfile
+
+If Node was bumped, run `npm install --package-lock-only` in `crates/agent-transport-node/` to update `package-lock.json`.
+
+### 7. Verify
 
 After applying changes, read all modified files and confirm the versions are correct. Print a summary of what was changed.
 
