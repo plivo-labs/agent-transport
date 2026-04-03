@@ -39,8 +39,8 @@ fn main() -> anyhow::Result<()> {
             EndpointEvent::IncomingCall { session } => {
                 println!("Incoming call from: {}", session.remote_uri);
                 // Auto-answer with 200 OK
-                ep.answer(&session.call_id, 200)?;
-                println!("Call answered (call_id={})", session.call_id);
+                ep.answer(&session.session_id, 200)?;
+                println!("Call answered (call_id={})", session.session_id);
             }
             EndpointEvent::CallMediaActive { call_id } => {
                 println!("Media active on call {}. Audio is bridged via conf.", call_id);
@@ -55,7 +55,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             EndpointEvent::CallTerminated { session, reason } => {
-                println!("Call {} ended: {}", session.call_id, reason);
+                println!("Call {} ended: {}", session.session_id, reason);
                 println!("Waiting for next call...");
             }
             _ => {}
