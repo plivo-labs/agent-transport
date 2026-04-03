@@ -68,7 +68,7 @@ def load_wav_as_16k(path):
     return samples
 
 
-def send_audio_frames(ep, call_id, samples, label=""):
+def send_audio_frames(ep, session_id, samples, label=""):
     """Send PCM samples as 20ms frames. Returns (frames_sent, duration_s)."""
     sent = 0
     for i in range(0, len(samples), FRAME_SAMPLES):
@@ -76,7 +76,7 @@ def send_audio_frames(ep, call_id, samples, label=""):
         if len(chunk) < FRAME_SAMPLES:
             chunk = np.pad(chunk, (0, FRAME_SAMPLES - len(chunk)))
         try:
-            ep.send_audio(call_id, AudioFrame(chunk.tolist(), SAMPLE_RATE, CHANNELS))
+            ep.send_audio(session_id, AudioFrame(chunk.tolist(), SAMPLE_RATE, CHANNELS))
             sent += 1
         except Exception:
             break
@@ -117,15 +117,15 @@ def main():
 
     if dest_uri:
         print(f"Calling {dest_uri}...")
-        call_id = ep.call(dest_uri)
+        session_id = ep.call(dest_uri)
     else:
         print("Waiting for incoming call...")
         while True:
             event = ep.wait_for_event(timeout_ms=1000)
             if event and event["type"] == "incoming_call":
-                call_id = event["session"]["session_id"]
+                session_id = event["session"]["session_id"]
                 print(f"Incoming from {event['session']['remote_uri']}")
-                ep.answer(call_id)
+                ep.answer(session_id)
                 break
 
     while True:
@@ -168,7 +168,7 @@ def main():
         mic_stopped.clear()
         mic_paused.set()
         mic_stopped.wait(timeout=0.1)
-        ep.clear_buffer(call_id)
+        ep.clear_buffer(session_id)
 
     def resume_mic():
         mic_stopped.clear()
@@ -186,11 +186,11 @@ def main():
                         mic_stopped.set()
                         continue
                     try:
-                        ep.send_audio(call_id, AudioFrame(data[:, 0].tolist(), SAMPLE_RATE, CHANNELS))
+                        ep.send_audio(session_id, AudioFrame(data[:, 0].tolist(), SAMPLE_RATE, CHANNELS))
                         sent += 1
                         if sent % 250 == 0:
                             peak = int(np.max(np.abs(data[:, 0])))
-                            q = ep.queued_frames(call_id) if running.is_set() else -1
+                            q = ep.queued_frames(session_id) if running.is_set() else -1
                             sys.stdout.write(f"\r  [MIC] sent={sent} peak={peak} queued={q}\n")
                             sys.stdout.flush()
                     except Exception:
@@ -206,7 +206,7 @@ def main():
                                  blocksize=FRAME_SAMPLES, dtype="int16") as stream:
                 while running.is_set():
                     try:
-                        frame = ep.recv_audio_blocking(call_id, 20)
+                        frame = ep.recv_audio_blocking(session_id, 20)
                     except Exception:
                         break
                     if frame is not None:
@@ -256,39 +256,39 @@ def main():
 
             try:
                 if ch in DTMF_KEYS:
-                    ep.send_dtmf(call_id, ch)
+                    ep.send_dtmf(session_id, ch)
                     out(f"\r  DTMF sent: {ch}\n"); flush()
 
                 elif ch == 'm':
-                    ep.mute(call_id); out("\r  MUTED\n"); flush()
+                    ep.mute(session_id); out("\r  MUTED\n"); flush()
                 elif ch == 'u':
-                    ep.unmute(call_id); out("\r  UNMUTED\n"); flush()
+                    ep.unmute(session_id); out("\r  UNMUTED\n"); flush()
                 elif ch == 'h':
-                    ep.hold(call_id); out("\r  HOLD — Re-INVITE sendonly\n"); flush()
+                    ep.hold(session_id); out("\r  HOLD — Re-INVITE sendonly\n"); flush()
                 elif ch == 'H':
-                    ep.unhold(call_id); out("\r  UNHOLD — Re-INVITE sendrecv\n"); flush()
+                    ep.unhold(session_id); out("\r  UNHOLD — Re-INVITE sendrecv\n"); flush()
 
                 elif ch == 'p':
-                    ep.pause(call_id)
-                    q = ep.queued_frames(call_id)
+                    ep.pause(session_id)
+                    q = ep.queued_frames(session_id)
                     out(f"\r  PAUSED — queued={q} ({q*0.02:.1f}s)\n"); flush()
                 elif ch == 'r':
-                    q = ep.queued_frames(call_id)
-                    ep.resume(call_id)
+                    q = ep.queued_frames(session_id)
+                    ep.resume(session_id)
                     out(f"\r  RESUMED — draining {q} frames ({q*0.02:.1f}s)\n"); flush()
 
                 elif ch == 'f':
-                    ep.flush(call_id)
-                    out(f"\r  FLUSH — queued={ep.queued_frames(call_id)}\n"); flush()
+                    ep.flush(session_id)
+                    out(f"\r  FLUSH — queued={ep.queued_frames(session_id)}\n"); flush()
                 elif ch == 'c':
-                    q = ep.queued_frames(call_id)
-                    ep.clear_buffer(call_id)
+                    q = ep.queued_frames(session_id)
+                    ep.clear_buffer(session_id)
                     out(f"\r  CLEAR — discarded {q} frames\n"); flush()
                 elif ch == 'w':
-                    q = ep.queued_frames(call_id)
+                    q = ep.queued_frames(session_id)
                     out(f"\r  WAIT (queued={q})...\n"); flush()
                     t0 = time.time()
-                    ok = ep.wait_for_playout(call_id, 30000)
+                    ok = ep.wait_for_playout(session_id, 30000)
                     out(f"\r  PLAYOUT {'done' if ok else 'timeout'} in {time.time()-t0:.2f}s\n"); flush()
 
                 # --- Audio playback tests ---
@@ -299,12 +299,12 @@ def main():
                         out("\r  No audio files\n"); flush(); continue
                     out("\r  --- Play + Flush + Wait ---\n"); flush()
                     stop_mic_and_drain()
-                    frames, dur = send_audio_frames(ep, call_id, audio, "PLAY")
-                    ep.flush(call_id)
-                    q = ep.queued_frames(call_id)
+                    frames, dur = send_audio_frames(ep, session_id, audio, "PLAY")
+                    ep.flush(session_id)
+                    q = ep.queued_frames(session_id)
                     out(f"\r  [FLUSH] queued={q} ({q*0.02:.1f}s)\n"); flush()
                     t0 = time.time()
-                    ok = ep.wait_for_playout(call_id, 30000)
+                    ok = ep.wait_for_playout(session_id, 30000)
                     out(f"\r  [PLAYOUT] {'done' if ok else 'timeout'} — {time.time()-t0:.2f}s for {dur:.1f}s audio\n"); flush()
                     resume_mic()
 
@@ -314,14 +314,14 @@ def main():
                         out("\r  No audio files\n"); flush(); continue
                     out("\r  --- Play + Interrupt after 2s ---\n"); flush()
                     stop_mic_and_drain()
-                    frames, dur = send_audio_frames(ep, call_id, audio, "PLAY")
-                    q0 = ep.queued_frames(call_id)
+                    frames, dur = send_audio_frames(ep, session_id, audio, "PLAY")
+                    q0 = ep.queued_frames(session_id)
                     out(f"\r  [QUEUED] {q0} — interrupting in 2s...\n"); flush()
                     time.sleep(2.0)
-                    q1 = ep.queued_frames(call_id)
-                    ep.clear_buffer(call_id)
+                    q1 = ep.queued_frames(session_id)
+                    ep.clear_buffer(session_id)
                     time.sleep(0.05)
-                    q2 = ep.queued_frames(call_id)
+                    q2 = ep.queued_frames(session_id)
                     out(f"\r  [INTERRUPT] played ~{(q0-q1)*0.02:.1f}s, discarded ~{q1*0.02:.1f}s (queue: {q0}→{q1}→{q2})\n"); flush()
                     resume_mic()
 
@@ -335,12 +335,12 @@ def main():
                     try:
                         for idx, clip in enumerate([clip1, clip2], 1):
                             label = f"SEG{idx}"
-                            f, d = send_audio_frames(ep, call_id, clip, label)
-                            ep.flush(call_id)
-                            q = ep.queued_frames(call_id)
+                            f, d = send_audio_frames(ep, session_id, clip, label)
+                            ep.flush(session_id)
+                            q = ep.queued_frames(session_id)
                             out(f"\r  [{label}] flushed, queued={q}, waiting...\n"); flush()
                             t0 = time.time()
-                            ok = ep.wait_for_playout(call_id, 30000)
+                            ok = ep.wait_for_playout(session_id, 30000)
                             out(f"\r  [{label}] {'done' if ok else 'timeout'} in {time.time()-t0:.2f}s ({d:.1f}s)\n"); flush()
                         out("\r  [CHAIN] Complete\n"); flush()
                     except Exception as e:
@@ -349,7 +349,7 @@ def main():
 
                 elif ch in ('q', '\r', '\n', '\x03'):
                     out("\r  Hanging up...\n"); flush()
-                    ep.hangup(call_id)
+                    ep.hangup(session_id)
                     break
 
             except Exception as e:

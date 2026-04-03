@@ -73,16 +73,16 @@ def main():
 
     if dest_uri:
         print(f"Calling {dest_uri}...")
-        call_id = ep.call(dest_uri)
-        print(f"Call initiated (call_id={call_id}). Waiting for answer...")
+        session_id = ep.call(dest_uri)
+        print(f"Call initiated (session_id={session_id}). Waiting for answer...")
     else:
         print("Waiting for incoming call... (Ctrl+C to quit)")
         while True:
             event = ep.wait_for_event(timeout_ms=1000)
             if event and event["type"] == "incoming_call":
-                call_id = event["session"]["session_id"]
+                session_id = event["session"]["session_id"]
                 print(f"Incoming call from {event['session']['remote_uri']}")
-                ep.answer(call_id)
+                ep.answer(session_id)
                 break
 
     while True:
@@ -112,7 +112,7 @@ def main():
                 while running.is_set():
                     data, _ = stream.read(FRAME_SAMPLES)
                     try:
-                        ep.send_audio(call_id, AudioFrame(data[:, 0].tolist(), SAMPLE_RATE, CHANNELS))
+                        ep.send_audio(session_id, AudioFrame(data[:, 0].tolist(), SAMPLE_RATE, CHANNELS))
                     except Exception:
                         break
         except Exception:
@@ -124,7 +124,7 @@ def main():
                                  blocksize=FRAME_SAMPLES, dtype="int16") as stream:
                 while running.is_set():
                     try:
-                        frame = ep.recv_audio_blocking(call_id, 20)
+                        frame = ep.recv_audio_blocking(session_id, 20)
                     except Exception:
                         break
                     if frame is not None:
@@ -164,33 +164,33 @@ def main():
                 continue
 
             if ch in DTMF_KEYS:
-                ep.send_dtmf(call_id, ch)
+                ep.send_dtmf(session_id, ch)
                 sys.stdout.write(f"\r  DTMF sent: {ch}\n")
                 sys.stdout.flush()
             elif ch == 'm':
-                ep.mute(call_id)
+                ep.mute(session_id)
                 sys.stdout.write("\r  MUTED\n")
                 sys.stdout.flush()
             elif ch == 'u':
-                ep.unmute(call_id)
+                ep.unmute(session_id)
                 sys.stdout.write("\r  UNMUTED\n")
                 sys.stdout.flush()
             elif ch == 'h':
                 if not is_held:
-                    ep.hold(call_id)
+                    ep.hold(session_id)
                     is_held = True
                     sys.stdout.write("\r  HOLD — Re-INVITE sendonly\n")
                     sys.stdout.flush()
             elif ch == 'H':
                 if is_held:
-                    ep.unhold(call_id)
+                    ep.unhold(session_id)
                     is_held = False
                     sys.stdout.write("\r  UNHOLD — Re-INVITE sendrecv\n")
                     sys.stdout.flush()
             elif ch in ('q', '\r', '\n', '\x03'):
                 sys.stdout.write("\r  Hanging up...\n")
                 sys.stdout.flush()
-                ep.hangup(call_id)
+                ep.hangup(session_id)
                 break
     except Exception:
         pass
