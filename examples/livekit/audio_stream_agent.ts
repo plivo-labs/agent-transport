@@ -90,6 +90,14 @@ server.audioStreamSession(async (ctx: AudioStreamJobContext) => {
   });
 
   ctx.session = session;
+
+  // Background audio — ambient plays continuously, thinking plays while agent processes
+  const bgAudio = new voice.BackgroundAudioPlayer({
+    ambientSound: voice.BuiltinAudioClip.OFFICE_AMBIENCE,
+    thinkingSound: voice.BuiltinAudioClip.KEYBOARD_TYPING,
+  });
+  await bgAudio.start({ room: ctx.room, agentSession: session });
+
   await session.start({ agent, room: ctx.room });
 
   session.say('Hello, how can I help you today?');

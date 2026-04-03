@@ -24,6 +24,7 @@ from agent_transport.sip.livekit import AgentServer, JobContext, JobProcess
 from livekit.agents import Agent, AgentSession, RunContext, TurnHandlingOptions, metrics
 
 from livekit.agents.llm import function_tool
+from livekit.agents.voice.background_audio import BackgroundAudioPlayer, BuiltinAudioClip
 from livekit.agents.job import get_job_context
 from livekit.plugins import deepgram, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
@@ -248,6 +249,12 @@ async def entrypoint(ctx: JobContext):
     )
     ctx.session = session
 
+    # Background audio — ambient plays continuously, thinking plays while agent processes
+    bg_audio = BackgroundAudioPlayer(
+        ambient_sound=BuiltinAudioClip.OFFICE_AMBIENCE,
+        thinking_sound=BuiltinAudioClip.KEYBOARD_TYPING,
+    )
+    await bg_audio.start(room=ctx.room, agent_session=session)
 
     await session.start(agent=GreeterAgent(), room=ctx.room)
 
