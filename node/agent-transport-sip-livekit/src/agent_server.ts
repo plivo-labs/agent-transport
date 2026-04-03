@@ -562,7 +562,7 @@ export class AgentServer {
                   console.log(`Outbound call ${returnedId} to ${destination} connected (from=${fromUri ?? 'default'})`);
                   this.startCall(returnedId, destination, 'outbound');
                 } catch (err) {
-                  console.warn(`Outbound call ${sessionId} to ${destination} failed:`, err);
+                  console.warn('Outbound call %s to %s failed:', sessionId, destination, err);
                 }
               });
             }
