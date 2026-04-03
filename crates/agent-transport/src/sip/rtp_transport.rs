@@ -132,10 +132,19 @@ impl RtpTransport {
                     bg_samples
                 };
 
-                if !samples.is_empty() {
-                    // Record agent audio (pipeline rate, before downsample)
-                    if let Ok(guard) = recorder.lock() { if let Some(ref rec) = *guard { rec.write_agent_samples(&samples); } }
+                // Record agent audio — always write to keep in sync with user channel
+                if let Ok(guard) = recorder.lock() {
+                    if let Some(ref rec) = *guard {
+                        if !samples.is_empty() {
+                            rec.write_agent_samples(&samples);
+                        } else {
+                            // Write silence to keep agent channel aligned with user channel
+                            rec.write_agent_samples(&vec![0i16; output_spf]);
+                        }
+                    }
+                }
 
+                if !samples.is_empty() {
                     if !muted.load(Ordering::Relaxed) {
                         let m = first; first = false;
                         let samples_8k = if let Some(ref mut ds) = downsampler {

@@ -35,9 +35,6 @@ export interface AgentServerOptions {
   host?: string;
   port?: number;
   agentName?: string;
-  recording?: boolean;
-  recordingDir?: string;
-  recordingStereo?: boolean;
   auth?: (req: IncomingMessage) => boolean | Promise<boolean>;
 }
 
@@ -95,9 +92,6 @@ export class AgentServer {
   private host: string;
   private port: number;
   private agentName: string;
-  private recording: boolean;
-  private recordingDir: string;
-  private recordingStereo: boolean;
   private authFn?: (req: IncomingMessage) => boolean | Promise<boolean>;
 
   private entrypointFn?: EntrypointFn;
@@ -122,9 +116,6 @@ export class AgentServer {
     this.host = opts.host ?? '0.0.0.0';
     this.port = opts.port ?? parseInt(process.env.PORT ?? '8080', 10);
     this.agentName = opts.agentName ?? 'sip-agent';
-    this.recording = opts.recording ?? false;
-    this.recordingDir = opts.recordingDir ?? 'recordings';
-    this.recordingStereo = opts.recordingStereo ?? true;
     this.authFn = opts.auth;
   }
 
@@ -389,27 +380,32 @@ export class AgentServer {
       this.sipCallsTotal[direction]++;
       const callStart = performance.now();
 
-      // Start recording if enabled
-      if (this.recording) {
-        try {
-          mkdirSync(this.recordingDir, { recursive: true });
-          this.ep!.startRecording(sessionId, `${this.recordingDir}/call_${sessionId}.wav`, this.recordingStereo);
-        } catch {
-          console.warn(`Failed to start recording for call ${sessionId}`);
-        }
-      }
-
       try {
         // Wrap in runWithJobContext so getJobContext().room works inside handler
         // (matches LiveKit WebRTC where entrypoint runs inside job context)
+        const sessionDir = `/tmp/agent-sessions/${sessionId}`;
         const stub = {
           room: ctx.room,
-          job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: false },
+          job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: true },
           _primaryAgentSession: null as any,
-          sessionDirectory: '/tmp',
+          sessionDirectory: sessionDir,
           proc: { executorType: null },
           inferenceExecutor: this.inferenceExecutor,
-          initRecording: () => {},
+          initRecording: () => {
+            // Start Rust-level recording (stereo WAV at RTP layer)
+            // and disable RecorderIO's JS-level recording to avoid double recording
+            try {
+              mkdirSync(sessionDir, { recursive: true });
+              this.ep!.startRecording(sessionId, `${sessionDir}/audio.wav`, true);
+              // Disable RecorderIO — Rust handles the recording
+              if (stub._primaryAgentSession) {
+                stub._primaryAgentSession._enableRecording = false;
+              }
+            } catch (err) {
+              console.warn('Rust recording failed, falling back to RecorderIO:', err);
+              // Don't disable RecorderIO — let it handle recording as fallback
+            }
+          },
           connect: async () => {},
           addShutdownCallback: () => {},
           shutdown: () => {},
@@ -430,10 +426,8 @@ export class AgentServer {
         const durationSec = (performance.now() - callStart) / 1000;
         this.sipCallDurations.push(durationSec);
 
-        // Stop recording
-        if (this.recording) {
-          try { this.ep!.stopRecording(sessionId); } catch {}
-        }
+        // Stop Rust recording if active
+        try { this.ep!.stopRecording(sessionId); } catch {}
 
         // Log usage
         if (ctx.session) {

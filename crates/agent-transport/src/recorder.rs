@@ -171,8 +171,10 @@ impl OggState {
         let frame_samples = (self.sample_rate as usize / 50) * self.num_channels as usize;
         let mut out_buf = vec![0u8; 4000];
         let mut pw = PacketWriter::new(&mut self.file);
+        let chunks: Vec<_> = interleaved.chunks(frame_samples).collect();
+        let last_idx = chunks.len().saturating_sub(1);
 
-        for chunk in interleaved.chunks(frame_samples) {
+        for (idx, chunk) in chunks.iter().enumerate() {
             let samples = if chunk.len() < frame_samples {
                 let mut v = chunk.to_vec();
                 v.resize(frame_samples, 0);
@@ -185,10 +187,16 @@ impl OggState {
             match self.encoder.encode(&samples, &mut out_buf) {
                 Ok(len) => {
                     self.granule_pos += spc as u64;
+                    // Force EndPage on last packet of batch to flush OGG pages to file
+                    let end_info = if idx == last_idx {
+                        ogg::writing::PacketWriteEndInfo::EndPage
+                    } else {
+                        ogg::writing::PacketWriteEndInfo::NormalPacket
+                    };
                     let _ = pw.write_packet(
                         Cow::Owned(out_buf[..len].to_vec()),
                         self.serial,
-                        ogg::writing::PacketWriteEndInfo::NormalPacket,
+                        end_info,
                         self.granule_pos,
                     );
                 }
@@ -397,6 +405,7 @@ mod tests {
         assert!(content.contains("agent-transport"), "Should contain vendor string");
 
         println!("OGG file: {} bytes ({:.1} KB)", data.len(), data.len() as f64 / 1024.0);
+        assert!(data.len() > 1000, "OGG file should have real audio data, not just headers (got {} bytes)", data.len());
 
         // Clean up
         let _ = std::fs::remove_file(path);
