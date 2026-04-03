@@ -3,20 +3,8 @@ name: Build Python
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - 'README.md'
-      - 'LICENSE'
-      - 'docs/**'
-      - 'examples/**'
-      - '.claude/**'
   pull_request:
     branches: [main]
-    paths-ignore:
-      - 'README.md'
-      - 'LICENSE'
-      - 'docs/**'
-      - 'examples/**'
-      - '.claude/**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -29,7 +17,29 @@ env:
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
-  build:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      core: ${{ steps.filter.outputs.core }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            core:
+              - '**'
+              - '!README.md'
+              - '!LICENSE'
+              - '!docs/**'
+              - '!examples/**'
+              - '!.claude/**'
+
+  run-build:
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
     name: Build - ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -85,3 +95,15 @@ jobs:
           name: wheels-${{ matrix.target }}
           path: crates/agent-transport-python/dist/*.whl
           retention-days: 1
+
+  build-python:
+    if: always()
+    needs: [changes, run-build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Passed
+        if: needs.run-build.result == 'success' || needs.run-build.result == 'skipped'
+        run: echo "Build passed or skipped (docs-only change)"
+      - name: Failed
+        if: needs.run-build.result == 'failure' || needs.run-build.result == 'cancelled'
+        run: exit 1

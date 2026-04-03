@@ -3,20 +3,8 @@ name: Test
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - 'README.md'
-      - 'LICENSE'
-      - 'docs/**'
-      - 'examples/**'
-      - '.claude/**'
   pull_request:
     branches: [main]
-    paths-ignore:
-      - 'README.md'
-      - 'LICENSE'
-      - 'docs/**'
-      - 'examples/**'
-      - '.claude/**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -29,8 +17,29 @@ env:
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
-  test:
-    name: Run tests
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      core: ${{ steps.filter.outputs.core }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            core:
+              - '**'
+              - '!README.md'
+              - '!LICENSE'
+              - '!docs/**'
+              - '!examples/**'
+              - '!.claude/**'
+
+  run-tests:
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,3 +56,15 @@ jobs:
 
       - name: Run tests with audio streaming
         run: cargo test --features audio-stream
+
+  test:
+    if: always()
+    needs: [changes, run-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Passed
+        if: needs.run-tests.result == 'success' || needs.run-tests.result == 'skipped'
+        run: echo "Tests passed or skipped (docs-only change)"
+      - name: Failed
+        if: needs.run-tests.result == 'failure' || needs.run-tests.result == 'cancelled'
+        run: exit 1
