@@ -9,9 +9,9 @@
  *   import { SipEndpoint } from 'agent-transport';
  *
  *   const ep = new SipEndpoint({ sipServer: 'phone.plivo.com' });
- *   const room = new TransportRoom(ep, callId, { agentName: 'my-agent', callerIdentity: remoteUri });
- *   const input = new SipAudioInput(ep, callId);
- *   const output = new SipAudioOutput(ep, callId);
+ *   const room = new TransportRoom(ep, sessionId, { agentName: 'my-agent', callerIdentity: remoteUri });
+ *   const input = new SipAudioInput(ep, sessionId);
+ *   const output = new SipAudioOutput(ep, sessionId);
  *
  *   // Connect to LiveKit AgentSession
  *   session.input.audio = input;
@@ -122,8 +122,8 @@ export class TransportRemoteParticipant {
   disconnect_reason: number | null = null;
   trackPublications: Record<string, any> = {};
 
-  constructor(identity: string, callId: string) {
-    this.sid = `PR_${callId}`;
+  constructor(identity: string, sessionId: string) {
+    this.sid = `PR_${sessionId}`;
     this.identity = identity;
     this.name = identity;
   }

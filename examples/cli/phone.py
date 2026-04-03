@@ -80,7 +80,7 @@ def main():
         while True:
             event = ep.wait_for_event(timeout_ms=1000)
             if event and event["type"] == "incoming_call":
-                call_id = event["session"]["call_id"]
+                call_id = event["session"]["session_id"]
                 print(f"Incoming call from {event['session']['remote_uri']}")
                 ep.answer(call_id)
                 break
