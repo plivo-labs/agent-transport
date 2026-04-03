@@ -704,8 +704,10 @@ impl SipEndpoint {
     /// Used by publish_track (background audio, hold music, etc.).
     pub fn send_background_audio(&self, call_id: &str, frame: &AudioFrame) -> Result<()> {
         let bg_buf = self.with_call(call_id, |c| c.bg_audio_buf.clone())?;
-        bg_buf.push(&frame.data, Box::new(|| {}))
-            .map_err(|e| EndpointError::Other(e.into()))
+        // Background audio: no backpressure — fire callback immediately, drop if full.
+        // Unlike agent voice, background audio is continuous and low priority.
+        bg_buf.push_no_backpressure(&frame.data);
+        Ok(())
     }
 
     pub fn recv_audio(&self, call_id: &str) -> Result<Option<AudioFrame>> {

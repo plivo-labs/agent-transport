@@ -243,6 +243,13 @@ server.audioStreamSession(async (ctx: AudioStreamJobContext) => {
   });
 
   ctx.session = session;
+
+  const bgAudio = new voice.BackgroundAudioPlayer({
+    ambientSound: voice.BuiltinAudioClip.OFFICE_AMBIENCE,
+    thinkingSound: voice.BuiltinAudioClip.KEYBOARD_TYPING,
+  });
+  await bgAudio.start({ room: ctx.room, agentSession: session });
+
   await session.start({ agent: GreeterAgent.create(), room: ctx.room });
 });
 

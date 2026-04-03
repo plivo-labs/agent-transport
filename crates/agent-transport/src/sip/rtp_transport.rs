@@ -105,15 +105,29 @@ impl RtpTransport {
 
                 let ts = t.timestamp.fetch_add(spf, Ordering::Relaxed);
 
+                // Drain background audio regardless of pause state
+                let bg_samples = bg_audio_buf.drain(output_spf);
+
                 if paused.load(Ordering::Relaxed) {
-                    let _ = t.send(t.codec.payload_type(), ts, false, vec![sil; spf as usize]).await;
-                    pkt_count += 1; octet_count += spf;
+                    // Paused: send background audio only (no agent voice)
+                    if !bg_samples.is_empty() {
+                        let samples_8k = if let Some(ref mut ds) = downsampler {
+                            ds.process(&bg_samples).to_vec()
+                        } else {
+                            bg_samples
+                        };
+                        let encoded = t.codec.encode(&samples_8k);
+                        octet_count += encoded.len() as u32;
+                        let _ = t.send(t.codec.payload_type(), ts, false, encoded).await;
+                    } else {
+                        let _ = t.send(t.codec.payload_type(), ts, false, vec![sil; spf as usize]).await;
+                    }
+                    pkt_count += 1;
                     continue;
                 }
 
-                // Drain agent voice + background audio and mix
+                // Drain agent voice and mix with background
                 let voice = audio_buf.drain(output_spf);
-                let bg_samples = bg_audio_buf.drain(output_spf);
 
                 let has_voice = !voice.is_empty();
                 let has_bg = !bg_samples.is_empty();

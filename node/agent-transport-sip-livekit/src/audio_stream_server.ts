@@ -331,17 +331,33 @@ export class AudioStreamServer {
         let agents: any;
         try { agents = await import('@livekit/agents'); } catch {}
 
+        const sessionDir = `/tmp/agent-sessions/${sessionId}`;
         const stub = {
           room: ctx.room,
-          job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: false },
+          job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: true },
           _primaryAgentSession: null as any,
-          sessionDirectory: '/tmp',
+          sessionDirectory: sessionDir,
           proc: { executorType: null },
           inferenceExecutor: this.inferenceExecutor,
-          initRecording: () => {},
+          initRecording: () => {
+            try {
+              const { mkdirSync } = require('node:fs');
+              mkdirSync(sessionDir, { recursive: true });
+              this.ep!.startRecording(sessionId, `${sessionDir}/audio.wav`, true);
+              if (stub._primaryAgentSession) {
+                stub._primaryAgentSession._enableRecording = false;
+              }
+            } catch (err) {
+              console.warn('Rust recording failed, falling back to RecorderIO:', err);
+            }
+          },
           connect: async () => {},
           addShutdownCallback: () => {},
           shutdown: () => {},
+          is_fake_job: () => false,
+          isFakeJob: () => false,
+          worker_id: 'local',
+          workerId: 'local',
         };
 
         if (agents?.runWithJobContext) {

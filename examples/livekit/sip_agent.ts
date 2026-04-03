@@ -95,6 +95,14 @@ server.sipSession(async (ctx: JobContext) => {
   });
 
   ctx.session = session;
+
+  // Background audio — ambient plays continuously, thinking plays while agent processes
+  const bgAudio = new voice.BackgroundAudioPlayer({
+    ambientSound: voice.BuiltinAudioClip.OFFICE_AMBIENCE,
+    thinkingSound: voice.BuiltinAudioClip.KEYBOARD_TYPING,
+  });
+  await bgAudio.start({ room: ctx.room, agentSession: session });
+
   await session.start({ agent, room: ctx.room });
 
   // Greet the user once the session is started

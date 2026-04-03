@@ -124,9 +124,15 @@ class _TransportLocalParticipant:
             stream = rtc.AudioStream.from_track(
                 track=track, sample_rate=sr, num_channels=1)
             logger.debug("Forwarding published track %s to background mixer", pub_sid)
+            frame_count = 0
 
             async for event in stream:
                 frame = event.frame
+                frame_count += 1
+                if frame_count == 1:
+                    logger.info("Background audio: first frame sr=%d samples=%d", frame.sample_rate, frame.samples_per_channel)
+                elif frame_count % 500 == 0:
+                    logger.info("Background audio: %d frames forwarded", frame_count)
                 if frame.samples_per_channel > 0 and self._ep is not None:
                     try:
                         self._ep.send_background_audio(
@@ -135,7 +141,8 @@ class _TransportLocalParticipant:
                             frame.sample_rate,
                             frame.num_channels,
                         )
-                    except Exception:
+                    except Exception as e:
+                        logger.error("Background audio send failed: %s", e)
                         break  # Session gone
 
             await stream.aclose()
@@ -370,6 +377,7 @@ class _StubJobContext:
         self._shutdown_callbacks: list = []
         self._tempdir = tempfile.TemporaryDirectory()
         self.session_directory = Path(self._tempdir.name)
+        self.worker_id = "local"
 
     @property
     def room(self):
@@ -386,6 +394,9 @@ class _StubJobContext:
     @property
     def executor_type(self):
         return None  # Avoids _ContextLogFieldsFilter match
+
+    def is_fake_job(self) -> bool:
+        return False
 
     @property
     def inference_executor(self):
@@ -439,8 +450,41 @@ class _StubJobContext:
     def add_shutdown_callback(self, callback):
         self._shutdown_callbacks.append(callback)
 
+    def shutdown(self, reason: str = ""):
+        pass
+
     async def delete_room(self, room_name=""):
         pass
+
+    @property
+    def log_context_fields(self):
+        return {}
+
+    @property
+    def primary_session(self):
+        return self._primary_agent_session
+
+    @property
+    def local_participant_identity(self):
+        return self._room._local_participant.identity if self._room else ""
+
+    def make_session_report(self, *args, **kwargs):
+        pass
+
+    @property
+    def tagger(self):
+        return None
+
+    def token_claims(self):
+        return {}
+
+    @property
+    def api(self):
+        return None
+
+    @property
+    def agent(self):
+        return None
 
 
 def create_transport_context(room: TransportRoom, agent_name: str = "agent",

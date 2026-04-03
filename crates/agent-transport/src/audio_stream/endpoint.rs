@@ -109,8 +109,8 @@ impl AudioStreamEndpoint {
             let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
             sess.bg_audio_buf.clone()
         };
-        bg_buf.push(&frame.data, Box::new(|| {}))
-            .map_err(|e| EndpointError::Other(e.into()))
+        bg_buf.push_no_backpressure(&frame.data);
+        Ok(())
     }
 
     pub fn recv_audio(&self, session_id: &str) -> Result<Option<AudioFrame>> {
@@ -413,16 +413,46 @@ async fn handle_ws(
 
                             loop {
                                 if sc.is_cancelled() { break; }
+
+                                // Drain background audio regardless of pause state
+                                let bg_samples = bg.drain(chunk_spf);
+
                                 if p.load(Ordering::Relaxed) {
+                                    // Paused: send background audio only (no agent voice)
+                                    if !bg_samples.is_empty() {
+                                        let encoded = send_enc.encode(&bg_samples, &mut resampler);
+                                        let play_msg = send_proto.build_play_audio(&encoded, send_enc, &stream_id_for_loop);
+                                        let _ = wstx.send(Message::Text(play_msg));
+                                    }
                                     tokio::time::sleep(Duration::from_millis(20)).await;
                                     continue;
                                 }
 
                                 let voice = ab.drain(chunk_spf);
-                                let bg_samples = bg.drain(chunk_spf);
 
                                 let has_voice = !voice.is_empty();
                                 let has_bg = !bg_samples.is_empty();
+
+                                // Record agent audio — always write to keep in sync with user channel
+                                if let Ok(guard) = rec_send.lock() {
+                                    if let Some(ref rec) = *guard {
+                                        if has_voice || has_bg {
+                                            let mixed_for_rec = if has_voice && has_bg {
+                                                let len = voice.len().max(bg_samples.len());
+                                                let mut out = Vec::with_capacity(len);
+                                                for i in 0..len {
+                                                    let v = if i < voice.len() { voice[i] as i32 } else { 0 };
+                                                    let b = if i < bg_samples.len() { bg_samples[i] as i32 } else { 0 };
+                                                    out.push((v + b).clamp(-32768, 32767) as i16);
+                                                }
+                                                out
+                                            } else if has_voice { voice.clone() } else { bg_samples.clone() };
+                                            rec.write_agent_samples(&mixed_for_rec);
+                                        } else {
+                                            rec.write_agent_samples(&vec![0i16; chunk_spf]);
+                                        }
+                                    }
+                                }
 
                                 if has_voice || has_bg {
                                     let mixed = if has_voice && has_bg {
@@ -439,10 +469,6 @@ async fn handle_ws(
                                     } else {
                                         bg_samples
                                     };
-
-                                    if let Ok(guard) = rec_send.lock() {
-                                        if let Some(ref rec) = *guard { rec.write_agent_samples(&mixed); }
-                                    }
 
                                     if !m.load(Ordering::Relaxed) {
                                         let encoded = send_enc.encode(&mixed, &mut resampler);
