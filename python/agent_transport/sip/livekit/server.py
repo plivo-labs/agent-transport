@@ -592,22 +592,9 @@ class AgentServer:
 
         logger.info("Outbound call %s to %s (from=%s)", call_id, destination, from_uri or "default")
 
-        # Register a future that the event dispatcher will resolve on call_media_active
-        media_fut = asyncio.get_running_loop().create_future()
-        self._pending_outbound[call_id] = media_fut
-
-        async def _wait_and_handle():
-            try:
-                await asyncio.wait_for(media_fut, timeout=30)
-            except asyncio.TimeoutError:
-                logger.warning("Outbound call %s to %s timed out", call_id, destination)
-                self._pending_outbound.pop(call_id, None)
-                return
-            # Dispatcher already popped _pending_outbound
-            if media_fut.result():
-                await self._start_call(call_id, destination, direction="outbound")
-
-        asyncio.create_task(_wait_and_handle())
+        # ep.call() blocks until 200 OK + RTP setup, so media is already active.
+        # Start the agent session immediately.
+        asyncio.create_task(self._start_call(call_id, destination, direction="outbound"))
         return web.json_response({"status": "calling", "call_id": call_id, "to": destination})
 
     async def _sip_event_loop(self) -> None:
