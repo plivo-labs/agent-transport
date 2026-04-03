@@ -280,9 +280,6 @@ class AgentServer:
         port: int | None = None,
         agent_name: str = "sip-agent",
         auth: Callable[..., bool | Coroutine] | None = None,
-        recording: bool = False,
-        recording_dir: str = "recordings",
-        recording_stereo: bool = True,
     ) -> None:
         self._sip_server = sip_server or os.environ.get("SIP_DOMAIN", "phone.plivo.com")
         self._sip_port = sip_port or int(os.environ.get("SIP_PORT", "5060"))
@@ -292,9 +289,6 @@ class AgentServer:
         self._port = port or int(os.environ.get("PORT", "8080"))
         self._agent_name = agent_name
         self._auth = auth
-        self._recording = recording
-        self._recording_dir = recording_dir
-        self._recording_stereo = recording_stereo
         self._entrypoint_fnc: Callable[..., Coroutine] | None = None
         self._setup_fnc: Callable | None = None
         self._proc = JobProcess()

@@ -328,13 +328,21 @@ class TransportRoom(EventEmitter):
     # ─── Session lifecycle ───────────────────────────────────────────────
 
     def _on_session_ended(self):
-        """Called when the call/stream ends — emit disconnected event.
+        """Called when the call/stream ends — stop recording, emit disconnected.
 
         participant_disconnected is emitted separately by the server event loop
         when call_terminated arrives (matching LiveKit's RoomIO pattern where
         the room fires participant_disconnected and RoomIO handles it).
         """
         self._connected = False
+        # Stop Rust recording if active
+        ep = self._ep
+        session_id = self._sid
+        if ep and session_id:
+            try:
+                ep.stop_recording(session_id)
+            except Exception:
+                pass
         self.emit("disconnected")
 
 
