@@ -27,6 +27,7 @@ from livekit.agents.job import get_job_context
 from livekit.agents.beta.tools import send_dtmf_events
 from livekit.plugins import deepgram, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from livekit.agents.voice.background_audio import BackgroundAudioPlayer, BuiltinAudioClip
 
 load_dotenv()
 
@@ -140,6 +141,12 @@ async def entrypoint(ctx: JobContext):
     )
     ctx.session = session
 
+    # Background audio — ambient plays continuously, thinking plays while agent processes
+    bg_audio = BackgroundAudioPlayer(
+        ambient_sound=BuiltinAudioClip.OFFICE_AMBIENCE,
+        thinking_sound=BuiltinAudioClip.KEYBOARD_TYPING,
+    )
+    await bg_audio.start(room=ctx.room, agent_session=session)
 
     await session.start(agent=Assistant(), room=ctx.room)
 

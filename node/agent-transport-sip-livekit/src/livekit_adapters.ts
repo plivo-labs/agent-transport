@@ -183,14 +183,35 @@ export class TransportLocalParticipant {
     }
   }
 
-  private async _forwardTrackAudio(_pubSid: string, _track: any, signal: AbortSignal): Promise<void> {
-    // TODO: Not yet implemented for Node.js.
-    // Python version reads frames from rtc.AudioStream.from_track() and forwards
-    // to endpoint.send_background_audio(). Node equivalent needs @livekit/rtc-node
-    // AudioStream API to read from the published track.
-    // For now, background audio mixing is not supported in the Node adapter.
-    while (!signal.aborted) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
+  private async _forwardTrackAudio(pubSid: string, track: any, signal: AbortSignal): Promise<void> {
+    // Read frames from published audio track and forward to Rust background mixer.
+    // Uses @livekit/rtc-node AudioStream to loopback-read from the LocalAudioTrack.
+    try {
+      const { AudioStream } = await import('@livekit/rtc-node');
+      const sr = this._ep.inputSampleRate ?? 8000;
+      const stream = new AudioStream(track, sr, 1);
+      const reader = stream.getReader();
+      let frameCount = 0;
+
+      while (!signal.aborted) {
+        const { value: frame, done } = await reader.read();
+        if (done || signal.aborted) break;
+        if (frame.samplesPerChannel > 0) {
+          try {
+            this._ep.sendBackgroundAudio(
+              this._sid, Buffer.from(frame.data.buffer), frame.sampleRate, frame.channels);
+            frameCount++;
+          } catch {
+            break; // Session gone
+          }
+        }
+      }
+    } catch (err) {
+      // @livekit/rtc-node AudioStream not available — background audio not supported
+      console.warn('Background audio forwarding not available:', err);
+      while (!signal.aborted) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
     }
   }
 

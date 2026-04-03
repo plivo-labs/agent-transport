@@ -182,6 +182,17 @@ impl AudioBuffer {
         if let Some(cb) = cb { cb(); }
     }
 
+    /// Push samples without backpressure — silently drop if buffer full.
+    /// Used for background audio which is continuous and low priority.
+    pub fn push_no_backpressure(&self, samples: &[i16]) {
+        let mut inner = self.inner.lock().unwrap();
+        let available = self.capacity.saturating_sub(inner.pcm.len());
+        if available >= samples.len() {
+            inner.pcm.extend(samples.iter().copied());
+        }
+        // Silently drop if full — background audio should never block
+    }
+
     /// Clear buffer immediately and fire pending completion.
     /// Called from clear_queue for immediate interrupt.
     pub fn clear(&self) {

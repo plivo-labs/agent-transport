@@ -409,6 +409,10 @@ export class AgentServer {
           connect: async () => {},
           addShutdownCallback: () => {},
           shutdown: () => {},
+          is_fake_job: () => false,
+          isFakeJob: () => false,
+          worker_id: 'local',
+          workerId: 'local',
         };
 
         if (runWithJobContext) {

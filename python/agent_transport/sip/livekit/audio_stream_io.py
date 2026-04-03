@@ -265,11 +265,19 @@ class AudioStreamOutput(AudioOutput):
     def pause(self) -> None:
         super().pause()
         self._playback_enabled.clear()
+        try:
+            self._ep.pause(self._cid)
+        except Exception:
+            pass
 
     def resume(self) -> None:
         super().resume()
         self._playback_enabled.set()
         self._first_frame_event.clear()
+        try:
+            self._ep.resume(self._cid)
+        except Exception:
+            pass
 
     async def _wait_for_playout(self) -> None:
         logger.debug("_wait_for_playout: starting (pushed=%.3fs)", self._pushed_duration)
