@@ -188,7 +188,7 @@ export class TransportLocalParticipant {
     // Uses @livekit/rtc-node AudioStream to loopback-read from the LocalAudioTrack.
     try {
       const { AudioStream } = await import('@livekit/rtc-node');
-      const sr = this._ep.inputSampleRate ?? 8000;
+      const sr = (this._endpoint as any).inputSampleRate ?? 8000;
       const stream = new AudioStream(track, sr, 1);
       const reader = stream.getReader();
       let frameCount = 0;
@@ -198,8 +198,8 @@ export class TransportLocalParticipant {
         if (done || signal.aborted) break;
         if (frame.samplesPerChannel > 0) {
           try {
-            this._ep.sendBackgroundAudio(
-              this._sid, Buffer.from(frame.data.buffer), frame.sampleRate, frame.channels);
+            this._endpoint.sendBackgroundAudio(
+              this._sessionId, Buffer.from(frame.data.buffer), frame.sampleRate, frame.channels);
             frameCount++;
           } catch {
             break; // Session gone

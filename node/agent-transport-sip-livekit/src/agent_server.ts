@@ -524,15 +524,15 @@ export class AgentServer {
         req.on('end', async () => {
           try {
             const data = JSON.parse(body);
-            const destination = data.to;
-            if (!destination) {
+            const rawTo = data.to;
+            if (!rawTo) {
               res.writeHead(400, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ error: "missing 'to' field" }));
               return;
             }
 
-            const rawTo = destination;
             // Normalize destination for SIP: add sip: prefix and @domain if missing
+            let destination = rawTo;
             if (!destination.startsWith('sip:')) destination = 'sip:' + destination;
             if (!destination.split(':')[1]?.includes('@')) destination = destination + '@' + this.sipServer;
 
