@@ -78,9 +78,7 @@ class Assistant(Agent):
     async def on_enter(self) -> None:
         job_ctx = get_job_context()
         job_ctx.room.on("sip_dtmf_received", self._on_dtmf)
-        self.session.generate_reply(
-            instructions="Greet the user and ask how you can help."
-        )
+        self.session.say("Hello, how can I help you today?")
 
     async def on_exit(self) -> None:
         pass

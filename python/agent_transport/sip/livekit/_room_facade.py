@@ -13,7 +13,6 @@ Architecture:
 import asyncio
 import datetime
 import logging
-import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -364,7 +363,7 @@ class _StubJob:
     """Minimal stub for agent.Job protobuf — provides fields AgentSession reads."""
     id: str
     agent_name: str
-    enable_recording: bool = False
+    enable_recording: bool = True
 
 
 class _StubJobContext:
@@ -379,8 +378,8 @@ class _StubJobContext:
         self._job = _StubJob(id=f"job-{room._sid}", agent_name=agent_name)
         self._primary_agent_session = None
         self._shutdown_callbacks: list = []
-        self._tempdir = tempfile.TemporaryDirectory()
-        self.session_directory = Path(self._tempdir.name)
+        self.session_directory = Path("/tmp/agent-sessions")
+        self.session_directory.mkdir(parents=True, exist_ok=True)
         self.worker_id = "local"
 
     @property
@@ -424,25 +423,25 @@ class _StubJobContext:
         if ep is None or session_id is None:
             return
 
+        # Rust recording: stereo OGG/Opus at the transport layer
+        # Captures agent voice + background audio + user audio (all mixed)
         try:
             import os
             rec_dir = str(self.session_directory)
             os.makedirs(rec_dir, exist_ok=True)
-            rec_path = os.path.join(rec_dir, "audio.ogg")
-            ep.start_recording(session_id, rec_path, True)  # stereo OGG/Opus
+            rec_path = os.path.join(rec_dir, f"recording_{session_id}.ogg")
+            ep.start_recording(session_id, rec_path, True)
             logger.debug("Recording started (Rust OGG/Opus): %s", rec_path)
-
-            # Disable RecorderIO's Python-level recording — Rust handles it
+            # Disable RecorderIO — Rust handles recording with full audio mix
             options["audio"] = False
         except Exception:
             logger.warning("Rust recording failed, falling back to RecorderIO", exc_info=True)
-            # Don't disable RecorderIO — let it handle recording as fallback
 
     async def connect(self):
         pass
 
     async def _on_session_end(self):
-        """Called when session ends — stop Rust recording if active."""
+        """Called when session ends — stop Rust recording."""
         ep = self._room._ep if self._room else None
         session_id = self._room._sid if self._room else None
         if ep and session_id:

@@ -407,29 +407,15 @@ export class AgentServer {
       try {
         // Wrap in runWithJobContext so getJobContext().room works inside handler
         // (matches LiveKit WebRTC where entrypoint runs inside job context)
-        const sessionDir = `/tmp/agent-sessions/${sessionId}`;
+        const sessionDir = `/tmp/agent-sessions`;
         const stub = {
           room: ctx.room,
-          job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: true },
+          job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: false },
           _primaryAgentSession: undefined as any,
           sessionDirectory: sessionDir,
           proc: { executorType: null },
           inferenceExecutor: this.inferenceExecutor,
-          initRecording: () => {
-            // Start Rust-level recording (stereo WAV at RTP layer)
-            // and disable RecorderIO's JS-level recording to avoid double recording
-            try {
-              mkdirSync(sessionDir, { recursive: true });
-              this.ep!.startRecording(sessionId, `${sessionDir}/audio.wav`, true);
-              // Disable RecorderIO — Rust handles the recording
-              if (stub._primaryAgentSession) {
-                stub._primaryAgentSession._enableRecording = false;
-              }
-            } catch (err) {
-              console.warn('Rust recording failed, falling back to RecorderIO:', err);
-              // Don't disable RecorderIO — let it handle recording as fallback
-            }
-          },
+          initRecording: () => {},
           connect: async () => {},
           addShutdownCallback: () => {},
           shutdown: () => {},
@@ -452,6 +438,13 @@ export class AgentServer {
             try { writeSync(2, `Call ${sessionId} user: ${ev.oldState} -> ${ev.newState}\n`); } catch {}
           });
         }
+
+        // Start Rust recording (stereo OGG/Opus at transport layer)
+        // Captures full mix: agent voice + background audio + user audio
+        try {
+          mkdirSync(sessionDir, { recursive: true });
+          this.ep!.startRecording(sessionId, `${sessionDir}/recording_${sessionId}.ogg`, true);
+        } catch {}
 
         // Entrypoint returned — session.start() is non-blocking,
         // so wait for call to actually end (BYE or agent shutdown)
