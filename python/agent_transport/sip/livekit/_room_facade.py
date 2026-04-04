@@ -346,14 +346,7 @@ class TransportRoom(EventEmitter):
             if not task.done():
                 task.cancel()
         self._track_forward_tasks.clear()
-        # Stop Rust recording if active
-        ep = self._ep
-        session_id = self._sid
-        if ep and session_id:
-            try:
-                ep.stop_recording(session_id)
-            except Exception:
-                pass
+        # Recording cleanup handled by LiveKit RecorderIO
         self.emit("disconnected")
 
 
@@ -424,32 +417,20 @@ class _StubJobContext:
         if ep is None or session_id is None:
             return
 
+        # Let LiveKit's RecorderIO handle recording (OGG/Opus, full call)
+        # No Rust-level recording needed — RecorderIO produces the correct format
         try:
             import os
-            rec_dir = str(self.session_directory)
-            os.makedirs(rec_dir, exist_ok=True)
-            rec_path = os.path.join(rec_dir, "audio.ogg")
-            ep.start_recording(session_id, rec_path, True)  # stereo OGG/Opus
-            logger.debug("Recording started (Rust OGG/Opus): %s", rec_path)
-
-            # Disable RecorderIO's Python-level recording — Rust handles it
-            options["audio"] = False
+            os.makedirs(str(self.session_directory), exist_ok=True)
         except Exception:
-            logger.warning("Rust recording failed, falling back to RecorderIO", exc_info=True)
-            # Don't disable RecorderIO — let it handle recording as fallback
+            pass
 
     async def connect(self):
         pass
 
     async def _on_session_end(self):
-        """Called when session ends — stop Rust recording if active."""
-        ep = self._room._ep if self._room else None
-        session_id = self._room._sid if self._room else None
-        if ep and session_id:
-            try:
-                ep.stop_recording(session_id)
-            except Exception:
-                pass
+        """Called when session ends — recording cleanup handled by RecorderIO."""
+        pass
 
     def add_shutdown_callback(self, callback):
         self._shutdown_callbacks.append(callback)

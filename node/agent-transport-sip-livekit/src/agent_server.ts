@@ -416,19 +416,11 @@ export class AgentServer {
           proc: { executorType: null },
           inferenceExecutor: this.inferenceExecutor,
           initRecording: () => {
-            // Start Rust-level recording (stereo WAV at RTP layer)
-            // and disable RecorderIO's JS-level recording to avoid double recording
+            // Let LiveKit's RecorderIO handle recording (OGG/Opus, full call)
+            // No Rust-level recording needed — RecorderIO produces the correct format
             try {
               mkdirSync(sessionDir, { recursive: true });
-              this.ep!.startRecording(sessionId, `${sessionDir}/audio.wav`, true);
-              // Disable RecorderIO — Rust handles the recording
-              if (stub._primaryAgentSession) {
-                stub._primaryAgentSession._enableRecording = false;
-              }
-            } catch (err) {
-              console.warn('Rust recording failed, falling back to RecorderIO:', err);
-              // Don't disable RecorderIO — let it handle recording as fallback
-            }
+            } catch {}
           },
           connect: async () => {},
           addShutdownCallback: () => {},
@@ -463,7 +455,7 @@ export class AgentServer {
         this.sipCallDurations.push(durationSec);
 
         // Stop Rust recording if active
-        try { this.ep!.stopRecording(sessionId); } catch {}
+        // Recording cleanup handled by LiveKit RecorderIO
 
         // Log usage
         if (ctx.session) {
