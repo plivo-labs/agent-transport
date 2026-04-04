@@ -542,6 +542,26 @@ impl SipEndpoint {
         self.inner.queued_frames(session_id).map_err(py_err)
     }
 
+    /// Get queued audio duration in milliseconds (real buffer state).
+    /// Matches WebRTC's audioSource.queuedDuration.
+    fn queued_duration_ms(&self, session_id: &str) -> PyResult<f64> {
+        self.inner.queued_duration_ms(session_id).map_err(py_err)
+    }
+
+    /// Set a callback for playout completion (fires when buffer drains to empty).
+    /// Matches WebRTC's audioSource.waitForPlayout() — truly async, pause-aware.
+    #[pyo3(signature = (session_id, notify_fn))]
+    fn wait_for_playout_notify(&self, _py: Python, session_id: &str, notify_fn: Py<PyAny>) -> PyResult<()> {
+        let callback: Box<dyn FnOnce() + Send> = Box::new(move || {
+            Python::with_gil(|py| {
+                if let Err(e) = notify_fn.call0(py) {
+                    e.print(py);
+                }
+            });
+        });
+        self.inner.wait_for_playout_notify(session_id, callback).map_err(py_err)
+    }
+
     /// Input audio sample rate in Hz.
     #[getter]
     fn input_sample_rate(&self) -> u32 {
@@ -817,6 +837,20 @@ impl AudioStreamEndpoint {
 
     fn queued_frames(&self, session_id: &str) -> PyResult<usize> {
         self.inner.queued_frames(session_id).map_err(py_err)
+    }
+
+    fn queued_duration_ms(&self, session_id: &str) -> PyResult<f64> {
+        self.inner.queued_duration_ms(session_id).map_err(py_err)
+    }
+
+    #[pyo3(signature = (session_id, notify_fn))]
+    fn wait_for_playout_notify(&self, _py: Python, session_id: &str, notify_fn: Py<PyAny>) -> PyResult<()> {
+        let callback: Box<dyn FnOnce() + Send> = Box::new(move || {
+            Python::with_gil(|py| {
+                if let Err(e) = notify_fn.call0(py) { e.print(py); }
+            });
+        });
+        self.inner.wait_for_playout_notify(session_id, callback).map_err(py_err)
     }
 
     /// Send DTMF digits via Plivo audio streaming.

@@ -700,6 +700,15 @@ impl SipEndpoint {
         self.send_audio_with_callback(call_id, frame, Box::new(|| {}))
     }
 
+    /// Send audio without backpressure — push directly, drop if full.
+    /// Used by Node.js adapter where napi ThreadsafeFunction callbacks
+    /// don't reliably fire from tokio threads.
+    pub fn send_audio_no_backpressure(&self, call_id: &str, frame: &AudioFrame) -> Result<()> {
+        let audio_buf = self.with_call(call_id, |c| c.audio_buf.clone())?;
+        audio_buf.push_no_backpressure(&frame.data);
+        Ok(())
+    }
+
     /// Send background audio to be mixed with agent voice in the RTP send loop.
     /// Used by publish_track (background audio, hold music, etc.).
     pub fn send_background_audio(&self, call_id: &str, frame: &AudioFrame) -> Result<()> {
@@ -730,6 +739,20 @@ impl SipEndpoint {
     pub fn queued_frames(&self, call_id: &str) -> Result<usize> {
         let spf = (self.config.output_sample_rate * 20 / 1000) as usize; // samples per 20ms frame
         self.with_call(call_id, |c| c.audio_buf.len() / spf)
+    }
+
+    /// Get queued audio duration in milliseconds (real buffer state).
+    /// Matches WebRTC's audioSource.queuedDuration.
+    pub fn queued_duration_ms(&self, call_id: &str) -> Result<f64> {
+        self.with_call(call_id, |c| c.audio_buf.queued_duration_ms(self.config.output_sample_rate))
+    }
+
+    /// Set a callback to fire when buffer drains to empty (playout complete).
+    /// Matches WebRTC's audioSource.waitForPlayout() — truly async, pause-aware.
+    pub fn wait_for_playout_notify(&self, call_id: &str, on_complete: crate::sip::audio_buffer::CompletionCallback) -> Result<()> {
+        let audio_buf = self.with_call(call_id, |c| c.audio_buf.clone())?;
+        audio_buf.set_playout_callback(on_complete);
+        Ok(())
     }
 
     pub fn start_recording(&self, call_id: &str, path: &str, stereo: bool) -> Result<()> {
@@ -780,7 +803,7 @@ impl Drop for SipEndpoint { fn drop(&mut self) { let _ = self.shutdown(); } }
 
 // ─── Incoming call handler ───────────────────────────────────────────────────
 
-async fn handle_incoming(dl: &Arc<DialogLayer>, st: &Arc<Mutex<EndpointState>>, etx: &Sender<EndpointEvent>, tx: rsipstack::transaction::transaction::Transaction, input_sample_rate: u32, output_sample_rate: u32) {
+async fn handle_incoming(dl: &Arc<DialogLayer>, st: &Arc<Mutex<EndpointState>>, etx: &Sender<EndpointEvent>, tx: rsipstack::transaction::transaction::Transaction, _input_sample_rate: u32, output_sample_rate: u32) {
     let (ds, dr) = dl.new_dialog_state_channel();
     let cred = st.lock().unwrap().credential.clone();
     let contact = st.lock().unwrap().contact_uri.clone();

@@ -55,7 +55,7 @@ declare module 'agent-transport' {
     on(eventName: string, callback: (event: EventInfo) => void): void;
     register(username: string, password: string): void;
     unregister(): void;
-    call(destUri: string, fromUri?: string, headers?: Record<string, string>): string;
+    call(destUri: string, fromUri?: string, headers?: Record<string, string>, sessionId?: string): string;
     answer(sessionId: string): void;
     hangup(sessionId: string): void;
     sendAudio(sessionId: string, frame: AudioFrame): void;

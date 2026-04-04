@@ -21,6 +21,7 @@ struct PlivoMessage {
     #[serde(default)] media: Option<PlivoMedia>,
     #[serde(default)] dtmf: Option<PlivoDtmf>,
     #[serde(default)] name: Option<String>,
+    #[serde(default)] reason: Option<String>,
     #[serde(default)] extra_headers: Option<String>,
 }
 
@@ -128,6 +129,16 @@ impl StreamProtocol for PlivoProtocol {
                 Some(StreamEvent::CheckpointAck { name })
             }
             "clearedAudio" => Some(StreamEvent::BufferCleared),
+            "playFailed" => {
+                let reason = plivo.reason.unwrap_or_else(|| "unknown".to_string());
+                Some(StreamEvent::PlayFailed { reason })
+            }
+            "error" => {
+                let reason = plivo.reason.unwrap_or_else(|| "unknown".to_string());
+                Some(StreamEvent::StreamError { reason })
+            }
+            "muteStream" => Some(StreamEvent::MuteStream),
+            "unmuteStream" => Some(StreamEvent::UnmuteStream),
             "stop" => Some(StreamEvent::Stop),
             _ => None,
         }
@@ -161,6 +172,18 @@ impl StreamProtocol for PlivoProtocol {
         serde_json::to_string(&serde_json::json!({
             "event": "sendDTMF", "dtmf": digits
         })).unwrap_or_else(|e| { warn!("JSON serialize error: {}", e); String::new() })
+    }
+
+    fn build_mute_stream(&self, stream_id: &str) -> Option<String> {
+        Some(serde_json::to_string(&serde_json::json!({
+            "event": "muteStream", "streamId": stream_id
+        })).unwrap_or_default())
+    }
+
+    fn build_unmute_stream(&self, stream_id: &str) -> Option<String> {
+        Some(serde_json::to_string(&serde_json::json!({
+            "event": "unmuteStream", "streamId": stream_id
+        })).unwrap_or_default())
     }
 
     fn hangup(&self, call_id: &str, rt: &tokio::runtime::Runtime) {

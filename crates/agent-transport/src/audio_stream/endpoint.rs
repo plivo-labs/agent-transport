@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use beep_detector::{BeepDetector, BeepDetectorConfig, BeepDetectorResult};
 use crate::audio::AudioFrame;
@@ -144,13 +144,23 @@ impl AudioStreamEndpoint {
     pub fn pause(&self, session_id: &str) -> Result<()> {
         let s = self.sessions.lock().unwrap();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
-        sess.paused.store(true, Ordering::Relaxed); Ok(())
+        sess.paused.store(true, Ordering::Relaxed);
+        // Tell provider to mute (stops audio output on their side)
+        if let Some(msg) = self.protocol.build_mute_stream(&sess.stream_id) {
+            let _ = sess.ws_tx.send(Message::Text(msg));
+        }
+        Ok(())
     }
 
     pub fn resume(&self, session_id: &str) -> Result<()> {
         let s = self.sessions.lock().unwrap();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
-        sess.paused.store(false, Ordering::Relaxed); Ok(())
+        sess.paused.store(false, Ordering::Relaxed);
+        // Tell provider to unmute
+        if let Some(msg) = self.protocol.build_unmute_stream(&sess.stream_id) {
+            let _ = sess.ws_tx.send(Message::Text(msg));
+        }
+        Ok(())
     }
 
     // ─── Buffer / checkpoint / flush ─────────────────────────────────────
@@ -283,6 +293,22 @@ impl AudioStreamEndpoint {
         let s = self.sessions.lock().unwrap();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         Ok(sess.audio_buf.len() / spf)
+    }
+
+    pub fn queued_duration_ms(&self, session_id: &str) -> Result<f64> {
+        let s = self.sessions.lock().unwrap();
+        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
+        Ok(sess.audio_buf.queued_duration_ms(self.config.output_sample_rate))
+    }
+
+    pub fn wait_for_playout_notify(&self, session_id: &str, on_complete: crate::sip::audio_buffer::CompletionCallback) -> Result<()> {
+        let audio_buf = {
+            let s = self.sessions.lock().unwrap();
+            let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
+            sess.audio_buf.clone()
+        };
+        audio_buf.set_playout_callback(on_complete);
+        Ok(())
     }
 
     pub fn input_sample_rate(&self) -> u32 { self.config.input_sample_rate }
@@ -579,6 +605,38 @@ async fn handle_ws(
 
                     StreamEvent::BufferCleared => {
                         debug!("Buffer cleared confirmed on session {}", sid);
+                    }
+
+                    StreamEvent::PlayFailed { reason } => {
+                        warn!("Playback failed on session {}: {}", sid, reason);
+                        // Clear stale audio to prevent accumulation after failure
+                        if let Some(sess) = sessions.lock().unwrap().get(&sid) {
+                            sess.audio_buf.clear();
+                        }
+                    }
+
+                    StreamEvent::StreamError { reason } => {
+                        warn!("Stream error on session {}: {}", sid, reason);
+                        if let Some(sess) = sessions.lock().unwrap().remove(&sid) {
+                            sess.cancel.cancel();
+                            let session = crate::sip::call::CallSession::new(sid.clone(), crate::sip::call::CallDirection::Inbound);
+                            let _ = etx.try_send(EndpointEvent::CallTerminated { session, reason: format!("stream error: {}", reason) });
+                        }
+                        break;
+                    }
+
+                    StreamEvent::MuteStream => {
+                        info!("Session {} muted by provider", sid);
+                        if let Some(sess) = sessions.lock().unwrap().get(&sid) {
+                            sess.muted.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+
+                    StreamEvent::UnmuteStream => {
+                        info!("Session {} unmuted by provider", sid);
+                        if let Some(sess) = sessions.lock().unwrap().get(&sid) {
+                            sess.muted.store(false, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
 
                     StreamEvent::Stop => {

@@ -19,6 +19,7 @@
  *   await session.start({ agent: myAgent, room });
  */
 
+import { writeSync } from 'node:fs';
 import { SipAudioInput } from './sip_audio_input.js';
 import { SipAudioOutput } from './sip_audio_output.js';
 
@@ -188,7 +189,7 @@ export class TransportLocalParticipant {
     // Uses @livekit/rtc-node AudioStream to loopback-read from the LocalAudioTrack.
     try {
       const { AudioStream } = await import('@livekit/rtc-node');
-      const sr = this._ep.inputSampleRate ?? 8000;
+      const sr = (this._endpoint as any).inputSampleRate ?? 8000;
       const stream = new AudioStream(track, sr, 1);
       const reader = stream.getReader();
       let frameCount = 0;
@@ -198,9 +199,14 @@ export class TransportLocalParticipant {
         if (done || signal.aborted) break;
         if (frame.samplesPerChannel > 0) {
           try {
-            this._ep.sendBackgroundAudio(
-              this._sid, Buffer.from(frame.data.buffer), frame.sampleRate, frame.channels);
+            this._endpoint.sendBackgroundAudio(
+              this._sessionId, Buffer.from(frame.data.buffer), frame.sampleRate, frame.channels);
             frameCount++;
+            if (frameCount === 1) {
+              writeSync(2, `Background audio: first frame sr=${frame.sampleRate} samples=${frame.samplesPerChannel}\n`);
+            } else if (frameCount % 500 === 0) {
+              writeSync(2, `Background audio: ${frameCount} frames forwarded\n`);
+            }
           } catch {
             break; // Session gone
           }
@@ -290,7 +296,7 @@ export class TransportRoom extends EventEmitter {
   get e2eeManager(): null { return null; }
   get creationTime(): Date { return this._creationTime; }
 
-  isConnected(): boolean { return this._connected; }
+  get isConnected(): boolean { return this._connected; }
 
   async connect(url = '', token = '', options?: any): Promise<void> {
     // Already connected via transport — no WebRTC connection needed

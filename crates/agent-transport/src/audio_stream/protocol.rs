@@ -88,6 +88,18 @@ pub enum StreamEvent {
     },
     /// Provider confirmed buffer was cleared.
     BufferCleared,
+    /// Audio playback failed on provider side.
+    PlayFailed {
+        reason: String,
+    },
+    /// Provider-side stream error.
+    StreamError {
+        reason: String,
+    },
+    /// Provider muted the stream (server-initiated).
+    MuteStream,
+    /// Provider unmuted the stream (server-initiated).
+    UnmuteStream,
     /// Session ended.
     Stop,
 }
@@ -120,4 +132,11 @@ pub trait StreamProtocol: Send + Sync + 'static {
     /// Hang up the call via provider's API (REST, WebSocket command, etc.).
     /// Called from a blocking context (tokio runtime).
     fn hangup(&self, call_id: &str, rt: &tokio::runtime::Runtime);
+
+    /// Build a "mute stream" command to pause audio output on the provider side.
+    /// Returns None if the provider doesn't support server-side mute.
+    fn build_mute_stream(&self, _stream_id: &str) -> Option<String> { None }
+
+    /// Build an "unmute stream" command to resume audio output on the provider side.
+    fn build_unmute_stream(&self, _stream_id: &str) -> Option<String> { None }
 }

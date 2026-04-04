@@ -34,12 +34,12 @@ pub struct RecvAudioTask {
 
 impl Task for RecvAudioTask {
     type Output = Option<Vec<u8>>;
-    type JsValue = Option<Vec<u8>>;
+    type JsValue = Option<Buffer>;
     fn compute(&mut self) -> Result<Self::Output> {
         Ok(self.rx.recv_timeout(std::time::Duration::from_millis(self.timeout_ms)).ok().map(|f| f.as_bytes()))
     }
     fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
-        Ok(output)
+        Ok(output.map(|v| Buffer::from(v)))
     }
 }
 
@@ -507,20 +507,27 @@ impl SipEndpoint {
 
     /// Receive audio as raw PCM bytes (little-endian int16). No JS array conversion.
     #[napi]
-    pub fn recv_audio_bytes(&self, session_id: String) -> Result<Option<Vec<u8>>> {
-        self.inner.recv_audio(&session_id).map(|opt| opt.map(|f| f.as_bytes())).map_err(napi_err)
+    pub fn recv_audio_bytes(&self, session_id: String) -> Result<Option<Buffer>> {
+        self.inner.recv_audio(&session_id).map(|opt| opt.map(|f| Buffer::from(f.as_bytes()))).map_err(napi_err)
     }
 
     /// Send raw PCM bytes (little-endian int16) directly.
     #[napi]
-    pub fn send_audio_bytes(&self, session_id: String, audio: Vec<u8>, sample_rate: u32, num_channels: u32) -> Result<()> {
+    pub fn send_audio_bytes(&self, session_id: String, audio: Buffer, sample_rate: u32, num_channels: u32) -> Result<()> {
         let frame = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
         self.inner.send_audio(&session_id, &frame).map_err(napi_err)
     }
 
+    /// Send audio without backpressure — push directly, drop if buffer full.
+    #[napi]
+    pub fn send_audio_no_backpressure(&self, session_id: String, audio: Buffer, sample_rate: u32, num_channels: u32) -> Result<()> {
+        let frame = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
+        self.inner.send_audio_no_backpressure(&session_id, &frame).map_err(napi_err)
+    }
+
     /// Send background audio to be mixed with agent voice in the RTP send loop.
     #[napi]
-    pub fn send_background_audio(&self, session_id: String, audio: Vec<u8>, sample_rate: u32, num_channels: u32) -> Result<()> {
+    pub fn send_background_audio(&self, session_id: String, audio: Buffer, sample_rate: u32, num_channels: u32) -> Result<()> {
         let f = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
         self.inner.send_background_audio(&session_id, &f).map_err(napi_err)
     }
@@ -529,7 +536,7 @@ impl SipEndpoint {
     /// The callback fires when the buffer drains below threshold.
     /// Matches Python's send_audio_notify pattern.
     #[napi(ts_args_type = "sessionId: string, audio: Buffer, sampleRate: number, numChannels: number, notifyFn: () => void")]
-    pub fn send_audio_notify(&self, session_id: String, audio: Vec<u8>, sample_rate: u32, num_channels: u32, notify_fn: JsFunction) -> Result<()> {
+    pub fn send_audio_notify(&self, session_id: String, audio: Buffer, sample_rate: u32, num_channels: u32, notify_fn: JsFunction) -> Result<()> {
         let frame = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
         let tsfn: ThreadsafeFunction<(), ErrorStrategy::CalleeHandled> =
             notify_fn.create_threadsafe_function(0, |ctx: ThreadSafeCallContext<()>| {
@@ -552,10 +559,10 @@ impl SipEndpoint {
 
     /// Receive audio as raw bytes, blocking. Fastest path.
     #[napi]
-    pub fn recv_audio_bytes_blocking(&self, session_id: String, timeout_ms: Option<u32>) -> Result<Option<Vec<u8>>> {
+    pub fn recv_audio_bytes_blocking(&self, session_id: String, timeout_ms: Option<u32>) -> Result<Option<Buffer>> {
         self.inner
             .recv_audio_blocking(&session_id, timeout_ms.unwrap_or(20) as u64)
-            .map(|opt| opt.map(|f| f.as_bytes()))
+            .map(|opt| opt.map(|f| Buffer::from(f.as_bytes())))
             .map_err(napi_err)
     }
 
@@ -577,6 +584,26 @@ impl SipEndpoint {
     #[napi]
     pub fn queued_frames(&self, session_id: String) -> Result<u32> {
         self.inner.queued_frames(&session_id).map(|n| n as u32).map_err(napi_err)
+    }
+
+    /// Queued audio duration in milliseconds (real buffer state).
+    #[napi]
+    pub fn queued_duration_ms(&self, session_id: String) -> Result<f64> {
+        self.inner.queued_duration_ms(&session_id).map_err(napi_err)
+    }
+
+    /// Set callback for playout completion — fires when buffer drains to empty.
+    /// Matches WebRTC's audioSource.waitForPlayout(). Truly async, pause-aware.
+    #[napi(ts_args_type = "sessionId: string, notifyFn: () => void")]
+    pub fn wait_for_playout_notify(&self, session_id: String, notify_fn: JsFunction) -> Result<()> {
+        let tsfn: ThreadsafeFunction<(), ErrorStrategy::CalleeHandled> =
+            notify_fn.create_threadsafe_function(0, |ctx: ThreadSafeCallContext<()>| {
+                Ok(vec![ctx.env.get_undefined()?])
+            })?;
+        let callback: Box<dyn FnOnce() + Send> = Box::new(move || {
+            tsfn.call(Ok(()), ThreadsafeFunctionCallMode::NonBlocking);
+        });
+        self.inner.wait_for_playout_notify(&session_id, callback).map_err(napi_err)
     }
 
     /// Audio sample rate in Hz.
@@ -769,14 +796,14 @@ impl AudioStreamEndpoint {
     }
 
     #[napi]
-    pub fn send_audio_bytes(&self, session_id: String, audio: Vec<u8>, sample_rate: u32, num_channels: u32) -> Result<()> {
+    pub fn send_audio_bytes(&self, session_id: String, audio: Buffer, sample_rate: u32, num_channels: u32) -> Result<()> {
         let f = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
         self.inner.send_audio(&session_id, &f).map_err(napi_err)
     }
 
     /// Send background audio to be mixed with agent voice in the send loop.
     #[napi]
-    pub fn send_background_audio(&self, session_id: String, audio: Vec<u8>, sample_rate: u32, num_channels: u32) -> Result<()> {
+    pub fn send_background_audio(&self, session_id: String, audio: Buffer, sample_rate: u32, num_channels: u32) -> Result<()> {
         let f = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
         self.inner.send_background_audio(&session_id, &f).map_err(napi_err)
     }
@@ -784,7 +811,7 @@ impl AudioStreamEndpoint {
     /// Send raw PCM bytes with async completion notification (backpressure).
     /// Matches SipEndpoint.send_audio_notify — used by SipAudioSource adapters.
     #[napi(ts_args_type = "sessionId: string, audio: Buffer, sampleRate: number, numChannels: number, notifyFn: () => void")]
-    pub fn send_audio_notify(&self, session_id: String, audio: Vec<u8>, sample_rate: u32, num_channels: u32, notify_fn: JsFunction) -> Result<()> {
+    pub fn send_audio_notify(&self, session_id: String, audio: Buffer, sample_rate: u32, num_channels: u32, notify_fn: JsFunction) -> Result<()> {
         let frame = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
         let tsfn: ThreadsafeFunction<(), ErrorStrategy::CalleeHandled> =
             notify_fn.create_threadsafe_function(0, |ctx: ThreadSafeCallContext<()>| {
@@ -802,8 +829,8 @@ impl AudioStreamEndpoint {
     }
 
     #[napi]
-    pub fn recv_audio_bytes(&self, session_id: String) -> Result<Option<Vec<u8>>> {
-        self.inner.recv_audio(&session_id).map(|o| o.map(|f| f.as_bytes())).map_err(napi_err)
+    pub fn recv_audio_bytes(&self, session_id: String) -> Result<Option<Buffer>> {
+        self.inner.recv_audio(&session_id).map(|o| o.map(|f| Buffer::from(f.as_bytes()))).map_err(napi_err)
     }
 
     #[napi]
@@ -812,8 +839,8 @@ impl AudioStreamEndpoint {
     }
 
     #[napi]
-    pub fn recv_audio_bytes_blocking(&self, session_id: String, timeout_ms: Option<u32>) -> Result<Option<Vec<u8>>> {
-        self.inner.recv_audio_blocking(&session_id, timeout_ms.unwrap_or(20) as u64).map(|o| o.map(|f| f.as_bytes())).map_err(napi_err)
+    pub fn recv_audio_bytes_blocking(&self, session_id: String, timeout_ms: Option<u32>) -> Result<Option<Buffer>> {
+        self.inner.recv_audio_blocking(&session_id, timeout_ms.unwrap_or(20) as u64).map(|o| o.map(|f| Buffer::from(f.as_bytes()))).map_err(napi_err)
     }
 
     /// Receive audio as raw bytes, non-blocking Promise. Runs on libuv thread pool.
@@ -866,6 +893,23 @@ impl AudioStreamEndpoint {
     #[napi]
     pub fn queued_frames(&self, session_id: String) -> Result<u32> {
         self.inner.queued_frames(&session_id).map(|n| n as u32).map_err(napi_err)
+    }
+
+    #[napi]
+    pub fn queued_duration_ms(&self, session_id: String) -> Result<f64> {
+        self.inner.queued_duration_ms(&session_id).map_err(napi_err)
+    }
+
+    #[napi(ts_args_type = "sessionId: string, notifyFn: () => void")]
+    pub fn wait_for_playout_notify(&self, session_id: String, notify_fn: JsFunction) -> Result<()> {
+        let tsfn: ThreadsafeFunction<(), ErrorStrategy::CalleeHandled> =
+            notify_fn.create_threadsafe_function(0, |ctx: ThreadSafeCallContext<()>| {
+                Ok(vec![ctx.env.get_undefined()?])
+            })?;
+        let callback: Box<dyn FnOnce() + Send> = Box::new(move || {
+            tsfn.call(Ok(()), ThreadsafeFunctionCallMode::NonBlocking);
+        });
+        self.inner.wait_for_playout_notify(&session_id, callback).map_err(napi_err)
     }
 
     #[napi]

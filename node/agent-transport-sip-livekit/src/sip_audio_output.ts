@@ -1,131 +1,73 @@
 /**
- * SipAudioOutput — implements LiveKit's AudioOutput interface for SIP/AudioStream.
+ * SipAudioOutput — extends LiveKit's AudioOutput base class for SIP/AudioStream.
  *
- * Duck-types LiveKit's AudioOutput (not publicly exported from @livekit/agents).
- * Implements the exact same interface including:
- * - Segment counting (playbackSegmentsCount / playbackFinishedCount)
- * - captureFrame() with backpressure via sendAudioNotify
- * - flush() → waitForPlayout task racing completion vs interruption
- * - clearBuffer() → interrupt + onPlaybackFinished
- * - onPlaybackStarted / onPlaybackFinished events
- * - pause() / resume() / onAttached() / onDetached()
- * - nextInChain support for middleware stacking
+ * Matches WebRTC's ParticipantAudioOutput exactly:
+ * - captureFrame sends to Rust with backpressure (sendAudioNotify callback)
+ * - waitForPlayout uses Rust callback (fires when buffer drains to empty)
+ * - queuedDuration reads real Rust buffer state
+ * - clearBuffer signals interruption
+ * - pause/resume controls Rust RTP output directly
  *
- * Playout timing replaces rtc.AudioSource (tracks queue depth for position).
+ * No timer heuristics — all playout tracking comes from Rust.
  */
 
-import { EventEmitter } from 'node:events';
-import type { AudioFrame } from '@livekit/rtc-node';
-import type { SipEndpoint } from 'agent-transport';
+import { AudioFrame } from '@livekit/rtc-node';
+import { createRequire } from 'node:module';
+import { Future, Task } from '@livekit/agents';
+import type { SipEndpoint, AudioStreamEndpoint } from 'agent-transport';
 
-export interface PlaybackStartedEvent {
-  createdAt: number;
-}
+// AudioOutput is not publicly exported from @livekit/agents — resolve internal path
+const _require = createRequire(import.meta.url);
+const _agentsPath = _require.resolve('@livekit/agents');
+const _ioPath = _agentsPath.replace(/dist\/index\.(c?)js$/, 'dist/voice/io.$1js');
+const { AudioOutput: _AudioOutputBase } = _require(_ioPath);
 
-export interface PlaybackFinishedEvent {
-  playbackPosition: number;
-  interrupted: boolean;
-  synchronizedTranscript?: string;
-}
+// Log via fd 2 (stderr) — pino-pretty takes over stdout/fd 1 completely
+import { writeSync } from 'node:fs';
+const _log = (msg: string) => { try { writeSync(2, msg + '\n'); } catch {} };
 
-class Future<T = void> {
-  private _resolve!: (value: T) => void;
-  private _promise: Promise<T>;
-  private _done = false;
-
-  constructor() {
-    this._promise = new Promise<T>((resolve) => { this._resolve = resolve; });
-  }
-
-  get done(): boolean { return this._done; }
-  get await(): Promise<T> { return this._promise; }
-
-  resolve(value?: T): void {
-    if (!this._done) {
-      this._done = true;
-      this._resolve(value as T);
-    }
-  }
-}
-
-export class SipAudioOutput extends EventEmitter {
-  static readonly EVENT_PLAYBACK_STARTED = 'playbackStarted';
-  static readonly EVENT_PLAYBACK_FINISHED = 'playbackFinished';
-
-  private endpoint: SipEndpoint;
+export class SipAudioOutput extends _AudioOutputBase {
+  private endpoint: SipEndpoint | AudioStreamEndpoint;
   private sessionId: string;
-  readonly sampleRate: number;
-  readonly capabilities = { pause: true };
-  readonly nextInChain?: SipAudioOutput;
 
-  // Playout state (matches ParticipantAudioOutput)
-  private pushedDuration = 0;
-  private interruptedFuture = new Future();
+  private flushTask: Task<void> | null = null;
+  private interruptedFuture = new Future<void>();
   private firstFrameEmitted = false;
-  private flushAbortController: AbortController | null = null;
+  private pushedDuration = 0;
+  private rustPaused = false;
 
-  // Playout timing (replaces rtc.AudioSource internal tracking)
-  private lastCapture = 0;
-  private qSize = 0;
-  private playoutTimer: ReturnType<typeof setTimeout> | null = null;
-  private playoutFuture: Future | null = null;
-
-  // Segment tracking (matches AudioOutput base class exactly)
-  private _capturing = false;
-  private playbackFinishedFuture = new Future();
-  private playbackFinishedCount = 0;
-  private playbackSegmentsCount = 0;
-  private lastPlaybackEvent: PlaybackFinishedEvent = { playbackPosition: 0, interrupted: false };
-  private _chainStartedCb: ((ev: PlaybackStartedEvent) => void) | null = null;
-  private _chainFinishedCb: ((ev: PlaybackFinishedEvent) => void) | null = null;
-
-  constructor(endpoint: SipEndpoint, sessionId: string, sampleRate?: number, nextInChain?: SipAudioOutput) {
-    super();
+  constructor(
+    endpoint: SipEndpoint | AudioStreamEndpoint,
+    sessionId: string,
+    sampleRate?: number,
+    nextInChain?: any,
+  ) {
+    const _sampleRate = sampleRate ?? endpoint.outputSampleRate;
+    super(_sampleRate, nextInChain, { pause: true });
+    _log(`SipAudioOutput constructor: sr=${_sampleRate} session=${sessionId}`);
     this.endpoint = endpoint;
     this.sessionId = sessionId;
-    this.sampleRate = sampleRate ?? endpoint.outputSampleRate;
-    this.nextInChain = nextInChain;
-
-    // Chain event forwarding (matches AudioOutput base class)
-    if (this.nextInChain) {
-      this._chainStartedCb = (ev: PlaybackStartedEvent) => this.onPlaybackStarted(ev.createdAt);
-      this._chainFinishedCb = (ev: PlaybackFinishedEvent) => this.onPlaybackFinished(ev);
-      this.nextInChain.on(SipAudioOutput.EVENT_PLAYBACK_STARTED, this._chainStartedCb);
-      this.nextInChain.on(SipAudioOutput.EVENT_PLAYBACK_FINISHED, this._chainFinishedCb);
-    }
   }
 
-  get canPause(): boolean {
-    return this.capabilities.pause && (this.nextInChain?.canPause ?? true);
-  }
+  // -- captureFrame: matches WebRTC's ParticipantAudioOutput.captureFrame --
 
-  get queuedDuration(): number {
-    return Math.max(this.qSize - (performance.now() / 1000 - this.lastCapture), 0);
-  }
-
-  /**
-   * captureFrame — matches AudioOutput.captureFrame + ParticipantAudioOutput pattern.
-   */
   async captureFrame(frame: AudioFrame): Promise<void> {
-    // Segment tracking (same as AudioOutput base class)
-    if (!this._capturing) {
-      this._capturing = true;
-      this.playbackSegmentsCount++;
+    // Segment tracking (WebRTC doesn't await this — it's sync internally)
+    super.captureFrame(frame);
+
+    // Emit playback started on first frame
+    if (!this.firstFrameEmitted) {
+      this.firstFrameEmitted = true;
+      this.onPlaybackStarted(Date.now());
     }
 
-    // Timing math (replaces rtc.AudioSource internal tracking)
-    const now = performance.now() / 1000;
-    const elapsed = this.lastCapture === 0 ? 0 : now - this.lastCapture;
-    this.qSize += frame.samplesPerChannel / this.sampleRate - elapsed;
-    this.lastCapture = now;
+    // Track pushed duration
+    this.pushedDuration += frame.samplesPerChannel / frame.sampleRate;
 
-    if (this.playoutTimer) clearTimeout(this.playoutTimer);
-    if (!this.playoutFuture) this.playoutFuture = new Future();
-    this.playoutTimer = setTimeout(() => this.releaseWaiter(), Math.max(this.qSize * 1000, 0));
-
-    // Push to Rust with backpressure callback
+    // Push to Rust with backpressure — callback fires when buffer has space.
+    // Matches WebRTC's await audioSource.captureFrame(frame).
     const frameData = Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
-    await new Promise<void>((resolve, reject) => {
+    await new Promise<void>((resolve) => {
       try {
         this.endpoint.sendAudioNotify(
           this.sessionId,
@@ -134,135 +76,147 @@ export class SipAudioOutput extends EventEmitter {
           frame.channels,
           () => resolve(),
         );
-      } catch (e) {
-        this.qSize -= frame.samplesPerChannel / this.sampleRate;
-        if (this.qSize <= 0) this.releaseWaiter();
-        reject(e);
+      } catch {
+        // Buffer full or session gone — drop frame silently (matches WebRTC behavior
+        // where captureFrame returns false on buffer full without throwing)
+        resolve();
       }
     });
-
-    if (!this.firstFrameEmitted) {
-      this.firstFrameEmitted = true;
-      this.onPlaybackStarted(Date.now());
-    }
-
-    this.pushedDuration += frame.samplesPerChannel / frame.sampleRate;
   }
 
-  /**
-   * flush — matches AudioOutput.flush + ParticipantAudioOutput._waitForPlayout.
-   */
+  // -- flush: matches WebRTC's ParticipantAudioOutput.flush --
+
   flush(): void {
-    this._capturing = false;
+    super.flush();
 
-    if (!this.pushedDuration) return;
-
-    if (this.flushAbortController) {
-      this.flushAbortController.abort();
+    if (!this.pushedDuration) {
+      _log('SipAudioOutput.flush: no pushed_duration, skipping');
+      return;
     }
 
-    this.flushAbortController = new AbortController();
-    this.waitForPlayoutTask(this.flushAbortController);
+    if (this.flushTask && !this.flushTask.done) {
+      _log('SipAudioOutput.flush: called while playback in progress');
+      this.flushTask.cancel();
+    }
+
+    _log(`SipAudioOutput.flush: pushed_dur=${this.pushedDuration.toFixed(3)}s, creating waitForPlayout task`);
+    this.flushTask = Task.from((controller: any) => this.waitForPlayoutTask(controller));
   }
 
-  /**
-   * clearBuffer — matches AudioOutput.clearBuffer. Triggers interruption.
-   */
+  // -- clearBuffer: matches WebRTC's ParticipantAudioOutput.clearBuffer --
+
   clearBuffer(): void {
-    if (this.playoutTimer) {
-      clearTimeout(this.playoutTimer);
-      this.playoutTimer = null;
+    if (!this.pushedDuration) {
+      _log('SipAudioOutput.clearBuffer: no pushed_duration, skipping');
+      return;
     }
-    if (!this.pushedDuration) return;
+    _log(`SipAudioOutput.clearBuffer: setting interrupted, pushed_dur=${this.pushedDuration.toFixed(3)}s`);
     this.interruptedFuture.resolve();
   }
 
-  /**
-   * waitForPlayoutTask — races playout completion vs interruption.
-   */
-  private async waitForPlayoutTask(_abortController: AbortController): Promise<void> {
-    const waitPlayout = async (): Promise<boolean> => {
-      if (this.playoutFuture) await this.playoutFuture.await;
-      return false;
+  // -- pause/resume: call Rust endpoint directly for immediate RTP effect --
+
+  pause(): void {
+    super.pause();
+    if (!this.rustPaused) {
+      this.rustPaused = true;
+      try {
+        this.endpoint.pause(this.sessionId);
+        _log('SipAudioOutput.pause: Rust paused');
+      } catch { /* ignore */ }
+    }
+  }
+
+  resume(): void {
+    super.resume();
+    if (this.rustPaused) {
+      this.rustPaused = false;
+      try {
+        this.endpoint.resume(this.sessionId);
+        _log('SipAudioOutput.resume: Rust resumed');
+      } catch { /* ignore */ }
+    }
+  }
+
+  // -- waitForPlayoutTask: matches WebRTC's waitForPlayoutTask exactly --
+
+  private async waitForPlayoutTask(abortController?: any): Promise<void> {
+    _log(`SipAudioOutput._waitForPlayout: starting (pushed=${this.pushedDuration.toFixed(3)}s)`);
+    const abortFuture = new Future<boolean>();
+    const resolveAbort = () => {
+      if (!abortFuture.done) abortFuture.resolve(true);
     };
+    if (abortController?.signal) {
+      abortController.signal.addEventListener('abort', resolveAbort);
+    }
+
+    // Wait for Rust playout — callback fires when buffer drains to empty.
+    // Pause-aware: won't fire while paused (RTP loop doesn't drain).
+    // Matches WebRTC's audioSource.waitForPlayout().
+    this.waitForSourcePlayout().finally(() => {
+      if (abortController?.signal) {
+        abortController.signal.removeEventListener('abort', resolveAbort);
+      }
+      if (!abortFuture.done) abortFuture.resolve(false);
+    });
 
     const interrupted = await Promise.race([
-      waitPlayout(),
+      abortFuture.await,
       this.interruptedFuture.await.then(() => true),
     ]);
 
     let pushedDuration = this.pushedDuration;
+
     if (interrupted) {
-      pushedDuration = Math.max(this.pushedDuration - this.queuedDuration, 0);
-      this.endpoint.clearBuffer(this.sessionId);
-      this.releaseWaiter();
+      // Real Rust buffer state — matches WebRTC's audioSource.queuedDuration
+      const queuedMs = (this.endpoint as any).queuedDurationMs?.(this.sessionId) ?? 0;
+      pushedDuration = Math.max(this.pushedDuration - queuedMs / 1000, 0);
+      this.clearSourceQueue();
+      _log(`SipAudioOutput._waitForPlayout: interrupted, played=${pushedDuration.toFixed(3)}s`);
+    } else {
+      _log(`SipAudioOutput._waitForPlayout: completed, played=${pushedDuration.toFixed(3)}s`);
     }
 
     this.pushedDuration = 0;
     this.interruptedFuture = new Future();
     this.firstFrameEmitted = false;
-
-    this.onPlaybackFinished({ playbackPosition: pushedDuration, interrupted });
+    this.onPlaybackFinished({
+      playbackPosition: pushedDuration,
+      interrupted,
+    });
   }
 
-  private releaseWaiter(): void {
-    if (!this.playoutFuture) return;
-    this.playoutFuture.resolve();
-    this.lastCapture = 0;
-    this.qSize = 0;
-    this.playoutFuture = null;
+  // -- Source helpers (using Rust APIs, matching WebRTC's audioSource) --
+
+  /** Wait for playout via Rust callback — no timer, no thread pool. */
+  private waitForSourcePlayout(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      try {
+        (this.endpoint as any).waitForPlayoutNotify(this.sessionId, () => resolve());
+      } catch {
+        resolve(); // Session gone
+      }
+    });
   }
 
-  // ─── AudioOutput base class interface (segment tracking + events) ──────
-
-  onPlaybackStarted(createdAt: number): void {
-    this.emit(SipAudioOutput.EVENT_PLAYBACK_STARTED, { createdAt } satisfies PlaybackStartedEvent);
+  /** Clear Rust buffer immediately. */
+  private clearSourceQueue(): void {
+    try {
+      this.endpoint.clearBuffer(this.sessionId);
+    } catch { /* ignore */ }
   }
 
-  onPlaybackFinished(ev: PlaybackFinishedEvent): void {
-    if (this.playbackFinishedCount >= this.playbackSegmentsCount) {
-      console.warn('playback_finished called more times than playback segments were captured');
-      return;
-    }
-    this.lastPlaybackEvent = ev;
-    this.playbackFinishedCount++;
-    this.playbackFinishedFuture.resolve();
-    this.playbackFinishedFuture = new Future();
-    this.emit(SipAudioOutput.EVENT_PLAYBACK_FINISHED, ev);
-  }
+  // -- lifecycle --
 
-  async waitForPlayout(): Promise<PlaybackFinishedEvent> {
-    const target = this.playbackSegmentsCount;
-    while (this.playbackFinishedCount < target) {
-      await this.playbackFinishedFuture.await;
-    }
-    return this.lastPlaybackEvent;
-  }
-
-  pause(): void {
-    this.endpoint.pause(this.sessionId);
-    this.nextInChain?.pause();
-  }
-
-  resume(): void {
-    this.endpoint.resume(this.sessionId);
-    this.nextInChain?.resume();
+  async close(): Promise<void> {
+    if (this.flushTask) this.flushTask.cancel();
   }
 
   onAttached(): void {
-    this.nextInChain?.onAttached();
+    if (this.nextInChain) this.nextInChain.onAttached();
   }
 
   onDetached(): void {
-    this.nextInChain?.onDetached();
-  }
-
-  async close(): Promise<void> {
-    if (this.flushAbortController) this.flushAbortController.abort();
-    if (this.playoutTimer) clearTimeout(this.playoutTimer);
-    if (this.nextInChain) {
-      if (this._chainStartedCb) this.nextInChain.off(SipAudioOutput.EVENT_PLAYBACK_STARTED, this._chainStartedCb);
-      if (this._chainFinishedCb) this.nextInChain.off(SipAudioOutput.EVENT_PLAYBACK_FINISHED, this._chainFinishedCb);
-    }
+    if (this.nextInChain) this.nextInChain.onDetached();
   }
 }

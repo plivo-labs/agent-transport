@@ -222,6 +222,8 @@ class SipAudioOutput(AudioOutput):
         self._playback_enabled.set()
         self._first_frame_event = asyncio.Event()
 
+        self._rust_paused = False  # Guard against redundant Rust IPC calls
+
     @property
     def sample_rate(self) -> int | None:
         return self._audio_source.sample_rate
@@ -302,24 +304,25 @@ class SipAudioOutput(AudioOutput):
     def pause(self) -> None:
         super().pause()
         self._playback_enabled.clear()
-        # Immediately pause Rust RTP output — sends silence instead of buffered audio.
-        # Audio stays in buffer for resume (false interruption). Buffer cleared later
-        # by clear_buffer() if it's a real interruption.
-        try:
-            self._ep.pause(self._cid)
-            logger.info("SipAudioOutput.pause: Rust paused")
-        except Exception:
-            pass
+        if not self._rust_paused:
+            self._rust_paused = True
+            try:
+                self._ep.pause(self._cid)
+                logger.debug("SipAudioOutput.pause: Rust paused")
+            except Exception:
+                pass
 
     def resume(self) -> None:
         super().resume()
         self._playback_enabled.set()
         self._first_frame_event.clear()
-        try:
-            self._ep.resume(self._cid)
-            logger.info("SipAudioOutput.resume: Rust resumed")
-        except Exception:
-            pass
+        if self._rust_paused:
+            self._rust_paused = False
+            try:
+                self._ep.resume(self._cid)
+                logger.debug("SipAudioOutput.resume: Rust resumed")
+            except Exception:
+                pass
 
     # -- _wait_for_playout: matches _ParticipantAudioOutput._wait_for_playout --
 

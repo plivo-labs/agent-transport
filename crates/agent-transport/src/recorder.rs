@@ -13,7 +13,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

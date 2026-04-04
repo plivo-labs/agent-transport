@@ -146,6 +146,30 @@ export class AgentServer {
    * Run the server — registers SIP, starts HTTP, handles calls.
    */
   async run(): Promise<void> {
+    // Handle unhandled rejections from LiveKit SDK TTS abort paths gracefully
+    // (StreamAdapter rejects with undefined when TTS is cancelled during interruption)
+    process.on('unhandledRejection', (reason) => {
+      if (reason === undefined || reason === null) return; // TTS abort — benign
+      console.error('Unhandled rejection:', reason);
+    });
+
+    // Strip tsx/ts-node loader hooks from execArgv before any child process forks
+    // (pino-pretty worker, inference subprocess). These hooks corrupt IPC channels.
+    // Must filter flag+value pairs: ['--require', '/path/tsx/...', '--import', 'file:///path/tsx/...']
+    const origLen = process.execArgv.length;
+    const cleanArgv: string[] = [];
+    for (let i = 0; i < process.execArgv.length; i++) {
+      const arg = process.execArgv[i];
+      const next = process.execArgv[i + 1] ?? '';
+      if ((arg === '--require' || arg === '--import') && (next.includes('tsx') || next.includes('ts-node'))) {
+        i++; // skip the value too
+      } else {
+        cleanArgv.push(arg);
+      }
+    }
+    process.execArgv = cleanArgv;
+    console.log(`[init] execArgv: ${origLen} -> ${cleanArgv.length} (stripped ${origLen - cleanArgv.length} tsx hooks)`);
+
     const mode = process.argv[2] ?? 'start';
 
     // Handle download-files command (downloads model files for turn detection etc.)
@@ -387,7 +411,7 @@ export class AgentServer {
         const stub = {
           room: ctx.room,
           job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: true },
-          _primaryAgentSession: null as any,
+          _primaryAgentSession: undefined as any,
           sessionDirectory: sessionDir,
           proc: { executorType: null },
           inferenceExecutor: this.inferenceExecutor,
@@ -419,6 +443,14 @@ export class AgentServer {
           await runWithJobContext(stub as any, () => this.entrypointFn!(ctx));
         } else {
           await this.entrypointFn!(ctx);
+        }
+
+        // Hook user state changes for debug logging (matches Python server behavior)
+        if (ctx.session) {
+          const { writeSync } = await import('node:fs');
+          ctx.session.on('user_state_changed', (ev: any) => {
+            try { writeSync(2, `Call ${sessionId} user: ${ev.oldState} -> ${ev.newState}\n`); } catch {}
+          });
         }
 
         // Entrypoint returned — session.start() is non-blocking,
@@ -524,15 +556,15 @@ export class AgentServer {
         req.on('end', async () => {
           try {
             const data = JSON.parse(body);
-            const destination = data.to;
-            if (!destination) {
+            const rawTo = data.to;
+            if (!rawTo) {
               res.writeHead(400, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ error: "missing 'to' field" }));
               return;
             }
 
-            const rawTo = destination;
             // Normalize destination for SIP: add sip: prefix and @domain if missing
+            let destination = rawTo;
             if (!destination.startsWith('sip:')) destination = 'sip:' + destination;
             if (!destination.split(':')[1]?.includes('@')) destination = destination + '@' + this.sipServer;
 

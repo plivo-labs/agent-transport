@@ -122,6 +122,25 @@ export class AudioStreamServer {
   }
 
   async run(): Promise<void> {
+    // Handle unhandled rejections from LiveKit SDK TTS abort paths gracefully
+    process.on('unhandledRejection', (reason) => {
+      if (reason === undefined || reason === null) return;
+      console.error('Unhandled rejection:', reason);
+    });
+
+    // Strip tsx/ts-node loader hooks from execArgv before any child process forks
+    const cleanArgv: string[] = [];
+    for (let i = 0; i < process.execArgv.length; i++) {
+      const arg = process.execArgv[i];
+      const next = process.execArgv[i + 1] ?? '';
+      if ((arg === '--require' || arg === '--import') && (next.includes('tsx') || next.includes('ts-node'))) {
+        i++;
+      } else {
+        cleanArgv.push(arg);
+      }
+    }
+    process.execArgv = cleanArgv;
+
     const mode = process.argv[2] ?? 'start';
 
     // Handle download-files command (downloads model files for turn detection etc.)
@@ -335,7 +354,7 @@ export class AudioStreamServer {
         const stub = {
           room: ctx.room,
           job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: true },
-          _primaryAgentSession: null as any,
+          _primaryAgentSession: undefined as any,
           sessionDirectory: sessionDir,
           proc: { executorType: null },
           inferenceExecutor: this.inferenceExecutor,
@@ -364,6 +383,14 @@ export class AudioStreamServer {
           await agents.runWithJobContext(stub, () => this.entrypointFn!(ctx));
         } else {
           await this.entrypointFn!(ctx);
+        }
+
+        // Hook user state changes for debug logging
+        if (ctx.session) {
+          const { writeSync } = await import('node:fs');
+          ctx.session.on('user_state_changed', (ev: any) => {
+            try { writeSync(2, `Session ${sessionId} user: ${ev.oldState} -> ${ev.newState}\n`); } catch {}
+          });
         }
 
         // Wait for stream to end

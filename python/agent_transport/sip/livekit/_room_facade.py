@@ -141,9 +141,8 @@ class _TransportLocalParticipant:
                             frame.sample_rate,
                             frame.num_channels,
                         )
-                    except Exception as e:
-                        logger.error("Background audio send failed: %s", e)
-                        break  # Session gone
+                    except Exception:
+                        break  # Session gone — forwarding task will be cancelled by _on_session_ended
 
             await stream.aclose()
         except asyncio.CancelledError:
@@ -335,13 +334,18 @@ class TransportRoom(EventEmitter):
     # ─── Session lifecycle ───────────────────────────────────────────────
 
     def _on_session_ended(self):
-        """Called when the call/stream ends — stop recording, emit disconnected.
+        """Called when the call/stream ends — stop recording, cancel forwarding tasks, emit disconnected.
 
         participant_disconnected is emitted separately by the server event loop
         when call_terminated arrives (matching LiveKit's RoomIO pattern where
         the room fires participant_disconnected and RoomIO handles it).
         """
         self._connected = False
+        # Cancel background audio forwarding tasks (matches LiveKit's track unpublish on disconnect)
+        for task in self._track_forward_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._track_forward_tasks.clear()
         # Stop Rust recording if active
         ep = self._ep
         session_id = self._sid

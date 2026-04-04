@@ -9,6 +9,7 @@
  *   });
  */
 
+import { writeSync } from 'node:fs';
 import type { AudioStreamEndpoint } from 'agent-transport';
 import { SipAudioInput } from './sip_audio_input.js';
 import { SipAudioOutput } from './sip_audio_output.js';
@@ -77,6 +78,23 @@ export class AudioStreamJobContext {
     // Wire audio stream I/O (uses same SipAudioInput/Output — they work with AudioStreamEndpoint too)
     session.input.audio = new SipAudioInput(this.endpoint as any, this.sessionId);
     session.output.audio = new SipAudioOutput(this.endpoint as any, this.sessionId);
+
+    // Wrap session.start() to disable RoomIO audio replacement (matches SIP JobContext)
+    const originalStart = session.start.bind(session);
+    session.start = async (opts: any) => {
+      opts = { ...opts };
+      opts.inputOptions = { ...opts.inputOptions, audioEnabled: false };
+      opts.outputOptions = { ...opts.outputOptions, audioEnabled: false };
+      await originalStart(opts);
+      // Work around LiveKit SDK bug: StreamAdapter adds anonymous listeners per speech
+      try {
+        const tts = (session as any).tts;
+        if (tts?.setMaxListeners) {
+          tts.setMaxListeners(100);
+          writeSync(2, `[AudioStreamContext] TTS maxListeners set to 100\n`);
+        }
+      } catch {}
+    };
 
     session.on('close', async () => {
       console.log(`Session ${this.sessionId} closed`);

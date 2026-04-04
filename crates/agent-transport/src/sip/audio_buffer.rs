@@ -35,6 +35,10 @@ struct Inner {
     pending_complete: Option<CompletionCallback>,
     /// Flush flag — when set, pcm is cleared on next drain
     flush: bool,
+    /// Playout callback — fires when buffer drains to empty after flush.
+    /// Matches WebRTC's waitForPlayout() which resolves when all queued audio is consumed.
+    /// Per-flush: each flush() stores a new callback, replacing any previous one.
+    playout_callback: Option<CompletionCallback>,
 }
 
 /// Shared audio buffer for outbound audio.
@@ -72,6 +76,7 @@ impl AudioBuffer {
                 pcm: VecDeque::with_capacity(capacity),
                 pending_complete: None,
                 flush: false,
+                playout_callback: None,
             }),
             notify_threshold,
             capacity,
@@ -151,13 +156,22 @@ impl AudioBuffer {
 
         // Fire deferred completion if buffer dropped below threshold
         // (matches WebRTC: if on_complete_ && buffer_.size() <= notify_threshold_samples_)
-        if inner.pending_complete.is_some() && inner.pcm.len() <= self.notify_threshold {
+        let pending_cb = if inner.pending_complete.is_some() && inner.pcm.len() <= self.notify_threshold {
             let remaining = inner.pcm.len();
             let cb = inner.pending_complete.take();
-            drop(inner);
             debug!("AudioBuffer: firing deferred callback, buf={} samples ({}ms)", remaining, remaining * 1000 / self.sample_rate as usize);
-            if let Some(cb) = cb { cb(); }
-        }
+            cb
+        } else { None };
+
+        // Fire playout callback when buffer drains to empty
+        // (matches WebRTC's waitForPlayout resolving when last frame consumed)
+        let playout_cb = if inner.pcm.is_empty() && inner.playout_callback.is_some() {
+            inner.playout_callback.take()
+        } else { None };
+
+        drop(inner);
+        if let Some(cb) = pending_cb { cb(); }
+        if let Some(cb) = playout_cb { cb(); }
 
         samples
     }
@@ -195,17 +209,44 @@ impl AudioBuffer {
 
     /// Clear buffer immediately and fire pending completion.
     /// Called from clear_queue for immediate interrupt.
+    /// Does NOT fire playout_callback — interruption is handled by the
+    /// interrupted_event/interruptedFuture in the Python/TS layer.
+    /// Matches WebRTC: clearQueue() clears buffer but doesn't resolve waitForPlayout().
     pub fn clear(&self) {
         let mut inner = self.inner.lock().unwrap();
         let cleared = inner.pcm.len();
         inner.pcm.clear();
         inner.flush = false;
         let cb = inner.pending_complete.take();
+        let _playout_cb = inner.playout_callback.take(); // Drop without firing
         drop(inner);
         if cleared > 0 {
             info!("AudioBuffer clear: cleared {} samples", cleared);
         }
         if let Some(cb) = cb { cb(); }
+    }
+
+    /// Get queued audio duration in milliseconds (real buffer state).
+    /// Matches WebRTC's audioSource.queuedDuration.
+    pub fn queued_duration_ms(&self, sample_rate: u32) -> f64 {
+        let len = self.inner.lock().unwrap().pcm.len();
+        (len as f64 / sample_rate as f64) * 1000.0
+    }
+
+    /// Set a callback to fire when buffer drains to empty after flush.
+    /// Matches WebRTC's audioSource.waitForPlayout() — resolves when all
+    /// queued audio is consumed by the RTP send loop.
+    /// Per-flush: replaces any existing playout callback.
+    /// Pause-aware: callback won't fire while paused (RTP loop doesn't drain).
+    pub fn set_playout_callback(&self, cb: CompletionCallback) {
+        let mut inner = self.inner.lock().unwrap();
+        // If buffer is already empty, fire immediately
+        if inner.pcm.is_empty() {
+            drop(inner);
+            cb();
+        } else {
+            inner.playout_callback = Some(cb);
+        }
     }
 }
 

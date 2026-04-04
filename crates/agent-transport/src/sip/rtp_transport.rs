@@ -13,7 +13,7 @@ use rtp::{header::Header, packet::Packet};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use webrtc_util::marshal::{Marshal, MarshalSize, Unmarshal};
+use webrtc_util::marshal::{Marshal, Unmarshal};
 
 use beep_detector::{BeepDetector, BeepDetectorResult};
 use crate::audio::AudioFrame;
