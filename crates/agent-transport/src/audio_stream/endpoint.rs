@@ -93,12 +93,15 @@ impl AudioStreamEndpoint {
             _ => None,
         };
 
-        let (addr, sess, etx2, cc, isr, osr, proto) = (
+        let recording_mgr = crate::recorder::RecordingManager::new();
+
+        let (addr, sess, etx2, cc, isr, osr, proto, rmgr) = (
             config.listen_addr.clone(), sessions.clone(), etx.clone(),
             cancel.clone(), config.input_sample_rate, config.output_sample_rate, protocol.clone(),
+            recording_mgr.clone(),
         );
         rt.spawn(async move {
-            if let Err(e) = run_ws_server(&addr, sess, etx2, cc, isr, osr, proto, tls_acceptor).await {
+            if let Err(e) = run_ws_server(&addr, sess, etx2, cc, isr, osr, proto, tls_acceptor, rmgr).await {
                 error!("WS server: {}", e);
             }
         });
@@ -107,7 +110,7 @@ impl AudioStreamEndpoint {
         info!("Audio streaming endpoint on {}://{}", scheme, config.listen_addr);
         Ok(Self {
             config, protocol, runtime: rt, sessions, event_tx: etx, event_rx: erx,
-            cancel, recording_mgr: crate::recorder::RecordingManager::new(),
+            cancel, recording_mgr,
         })
     }
 
@@ -303,7 +306,7 @@ impl AudioStreamEndpoint {
     pub fn hangup(&self, session_id: &str) -> Result<()> {
         let call_id = {
             let sess = self.sessions.lock().unwrap().remove(session_id);
-            match sess { Some(s) => { cleanup_session(&s); s.call_id.clone() }, None => return Ok(()) }
+            match sess { Some(s) => { cleanup_session(session_id, &s, &self.recording_mgr); s.call_id.clone() }, None => return Ok(()) }
         };
         self.protocol.hangup(&call_id, &self.runtime);
         Ok(())
@@ -407,6 +410,7 @@ async fn run_ws_server(
     input_sample_rate: u32, output_sample_rate: u32,
     protocol: Arc<dyn StreamProtocol>,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    recording_mgr: Arc<crate::recorder::RecordingManager>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     loop {
@@ -419,10 +423,9 @@ async fn run_ws_server(
                 };
                 info!("WS connection from {}", peer);
                 let sid = format!("ws-{:016x}", rand::random::<u64>());
-                let (s, e, c, p) = (sessions.clone(), etx.clone(), cancel.clone(), protocol.clone());
+                let (s, e, c, p, r) = (sessions.clone(), etx.clone(), cancel.clone(), protocol.clone(), recording_mgr.clone());
 
                 if let Some(ref acceptor) = tls_acceptor {
-                    // TLS mode: perform TLS handshake first, then WS handshake
                     let acceptor = acceptor.clone();
                     tokio::spawn(async move {
                         let tls_stream = match acceptor.accept(stream).await {
@@ -434,16 +437,15 @@ async fn run_ws_server(
                             Ok(ws) => ws,
                             Err(e) => { warn!("WS handshake failed from {}: {}", peer, e); return; }
                         };
-                        handle_ws(ws, sid, s, e, c, input_sample_rate, output_sample_rate, p).await;
+                        handle_ws(ws, sid, s, e, c, input_sample_rate, output_sample_rate, p, r).await;
                     });
                 } else {
-                    // Plain WS mode
                     tokio::spawn(async move {
                         let ws = match tokio_tungstenite::accept_async(stream).await {
                             Ok(ws) => ws,
                             Err(e) => { warn!("WS handshake failed from {}: {}", peer, e); return; }
                         };
-                        handle_ws(ws, sid, s, e, c, input_sample_rate, output_sample_rate, p).await;
+                        handle_ws(ws, sid, s, e, c, input_sample_rate, output_sample_rate, p, r).await;
                     });
                 }
             }
@@ -462,6 +464,7 @@ async fn handle_ws<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     cancel: CancellationToken,
     input_sample_rate: u32, output_sample_rate: u32,
     protocol: Arc<dyn StreamProtocol>,
+    recording_mgr: Arc<crate::recorder::RecordingManager>,
 ) {
     use futures_util::{SinkExt, StreamExt};
     let (mut sink, mut stream) = ws.split();
@@ -748,7 +751,7 @@ async fn handle_ws<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     StreamEvent::StreamError { reason } => {
                         warn!("Stream error on session {}: {}", sid, reason);
                         if let Some(sess) = sessions.lock().unwrap().remove(&sid) {
-                            cleanup_session(&sess);
+                            cleanup_session(&sid, &sess, &recording_mgr);
                             let session = crate::sip::call::CallSession::new(sid.clone(), crate::sip::call::CallDirection::Inbound);
                             let _ = etx.try_send(EndpointEvent::CallTerminated { session, reason: format!("stream error: {}", reason) });
                         }
@@ -772,7 +775,7 @@ async fn handle_ws<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     StreamEvent::Stop => {
                         info!("Session {} stopped", sid);
                         if let Some(sess) = sessions.lock().unwrap().remove(&sid) {
-                            cleanup_session(&sess);
+                            cleanup_session(&sid, &sess, &recording_mgr);
                             let session = crate::sip::call::CallSession::new(sid.clone(), crate::sip::call::CallDirection::Inbound);
                             let _ = etx.try_send(EndpointEvent::CallTerminated { session, reason: "stream stopped".into() });
                         }
@@ -785,7 +788,7 @@ async fn handle_ws<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
     // Cleanup on WS disconnect
     if let Some(sess) = sessions.lock().unwrap().remove(&sid) {
-        cleanup_session(&sess);
+        cleanup_session(&sid, &sess, &recording_mgr);
         let session = crate::sip::call::CallSession::new(sid.clone(), crate::sip::call::CallDirection::Inbound);
         let _ = etx.try_send(EndpointEvent::CallTerminated { session, reason: "ws disconnected".into() });
         info!("Session {} cleaned up (WS disconnected)", sid);
@@ -793,8 +796,10 @@ async fn handle_ws<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 }
 
 /// Clean up a session — cancel send loop and wake any blocked wait_for_playout.
-fn cleanup_session(sess: &StreamSession) {
+fn cleanup_session(session_id: &str, sess: &StreamSession, recording_mgr: &Arc<crate::recorder::RecordingManager>) {
     sess.cancel.cancel();
+    // Stop recording — wakes encoder thread for immediate finalization
+    recording_mgr.stop(session_id);
     // Wake blocked wait_for_playout so executor threads don't hang for 30s
     let (lock, cvar) = &*sess.checkpoint_notify;
     *lock.lock().unwrap() = Some("_closed".into());
