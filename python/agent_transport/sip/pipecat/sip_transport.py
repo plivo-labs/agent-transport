@@ -120,7 +120,7 @@ class SipInputTransport(BaseInputTransport):
                     None, lambda: self._ep.recv_audio_bytes_blocking(self._cid, 20)
                 )
             except Exception as e:
-                logger.debug("SipInputTransport recv_audio error: %s", e)
+                logger.debug("SipInputTransport recv_audio error: {}", e)
                 break
             if result is not None:
                 audio_bytes, sample_rate, num_channels = result
@@ -147,7 +147,7 @@ class SipInputTransport(BaseInputTransport):
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
-                logger.debug("SipInputTransport event_loop error: %s", e)
+                logger.debug("SipInputTransport event_loop error: {}", e)
                 break
             await self._handle_event(event)
 
@@ -160,7 +160,7 @@ class SipInputTransport(BaseInputTransport):
                     None, lambda: self._ep.wait_for_event(timeout_ms=100)
                 )
             except Exception as e:
-                logger.debug("SipInputTransport endpoint event_loop error: %s", e)
+                logger.debug("SipInputTransport endpoint event_loop error: {}", e)
                 break
             if event is None:
                 continue
@@ -280,7 +280,7 @@ class SipOutputTransport(BaseOutputTransport):
                 None, lambda: self._ep.send_info(self._cid, "application/json", msg)
             )
         except Exception as e:
-            logger.warning("send_message via SIP INFO failed: %s", e)
+            logger.warning("send_message via SIP INFO failed: {}", e)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Handle InterruptionFrame — clear Rust buffer + pause RTP, then let base class handle pipeline."""
@@ -299,7 +299,7 @@ class SipOutputTransport(BaseOutputTransport):
         try:
             await loop.run_in_executor(None, lambda: self._ep.hangup(self._cid))
         except Exception as e:
-            logger.debug("hangup on stop failed: %s", e)
+            logger.debug("hangup on stop failed: {}", e)
         await super().stop(frame)
 
     async def cancel(self, frame: CancelFrame):
@@ -307,7 +307,7 @@ class SipOutputTransport(BaseOutputTransport):
         try:
             await loop.run_in_executor(None, lambda: self._ep.hangup(self._cid))
         except Exception as e:
-            logger.debug("hangup on cancel failed: %s", e)
+            logger.debug("hangup on cancel failed: {}", e)
         await super().cancel(frame)
 
 

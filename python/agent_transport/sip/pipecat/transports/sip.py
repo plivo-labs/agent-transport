@@ -208,7 +208,7 @@ class SipServerTransport:
             )
             return session_id
         except Exception as e:
-            logger.error("Outbound call failed: %s", e)
+            logger.error("Outbound call failed: {}", e)
             return None
 
     def run(self) -> None:
@@ -230,7 +230,7 @@ class SipServerTransport:
             result = self._setup_fnc()
             if isinstance(result, dict):
                 self._userdata = result
-            logger.info("Setup complete: %s", list(self._userdata.keys()) or "(no userdata)")
+            logger.info("Setup complete: {}", list(self._userdata.keys()) or "(no userdata)")
 
         # Initialize Rust logging (reads RUST_LOG env var)
         from agent_transport import init_logging
@@ -257,10 +257,10 @@ class SipServerTransport:
             None, lambda: self._ep.wait_for_event(timeout_ms=10000)
         )
         if not event or event["type"] != "registered":
-            logger.error("SIP registration failed: %s", event)
+            logger.error("SIP registration failed: {}", event)
             return
 
-        logger.info("Registered as %s@%s", self._sip_username, self._sip_server)
+        logger.info("Registered as {}@{}", self._sip_username, self._sip_server)
 
         # Start HTTP server if aiohttp available and port configured
         http_task = None
@@ -275,7 +275,7 @@ class SipServerTransport:
             pass
         finally:
             if self._active_sessions:
-                logger.info("Draining %d active session(s)...", len(self._active_sessions))
+                logger.info("Draining {} active session(s)...", len(self._active_sessions))
                 for task in self._active_sessions.values():
                     task.cancel()
                 await asyncio.gather(*self._active_sessions.values(), return_exceptions=True)
@@ -315,11 +315,11 @@ class SipServerTransport:
                 session = event["session"]
                 session_id = session.session_id
                 session_data = _session_to_dict(session)
-                logger.info("Incoming call from %s (session_id=%s)", session_data["remote_uri"], session_id)
+                logger.info("Incoming call from {} (session_id={})", session_data["remote_uri"], session_id)
                 try:
                     await loop.run_in_executor(None, lambda: self._ep.answer(session_id))
                 except Exception as e:
-                    logger.warning("Failed to answer call %s: %s", session_id, e)
+                    logger.warning("Failed to answer call {}: {}", session_id, e)
                     continue
                 pending_calls[session_id] = session_data
 
@@ -359,7 +359,7 @@ class SipServerTransport:
                 if q:
                     await q.put(event)
                 else:
-                    logger.warning("No session queue for %s event on call %s (session not yet started?)", ev_type, session_id)
+                    logger.warning("No session queue for {} event on call {} (session not yet started?)", ev_type, session_id)
 
     def _start_session(self, session_id: str, session_data: dict) -> None:
         """Create transport and spawn session handler task."""
@@ -395,7 +395,7 @@ class SipServerTransport:
         except asyncio.CancelledError:
             pass
         except Exception:
-            logger.exception("Session %s handler failed", session_id)
+            logger.exception("Session {} handler failed", session_id)
         finally:
             duration = time.monotonic() - self._session_start_times.pop(session_id, time.monotonic())
             self._active_sessions.pop(session_id, None)
@@ -403,7 +403,7 @@ class SipServerTransport:
             if HAS_PROMETHEUS:
                 RUNNING_CALLS_GAUGE.dec()
                 SIP_CALL_DURATION.observe(duration)
-            logger.info("Session %s ended (%.1fs)", session_id, duration)
+            logger.info("Session {} ended ({:.1f}s)", session_id, duration)
 
     # ── HTTP server ──────────────────────────────────────────────────────
 
@@ -416,7 +416,7 @@ class SipServerTransport:
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, self._http_host, self._http_port)
-        logger.info("HTTP server on http://%s:%d (health, metrics, call)",
+        logger.info("HTTP server on http://{}:{} (health, metrics, call)",
                      self._http_host, self._http_port)
         await site.start()
 

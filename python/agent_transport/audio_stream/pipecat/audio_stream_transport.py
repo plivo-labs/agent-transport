@@ -121,7 +121,7 @@ class AudioStreamInputTransport(BaseInputTransport):
                     None, lambda: self._ep.recv_audio_bytes_blocking(self._sid, 20)
                 )
             except Exception as e:
-                logger.debug("AudioStreamInputTransport recv_audio error: %s", e)
+                logger.debug("AudioStreamInputTransport recv_audio error: {}", e)
                 break
             if result is not None:
                 audio_bytes, sample_rate, num_channels = result
@@ -148,7 +148,7 @@ class AudioStreamInputTransport(BaseInputTransport):
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
-                logger.debug("AudioStreamInputTransport event_loop error: %s", e)
+                logger.debug("AudioStreamInputTransport event_loop error: {}", e)
                 break
             await self._handle_event(event)
 
@@ -161,7 +161,7 @@ class AudioStreamInputTransport(BaseInputTransport):
                     None, lambda: self._ep.wait_for_event(timeout_ms=100)
                 )
             except Exception as e:
-                logger.debug("AudioStreamInputTransport endpoint event_loop error: %s", e)
+                logger.debug("AudioStreamInputTransport endpoint event_loop error: {}", e)
                 break
             if event is None:
                 continue
@@ -279,7 +279,7 @@ class AudioStreamOutputTransport(BaseOutputTransport):
             await loop.run_in_executor(
                 None, lambda: self._ep.send_raw_message(self._sid, msg))
         except Exception as e:
-            logger.warning("send_message failed: %s", e)
+            logger.warning("send_message failed: {}", e)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Handle InterruptionFrame → clearAudio before base class processing.
@@ -292,7 +292,7 @@ class AudioStreamOutputTransport(BaseOutputTransport):
             try:
                 self._ep.clear_buffer(self._sid)
             except Exception as e:
-                logger.debug("clear_buffer on interruption failed: %s", e)
+                logger.debug("clear_buffer on interruption failed: {}", e)
             # Reset pacing clock on interruption (matches Pipecat WebSocket transport)
             self._next_send_time = 0.0
 
@@ -303,7 +303,7 @@ class AudioStreamOutputTransport(BaseOutputTransport):
         try:
             await loop.run_in_executor(None, lambda: self._ep.hangup(self._sid))
         except Exception as e:
-            logger.debug("hangup on stop failed: %s", e)
+            logger.debug("hangup on stop failed: {}", e)
         await super().stop(frame)
 
     async def cancel(self, frame: CancelFrame):
@@ -311,7 +311,7 @@ class AudioStreamOutputTransport(BaseOutputTransport):
         try:
             await loop.run_in_executor(None, lambda: self._ep.hangup(self._sid))
         except Exception as e:
-            logger.debug("hangup on cancel failed: %s", e)
+            logger.debug("hangup on cancel failed: {}", e)
         await super().cancel(frame)
 
 

@@ -194,7 +194,7 @@ class WebsocketServerTransport:
             result = self._setup_fnc()
             if isinstance(result, dict):
                 self._userdata = result
-            logger.info("Setup complete: %s", list(self._userdata.keys()) or "(no userdata)")
+            logger.info("Setup complete: {}", list(self._userdata.keys()) or "(no userdata)")
 
         self._ep = AudioStreamEndpoint(
             listen_addr=self._listen_addr,
@@ -203,7 +203,7 @@ class WebsocketServerTransport:
             input_sample_rate=self._sample_rate,
             output_sample_rate=self._sample_rate,
         )
-        logger.info("WebSocket server listening on %s", self._listen_addr)
+        logger.info("WebSocket server listening on ws://{}", self._listen_addr)
 
         # Start HTTP server if aiohttp available and port configured
         http_task = None
@@ -218,7 +218,7 @@ class WebsocketServerTransport:
             pass
         finally:
             if self._active_sessions:
-                logger.info("Draining %d active session(s)...", len(self._active_sessions))
+                logger.info("Draining {} active session(s)...", len(self._active_sessions))
                 for task in self._active_sessions.values():
                     task.cancel()
                 await asyncio.gather(*self._active_sessions.values(), return_exceptions=True)
@@ -255,7 +255,7 @@ class WebsocketServerTransport:
                 session = event["session"]
                 session_id = session.session_id
                 session_data = _session_to_dict(session)
-                logger.info("Session %s connected (call_uuid=%s)",
+                logger.info("Session {} connected (call_uuid={})",
                             session_id, session_data.get("call_uuid", ""))
                 pending_sessions[session_id] = session_data
 
@@ -286,7 +286,7 @@ class WebsocketServerTransport:
                 if q:
                     await q.put(event)
                 else:
-                    logger.warning("No session queue for %s event on session %s (session not yet started?)", ev_type, session_id)
+                    logger.warning("No session queue for {} event on session {} (session not yet started?)", ev_type, session_id)
 
     def _start_session(self, session_id: str, session_data: dict) -> None:
         """Create transport and spawn session handler task."""
@@ -322,7 +322,7 @@ class WebsocketServerTransport:
         except asyncio.CancelledError:
             pass
         except Exception:
-            logger.exception("Session %s handler failed", session_id)
+            logger.exception("Session {} handler failed", session_id)
         finally:
             duration = time.monotonic() - self._session_start_times.pop(session_id, time.monotonic())
             self._active_sessions.pop(session_id, None)
@@ -330,7 +330,7 @@ class WebsocketServerTransport:
             if HAS_PROMETHEUS:
                 RUNNING_SESSIONS_GAUGE.dec()
                 STREAM_SESSION_DURATION.observe(duration)
-            logger.info("Session %s ended (%.1fs)", session_id, duration)
+            logger.info("Session {} ended ({:.1f}s)", session_id, duration)
 
     # ── HTTP server ──────────────────────────────────────────────────────
 
@@ -343,7 +343,7 @@ class WebsocketServerTransport:
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, self._http_host, self._http_port)
-        logger.info("HTTP server on http://%s:%d (health, metrics, worker)",
+        logger.info("HTTP server on http://{}:{} (health, metrics, worker)",
                      self._http_host, self._http_port)
         await site.start()
 

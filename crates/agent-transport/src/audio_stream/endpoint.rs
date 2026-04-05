@@ -36,6 +36,9 @@ struct StreamSession {
     incoming_rx: Receiver<AudioFrame>,
     audio_buf: Arc<AudioBuffer>,
     bg_audio_buf: Arc<AudioBuffer>,
+    /// Resampler for incoming agent audio (e.g. 24kHz TTS → 8kHz wire rate).
+    /// Lazy-initialized on first mismatched frame, matching SIP endpoint pattern.
+    input_resampler: Arc<Mutex<Option<crate::sip::resampler::Resampler>>>,
     extra_headers: HashMap<String, String>,
     encoding: WireEncoding,
     muted: Arc<AtomicBool>,
@@ -100,13 +103,31 @@ impl AudioStreamEndpoint {
     // ─── Audio send/recv ─────────────────────────────────────────────────
 
     pub fn send_audio_with_callback(&self, session_id: &str, frame: &AudioFrame, on_complete: CompletionCallback) -> Result<()> {
-        let audio_buf = {
+        let (audio_buf, resampler) = {
             let s = self.sessions.lock().unwrap();
             let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
-            sess.audio_buf.clone()
+            (sess.audio_buf.clone(), sess.input_resampler.clone())
         };
-        audio_buf.push(&frame.data, on_complete)
-            .map_err(|e| EndpointError::Other(e.into()))
+        let target_rate = self.config.output_sample_rate;
+        if frame.sample_rate != 0 && frame.sample_rate != target_rate {
+            // Resample incoming audio (e.g. 24kHz TTS → 8kHz wire rate)
+            let mut guard = resampler.lock().unwrap();
+            if guard.is_none() {
+                info!("send_audio: resampling {}Hz -> {}Hz", frame.sample_rate, target_rate);
+                *guard = crate::sip::resampler::Resampler::new_voip(frame.sample_rate, target_rate);
+            }
+            if let Some(ref mut r) = *guard {
+                let resampled = r.process(&frame.data).to_vec();
+                audio_buf.push(&resampled, on_complete)
+                    .map_err(|e| EndpointError::Other(e.into()))
+            } else {
+                audio_buf.push(&frame.data, on_complete)
+                    .map_err(|e| EndpointError::Other(e.into()))
+            }
+        } else {
+            audio_buf.push(&frame.data, on_complete)
+                .map_err(|e| EndpointError::Other(e.into()))
+        }
     }
 
     pub fn send_audio(&self, session_id: &str, frame: &AudioFrame) -> Result<()> {
@@ -181,6 +202,8 @@ impl AudioStreamEndpoint {
         let s = self.sessions.lock().unwrap();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         sess.audio_buf.clear();
+        // Reset resampler to prevent stale filter artifacts on next speech
+        *sess.input_resampler.lock().unwrap() = None;
         // Cancel any pending flush checkpoint — interrupt overrides playout
         *sess.pending_flush.lock().unwrap() = None;
         // Clear awaiting_checkpoint so late Plivo confirmations are ignored
@@ -580,7 +603,9 @@ async fn handle_ws(
                         sessions.lock().unwrap().insert(sid.clone(), StreamSession {
                             call_id: call_id.clone(), stream_id: stream_id.clone(),
                             ws_tx: ws_tx.clone(), incoming_tx: itx.clone(), incoming_rx: irx.clone(),
-                            audio_buf, bg_audio_buf, extra_headers: headers.clone(), encoding,
+                            audio_buf, bg_audio_buf,
+                            input_resampler: Arc::new(Mutex::new(None)),
+                            extra_headers: headers.clone(), encoding,
                             muted, paused, playout_notify,
                             checkpoint_counter: AtomicU64::new(0), checkpoint_notify: cp_notify,
                             send_loop_notify, pending_flush, awaiting_checkpoint,

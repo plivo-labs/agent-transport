@@ -12,7 +12,7 @@ Usage — minimal change from AudioBufferProcessor:
 
     # After (Agent Transport) — add transport arg, optionally enable file recording
     from agent_transport.audio_stream.pipecat.processors import AudioRecorder
-    recorder = AudioRecorder(transport, num_channels=2, path="/tmp/call.ogg")
+    recorder = AudioRecorder(transport, num_channels=2, path=f"/tmp/agent-sessions/recording_{transport.session_id}.ogg")
 
 All AudioBufferProcessor events work identically:
     on_audio_data, on_track_audio_data, on_user_turn_audio_data, on_bot_turn_audio_data
@@ -84,7 +84,7 @@ class AudioRecorder(AudioBufferProcessor):
                 self._transport.start_recording(self._path, self._stereo)
                 self._rust_recording = True
             except Exception as e:
-                logger.warning("Rust recording failed to start: %s", e)
+                logger.warning("Rust recording failed to start: {}", e)
 
     async def stop_recording(self):
         """Stop recording. Stops Rust file, then fires Python callbacks."""
@@ -95,7 +95,7 @@ class AudioRecorder(AudioBufferProcessor):
             try:
                 self._transport.stop_recording()
             except Exception as e:
-                logger.warning("Rust recording failed to stop: %s", e)
+                logger.warning("Rust recording failed to stop: {}", e)
             self._rust_recording = False
         await super().stop_recording()
         await self._call_event_handler("on_recording_stopped", self._path)
@@ -107,7 +107,7 @@ class AudioRecorder(AudioBufferProcessor):
             try:
                 self._transport.stop_recording()
             except Exception as e:
-                logger.debug("AudioRecorder stop_recording error: %s", e)
+                logger.debug("AudioRecorder stop_recording error: {}", e)
             self._rust_recording = False
 
         await super().process_frame(frame, direction)

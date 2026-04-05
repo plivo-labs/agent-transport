@@ -135,20 +135,20 @@ class SoundfileMixer(BaseAudioMixer):
                     scaled.tobytes(), self._sample_rate, 1,
                 )
             except Exception as e:
-                logger.warning("Background audio feed stopped: %s", e)
+                logger.warning("Background audio feed stopped: {}", e)
                 break  # Session gone
 
     def _load_sound_file(self, name: str, path: str):
         try:
             sound, sr = sf.read(path, dtype="int16")
             if sr != self._sample_rate:
-                logger.info("Resampling sound %s from %dHz to %dHz", path, sr, self._sample_rate)
+                logger.info("Resampling sound {} from {}Hz to {}Hz", path, sr, self._sample_rate)
                 sound = np.interp(
                     np.linspace(0, len(sound), int(len(sound) * self._sample_rate / sr)),
                     np.arange(len(sound)),
                     sound,
                 ).astype(np.int16)
             self._sounds[name] = np.asarray(sound, dtype=np.int16)
-            logger.debug("Loaded mixer sound %s from %s", name, path)
+            logger.debug("Loaded mixer sound {} from {}", name, path)
         except Exception as e:
-            logger.error("Failed to load sound %s: %s", path, e)
+            logger.error("Failed to load sound {}: {}", path, e)
