@@ -18,12 +18,11 @@ All AudioBufferProcessor events work identically:
     on_audio_data, on_track_audio_data, on_user_turn_audio_data, on_bot_turn_audio_data
 """
 
-import logging
 import os
 import tempfile
 from typing import Optional
 
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 try:
     from pipecat.frames.frames import CancelFrame, EndFrame, Frame, StartFrame

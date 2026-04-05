@@ -25,11 +25,10 @@ chunking, and bot speaking detection.
 
 import asyncio
 import json
-import logging
 import time
 from typing import Any, Dict, Optional
 
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 try:
     from pipecat.audio.dtmf.types import KeypadEntry

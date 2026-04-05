@@ -24,16 +24,15 @@ Usage:
 
 import asyncio
 import inspect
-import logging
 import os
 import platform
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
-from agent_transport import SipEndpoint
+from loguru import logger
 
-logger = logging.getLogger("agent_transport.sip_server")
+from agent_transport import SipEndpoint
 
 try:
     from pipecat.transports.base_transport import TransportParams
@@ -144,7 +143,7 @@ class SipServerTransport:
         self._plc = plc or p.plc
         self._comfort_noise = comfort_noise or p.comfort_noise
         self._http_host = http_host
-        self._http_port = http_port or int(os.environ.get("PORT", "0")) or None
+        self._http_port = http_port or int(os.environ.get("PORT", "8080"))
         self._transport_params = transport_params or (p.transport_params if params else None)
 
         self._handler_fnc: Optional[Callable[..., Coroutine]] = None
@@ -232,6 +231,10 @@ class SipServerTransport:
             if isinstance(result, dict):
                 self._userdata = result
             logger.info("Setup complete: %s", list(self._userdata.keys()) or "(no userdata)")
+
+        # Initialize Rust logging (reads RUST_LOG env var)
+        from agent_transport import init_logging
+        init_logging(os.environ.get("RUST_LOG", "info"))
 
         # Create SIP endpoint
         self._ep = SipEndpoint(
@@ -324,6 +327,16 @@ class SipServerTransport:
                 session_id = event.get("session_id", "")
                 if session_id in pending_calls:
                     session_data = pending_calls.pop(session_id)
+                    self._start_session(session_id, session_data)
+                elif session_id not in self._active_sessions:
+                    # Outbound call — no incoming_call event, media active directly
+                    session_data = {
+                        "session_id": session_id,
+                        "remote_uri": event.get("remote_uri", ""),
+                        "direction": "Outbound",
+                        "extra_headers": {},
+                    }
+                    logger.info("Outbound call {} media active", session_id)
                     self._start_session(session_id, session_data)
 
             elif ev_type == "call_terminated":
@@ -436,16 +449,44 @@ class SipServerTransport:
         return web.Response(text="prometheus_client not installed", status=501)
 
     async def _call_handler(self, request: "web.Request") -> "web.Response":
-        """POST /call — make outbound call. Body: {"to": "sip:...", "headers": {...}}"""
+        """POST /call — make outbound call (non-blocking).
+
+        Body: {"to": "+1234567890" or "sip:user@domain", "from": "...", "headers": {...}}
+        Returns immediately with session_id while call dials in background.
+        """
         try:
             body = await request.json()
-            dest = body.get("to", "")
+            raw_to = body.get("to", "")
+            raw_from = body.get("from", "")
             headers = body.get("headers")
-            if not dest:
+            if not raw_to:
                 return web.json_response({"error": "missing 'to' field"}, status=400)
-            session_id = await self.call(dest, headers)
-            if session_id:
-                return web.json_response({"session_id": session_id})
-            return web.json_response({"error": "call failed"}, status=500)
+
+            # Normalize: add sip: prefix and @domain if missing
+            dest = raw_to
+            if not dest.startswith("sip:"):
+                dest = "sip:" + dest
+            if "@" not in dest.split(":", 1)[1]:
+                dest = dest + "@" + self._sip_server
+
+            # Non-blocking: generate session_id, dial in background
+            import uuid
+            session_id = "c" + uuid.uuid4().hex[:16]
+            loop = asyncio.get_running_loop()
+
+            async def _dial():
+                try:
+                    returned_id = await loop.run_in_executor(
+                        None, lambda: self._ep.call(dest, headers=headers, session_id=session_id)
+                    )
+                    logger.info(f"Outbound call {returned_id} to {dest} connected")
+                except Exception as e:
+                    logger.warning(f"Outbound call {session_id} to {dest} failed: {e}")
+
+            asyncio.create_task(_dial())
+            return web.json_response({
+                "session_id": session_id, "status": "dialing",
+                "to": raw_to, "from": raw_from,
+            })
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)

@@ -24,15 +24,14 @@ Usage:
 
 import asyncio
 import inspect
-import logging
 import platform
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Dict, Optional
 
-from agent_transport import AudioStreamEndpoint
+from loguru import logger
 
-logger = logging.getLogger("agent_transport.websocket_server")
+from agent_transport import AudioStreamEndpoint
 
 try:
     from pipecat.transports.base_transport import TransportParams

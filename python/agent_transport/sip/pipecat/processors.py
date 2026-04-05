@@ -9,10 +9,9 @@ Usage:
     pipeline = Pipeline([transport.input(), stt, llm, tts, transport.output(), recorder])
 """
 
-import logging
 from typing import Optional
 
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 try:
     from pipecat.frames.frames import CancelFrame, EndFrame, Frame, StartFrame
@@ -30,7 +29,7 @@ class AudioRecorder(AudioBufferProcessor):
 
     Adds Rust transport-level file recording:
     - Records directly in Rust's RTP send loop (zero Python overhead)
-    - WAV output, stereo (L=user, R=agent)
+    - OGG/Opus output, stereo (L=user, R=agent)
     - on_recording_stopped(path) event when file is written
 
     If path is not provided, behaves exactly like AudioBufferProcessor.

@@ -24,11 +24,10 @@ Pipecat's BaseOutputTransport MediaSender infrastructure.
 
 import asyncio
 import json
-import logging
 import time
 from typing import Any, Dict, Optional
 
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 try:
     from pipecat.audio.dtmf.types import KeypadEntry
@@ -240,6 +239,11 @@ class SipOutputTransport(BaseOutputTransport):
         simulate audio device timing so frames are paced at real-time rate.
         The Rust RTP loop handles the actual 20ms packetization and sending.
         """
+        if not hasattr(self, '_audio_log_count'):
+            self._audio_log_count = 0
+        self._audio_log_count += 1
+        if self._audio_log_count <= 3 or self._audio_log_count % 100 == 0:
+            logger.debug(f"write_audio_frame #{self._audio_log_count}: sr={frame.sample_rate} ch={frame.num_channels} bytes={len(frame.audio)} samples={len(frame.audio)//2} chunk_size={self.audio_chunk_size} transport_sr={self.sample_rate}")
         try:
             self._ep.send_audio_bytes(self._cid, frame.audio, frame.sample_rate, frame.num_channels)
         except Exception:
@@ -279,16 +283,16 @@ class SipOutputTransport(BaseOutputTransport):
             logger.warning("send_message via SIP INFO failed: %s", e)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        """Handle InterruptionFrame → clear_buffer before base class processing."""
+        """Handle InterruptionFrame — clear Rust buffer + pause RTP, then let base class handle pipeline."""
+        await super().process_frame(frame, direction)
+
         if isinstance(frame, InterruptionFrame):
+            logger.debug(f"InterruptionFrame: clearing buffer for {self._cid}")
             try:
                 self._ep.clear_buffer(self._cid)
             except Exception as e:
-                logger.debug("clear_buffer on interruption failed: %s", e)
-            # Reset pacing clock on interruption (matches Pipecat WebSocket transport)
+                logger.warning(f"clear_buffer on interruption failed: {e}")
             self._next_send_time = 0.0
-
-        await super().process_frame(frame, direction)
 
     async def stop(self, frame: EndFrame):
         loop = asyncio.get_running_loop()

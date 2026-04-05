@@ -15,12 +15,10 @@ Usage:
 """
 
 import asyncio
-import logging
 from typing import Any, Dict, Mapping, Optional
 
 import numpy as np
-
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 try:
     from pipecat.audio.mixers.base_audio_mixer import BaseAudioMixer

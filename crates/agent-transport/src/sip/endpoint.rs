@@ -50,6 +50,9 @@ struct CallContext {
     playout_notify: Arc<(Mutex<bool>, Condvar)>,
     beep_detector: Arc<Mutex<Option<BeepDetector>>>,
     recorder: Arc<Mutex<Option<Arc<CallRecorder>>>>,
+    /// Cached resampler for send_audio — resamples TTS output to pipeline rate.
+    /// Stateful (speex anti-aliasing filter) — must persist across frames.
+    input_resampler: Arc<Mutex<Option<crate::sip::resampler::Resampler>>>,
     cancel: CancellationToken,
     rtp_tasks: Vec<tokio::task::JoinHandle<()>>,
     client_dialog: Option<rsipstack::dialog::client_dialog::ClientInviteDialog>,
@@ -183,7 +186,8 @@ fn new_call_context(call_id: &str, direction: CallDirection, cc: CancellationTok
         muted: Arc::new(AtomicBool::new(false)), paused: Arc::new(AtomicBool::new(false)),
         held: Arc::new(AtomicBool::new(false)),
         playout_notify: Arc::new((Mutex::new(false), Condvar::new())),
-        beep_detector: Arc::new(Mutex::new(None)), recorder: Arc::new(Mutex::new(None)), cancel: cc,
+        beep_detector: Arc::new(Mutex::new(None)), recorder: Arc::new(Mutex::new(None)),
+        input_resampler: Arc::new(Mutex::new(None)), cancel: cc,
         rtp_tasks: Vec::new(),
         client_dialog: None, server_dialog: None, local_sdp: None,
     };
@@ -664,7 +668,12 @@ impl SipEndpoint {
     pub fn flush(&self, call_id: &str) -> Result<()> { self.with_call(call_id, |c| { if let Ok(mut d) = c.playout_notify.0.lock() { *d = false; } }) }
     pub fn clear_buffer(&self, call_id: &str) -> Result<()> {
         info!("clear_buffer: call={} clearing audio buffer", call_id);
-        self.with_call(call_id, |c| c.audio_buf.clear())
+        self.with_call(call_id, |c| {
+            c.audio_buf.clear();
+            // Reset the input resampler — stale filter state from the previous speech
+            // segment would produce a click/tick at the start of the next segment.
+            *c.input_resampler.lock().unwrap() = None;
+        })
     }
 
     pub fn wait_for_playout(&self, call_id: &str, timeout_ms: u64) -> Result<bool> {
@@ -686,13 +695,32 @@ impl SipEndpoint {
     ///
     /// Matches WebRTC C++ InternalSource::capture_frame exactly.
     pub fn send_audio_with_callback(&self, call_id: &str, frame: &AudioFrame, on_complete: crate::sip::audio_buffer::CompletionCallback) -> Result<()> {
-        let audio_buf = {
+        let (audio_buf, resampler) = {
             let s = self.state.lock().unwrap();
             let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
-            ctx.audio_buf.clone()
+            (ctx.audio_buf.clone(), ctx.input_resampler.clone())
         };
-        audio_buf.push(&frame.data, on_complete)
-            .map_err(|e| EndpointError::Other(e.into()))
+        let target_rate = self.config.output_sample_rate;
+        if frame.sample_rate != 0 && frame.sample_rate != target_rate {
+            let mut guard = resampler.lock().unwrap();
+            if guard.is_none() {
+                info!("send_audio: resampling {}Hz -> {}Hz (first frame: {} samples)", frame.sample_rate, target_rate, frame.data.len());
+                *guard = crate::sip::resampler::Resampler::new_voip(frame.sample_rate, target_rate);
+            }
+            if let Some(ref mut r) = *guard {
+                let resampled = r.process(&frame.data).to_vec();
+                debug!("send_audio: resampled {} -> {} samples", frame.data.len(), resampled.len());
+                audio_buf.push(&resampled, on_complete)
+                    .map_err(|e| EndpointError::Other(e.into()))
+            } else {
+                info!("send_audio: resampler init failed, pushing raw {} samples at {}Hz", frame.data.len(), frame.sample_rate);
+                audio_buf.push(&frame.data, on_complete)
+                    .map_err(|e| EndpointError::Other(e.into()))
+            }
+        } else {
+            audio_buf.push(&frame.data, on_complete)
+                .map_err(|e| EndpointError::Other(e.into()))
+        }
     }
 
     /// Simple send_audio without callback — for backward compatibility.
@@ -705,7 +733,15 @@ impl SipEndpoint {
     /// don't reliably fire from tokio threads.
     pub fn send_audio_no_backpressure(&self, call_id: &str, frame: &AudioFrame) -> Result<()> {
         let audio_buf = self.with_call(call_id, |c| c.audio_buf.clone())?;
-        audio_buf.push_no_backpressure(&frame.data);
+        let target_rate = self.config.output_sample_rate;
+        if frame.sample_rate != 0 && frame.sample_rate != target_rate {
+            let resampled = crate::sip::resampler::Resampler::new_voip(frame.sample_rate, target_rate)
+                .map(|mut r| r.process(&frame.data).to_vec())
+                .unwrap_or_else(|| frame.data.clone());
+            audio_buf.push_no_backpressure(&resampled);
+        } else {
+            audio_buf.push_no_backpressure(&frame.data);
+        }
         Ok(())
     }
 
@@ -713,9 +749,15 @@ impl SipEndpoint {
     /// Used by publish_track (background audio, hold music, etc.).
     pub fn send_background_audio(&self, call_id: &str, frame: &AudioFrame) -> Result<()> {
         let bg_buf = self.with_call(call_id, |c| c.bg_audio_buf.clone())?;
-        // Background audio: no backpressure — fire callback immediately, drop if full.
-        // Unlike agent voice, background audio is continuous and low priority.
-        bg_buf.push_no_backpressure(&frame.data);
+        let target_rate = self.config.output_sample_rate;
+        if frame.sample_rate != 0 && frame.sample_rate != target_rate {
+            let resampled = crate::sip::resampler::Resampler::new_voip(frame.sample_rate, target_rate)
+                .map(|mut r| r.process(&frame.data).to_vec())
+                .unwrap_or_else(|| frame.data.clone());
+            bg_buf.push_no_backpressure(&resampled);
+        } else {
+            bg_buf.push_no_backpressure(&frame.data);
+        }
         Ok(())
     }
 

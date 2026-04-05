@@ -73,14 +73,19 @@ async def run_bot(transport, userdata):
         ),
     )
 
-    # Rust-backed recorder: AudioBufferProcessor callbacks + WAV file recording
-    recorder = AudioRecorder(transport, path=f"/tmp/call-{transport.session_id}.wav", num_channels=2)
+    # Rust-backed recorder: stereo OGG/Opus recording at the transport layer
+    os.makedirs("/tmp/agent-sessions", exist_ok=True)
+    recorder = AudioRecorder(
+        transport,
+        path=f"/tmp/agent-sessions/recording_{transport.session_id}.ogg",
+        num_channels=2,
+    )
 
     @recorder.event_handler("on_recording_stopped")
     async def on_recording_stopped(recorder, path):
         logger.info(f"Recording saved to {path}")
 
-    # Rust-backed background mixer (uncomment to enable hold music)
+    # Background audio mixer (requires audio files on disk)
     # mixer = SoundfileMixer(transport, sound_files={"hold": "hold_music.wav"},
     #                        default_sound="hold", volume=0.3)
 
@@ -97,7 +102,6 @@ async def run_bot(transport, userdata):
 
     task = PipelineTask(pipeline, params=PipelineParams(
         audio_in_sample_rate=8000,
-        audio_out_sample_rate=8000,
         allow_interruptions=True,
         enable_metrics=True,
         enable_usage_metrics=True,
