@@ -362,7 +362,7 @@ export class AudioStreamServer {
             try {
               const { mkdirSync } = require('node:fs');
               mkdirSync(sessionDir, { recursive: true });
-              this.ep!.startRecording(sessionId, `${sessionDir}/audio.wav`, true);
+              this.ep!.startRecording(sessionId, `${sessionDir}/recording_${sessionId}.ogg`, true);
               if (stub._primaryAgentSession) {
                 stub._primaryAgentSession._enableRecording = false;
               }
@@ -405,6 +405,8 @@ export class AudioStreamServer {
           try { await (ctx.session as any).close(); } catch {}
         }
 
+        // Stop Rust recording if active
+        try { this.ep!.stopRecording(sessionId); } catch {}
         try { this.ep!.hangup(sessionId); } catch {}
 
         ctx.room._onSessionEnded();

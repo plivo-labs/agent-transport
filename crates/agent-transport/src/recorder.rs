@@ -13,7 +13,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fs::File;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use opus::Encoder as OpusEncoder;
@@ -97,7 +97,9 @@ impl CallRecorder {
 // ─── OGG/Opus encoder state ─────────────────────────────────────────────────
 
 struct OggState {
-    file: File,
+    /// Persistent PacketWriter — keeps page sequence numbers correct across batches.
+    /// Using BufWriter<File> as the owned writer so PacketWriter can live in the struct.
+    writer: PacketWriter<'static, std::io::BufWriter<File>>,
     serial: u32,
     encoder: OpusEncoder,
     granule_pos: u64,
@@ -123,9 +125,12 @@ impl OggState {
         let encoder = OpusEncoder::new(opus_sr, channels, Application::Voip)
             .map_err(|e| format!("opus: {}", e))?;
 
+        let serial = rand::random::<u32>();
+        let writer = PacketWriter::new(std::io::BufWriter::new(file));
+
         Ok(Self {
-            file,
-            serial: rand::random::<u32>(),
+            writer,
+            serial,
             encoder,
             granule_pos: 0,
             sample_rate: opus_sr,
@@ -137,15 +142,19 @@ impl OggState {
     fn write_headers(&mut self) -> Result<(), String> {
         if self.header_written { return Ok(()); }
 
+        // OpusHead — RFC 7845 §5.1
+        let lookahead = self.encoder.get_lookahead().unwrap_or(312) as u64;
+        let pre_skip: u16 = (lookahead * 48000 / self.sample_rate as u64) as u16;
         let mut id = Vec::with_capacity(19);
         id.extend_from_slice(b"OpusHead");
-        id.push(1);
+        id.push(1); // version
         id.push(self.num_channels as u8);
-        id.extend_from_slice(&0u16.to_le_bytes());
-        id.extend_from_slice(&self.sample_rate.to_le_bytes());
-        id.extend_from_slice(&0i16.to_le_bytes());
-        id.push(0);
+        id.extend_from_slice(&pre_skip.to_le_bytes());
+        id.extend_from_slice(&self.sample_rate.to_le_bytes()); // input sample rate (informational)
+        id.extend_from_slice(&0i16.to_le_bytes()); // output gain
+        id.push(0); // channel mapping family
 
+        // OpusTags — RFC 7845 §5.2
         let vendor = b"agent-transport";
         let mut comment = Vec::with_capacity(20 + vendor.len());
         comment.extend_from_slice(b"OpusTags");
@@ -153,10 +162,9 @@ impl OggState {
         comment.extend_from_slice(vendor);
         comment.extend_from_slice(&0u32.to_le_bytes());
 
-        let mut pw = PacketWriter::new(&mut self.file);
-        pw.write_packet(Cow::Owned(id), self.serial, ogg::writing::PacketWriteEndInfo::EndPage, 0)
+        self.writer.write_packet(Cow::Owned(id), self.serial, ogg::writing::PacketWriteEndInfo::EndPage, 0)
             .map_err(|e| format!("ogg: {}", e))?;
-        pw.write_packet(Cow::Owned(comment), self.serial, ogg::writing::PacketWriteEndInfo::EndPage, 0)
+        self.writer.write_packet(Cow::Owned(comment), self.serial, ogg::writing::PacketWriteEndInfo::EndPage, 0)
             .map_err(|e| format!("ogg: {}", e))?;
 
         self.header_written = true;
@@ -167,9 +175,11 @@ impl OggState {
         if interleaved.is_empty() { return Ok(()); }
         if !self.header_written { self.write_headers()?; }
 
+        // Opus frame: 20ms at encoder sample rate, interleaved channels
         let frame_samples = (self.sample_rate as usize / 50) * self.num_channels as usize;
+        // Granule position is ALWAYS at 48kHz per RFC 7845, regardless of encoder rate
+        let granule_increment: u64 = 48000 / 50; // 960 per 20ms frame
         let mut out_buf = vec![0u8; 4000];
-        let mut pw = PacketWriter::new(&mut self.file);
         let chunks: Vec<_> = interleaved.chunks(frame_samples).collect();
         let last_idx = chunks.len().saturating_sub(1);
 
@@ -182,17 +192,15 @@ impl OggState {
                 chunk.to_vec()
             };
 
-            let spc = samples.len() / self.num_channels as usize;
             match self.encoder.encode(&samples, &mut out_buf) {
                 Ok(len) => {
-                    self.granule_pos += spc as u64;
-                    // Force EndPage on last packet of batch to flush OGG pages to file
+                    self.granule_pos += granule_increment;
                     let end_info = if idx == last_idx {
                         ogg::writing::PacketWriteEndInfo::EndPage
                     } else {
                         ogg::writing::PacketWriteEndInfo::NormalPacket
                     };
-                    let _ = pw.write_packet(
+                    let _ = self.writer.write_packet(
                         Cow::Owned(out_buf[..len].to_vec()),
                         self.serial,
                         end_info,
@@ -206,14 +214,13 @@ impl OggState {
     }
 
     fn finalize(mut self) {
-        let mut pw = PacketWriter::new(&mut self.file);
-        let _ = pw.write_packet(
+        let _ = self.writer.write_packet(
             Cow::Owned(vec![]),
             self.serial,
             ogg::writing::PacketWriteEndInfo::EndStream,
             self.granule_pos,
         );
-        let dur = self.granule_pos as f64 / self.sample_rate as f64;
+        let dur = self.granule_pos as f64 / 48000.0;
         info!("Recording finalized: {:.1}s {}Hz OGG/Opus", dur, self.sample_rate);
     }
 }
@@ -248,6 +255,8 @@ fn interleave(user: &[i16], agent: &[i16], mode: RecordingMode) -> Vec<i16> {
 pub(crate) struct RecordingManager {
     recordings: Mutex<HashMap<String, (Arc<CallRecorder>, String)>>,
     shutdown: Arc<Mutex<bool>>,
+    /// Wakes encoder thread immediately (for stop/shutdown instead of waiting 2.5s).
+    wake: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl RecordingManager {
@@ -255,6 +264,7 @@ impl RecordingManager {
         let mgr = Arc::new(Self {
             recordings: Mutex::new(HashMap::new()),
             shutdown: Arc::new(Mutex::new(false)),
+            wake: Arc::new((Mutex::new(false), Condvar::new())),
         });
 
         let mgr_ref = mgr.clone();
@@ -283,17 +293,33 @@ impl RecordingManager {
         if let Some((rec, _)) = self.recordings.lock().unwrap().get(call_id) {
             rec.mark_finalized();
         }
+        // Wake encoder thread to do final drain + finalize immediately
+        let (lock, cvar) = &*self.wake;
+        *lock.lock().unwrap() = true;
+        cvar.notify_one();
     }
 
     pub fn shutdown(&self) {
         *self.shutdown.lock().unwrap() = true;
+        let (lock, cvar) = &*self.wake;
+        *lock.lock().unwrap() = true;
+        cvar.notify_one();
     }
 
     fn encoder_loop(&self) {
         let mut ogg_states: HashMap<String, OggState> = HashMap::new();
 
         loop {
-            std::thread::sleep(Duration::from_millis(BATCH_INTERVAL_MS));
+            // Sleep up to BATCH_INTERVAL_MS, but wake immediately on stop/shutdown
+            {
+                let (lock, cvar) = &*self.wake;
+                let mut woken = lock.lock().unwrap();
+                if !*woken {
+                    let (guard, _) = cvar.wait_timeout(woken, Duration::from_millis(BATCH_INTERVAL_MS)).unwrap();
+                    woken = guard;
+                }
+                *woken = false;
+            }
 
             let is_shutdown = *self.shutdown.lock().unwrap();
             let snapshot: Vec<(String, Arc<CallRecorder>, String)> = {
