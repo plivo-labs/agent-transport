@@ -12,7 +12,7 @@ Usage — minimal change from AudioBufferProcessor:
 
     # After (Agent Transport) — add transport arg, optionally enable file recording
     from agent_transport.audio_stream.pipecat.processors import AudioRecorder
-    recorder = AudioRecorder(transport, num_channels=2, path="/tmp/call.ogg")
+    recorder = AudioRecorder(transport, num_channels=2, path=f"/tmp/agent-sessions/recording_{transport.session_id}.ogg")
 
 All AudioBufferProcessor events work identically:
     on_audio_data, on_track_audio_data, on_user_turn_audio_data, on_bot_turn_audio_data

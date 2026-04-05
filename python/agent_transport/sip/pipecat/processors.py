@@ -5,7 +5,7 @@ AudioRecorder hooks Rust's transport-level recording into the Pipecat pipeline.
 Usage:
     from agent_transport.sip.pipecat import AudioRecorder
 
-    recorder = AudioRecorder(transport, path="/tmp/call.wav", num_channels=2)
+    recorder = AudioRecorder(transport, path=f"/tmp/agent-sessions/recording_{transport.session_id}.ogg", num_channels=2)
     pipeline = Pipeline([transport.input(), stt, llm, tts, transport.output(), recorder])
 """
 
