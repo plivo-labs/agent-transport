@@ -2,7 +2,7 @@
   "private": true,
   "workspaces": [
     "crates/agent-transport-node",
-    "node/agent-transport-sip-livekit"
+    "node/agent-transport-livekit"
   ],
   "dependencies": {
     "@livekit/agents": "^1.2.3",

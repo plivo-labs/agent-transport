@@ -91,6 +91,13 @@ jobs:
             fi
           done
 
+      - name: Build LiveKit adapter
+        working-directory: node/agent-transport-livekit
+        run: |
+          npm install
+          npm run build
+          cp -r dist ../../crates/agent-transport-node/livekit
+
       - name: Copy root README into package
         run: cp README.md crates/agent-transport-node/README.md
 
