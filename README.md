@@ -110,65 +110,30 @@ Full examples: [`audio_stream_agent.py`](examples/pipecat/audio_stream_agent.py)
 
 ## Installation
 
-### Rust Core
-
-Requires CMake for the bundled Opus codec. No other system dependencies.
-
 ```bash
-cargo build                                     # Core library (SIP transport)
-cargo build --features audio-stream             # + Plivo audio streaming
-cargo build --features audio-processing         # + jitter buffer, PLC, comfort noise
+pip install agent-transport                     # Core only (Rust bindings)
+pip install agent-transport[livekit]            # + LiveKit adapter
+pip install agent-transport[pipecat]            # + Pipecat adapter
+pip install agent-transport[all]                # Both adapters
 ```
-
-> **CMake 4.x note:** If you see `Compatibility with CMake < 3.5 has been removed`, set `CMAKE_POLICY_VERSION_MINIMUM=3.5` in your environment before building.
-
-### Python
 
 Minimum versions: `livekit-agents>=1.5`, `pipecat-ai>=0.0.108`
 
+### Building from Source
+
+Requires Rust, a C compiler, and CMake.
+
 ```bash
-# 1. Build the native Rust binding
+# Rust core
+cargo build                                     # Core library (SIP transport)
+cargo build --features audio-stream             # + Plivo audio streaming
+cargo build --features audio-processing         # + jitter buffer, PLC, comfort noise
+
+# Python binding
 cd crates/agent-transport-python && pip install -e .
-
-# 2. Install the adapter (LiveKit or Pipecat)
-cd python && pip install -e ".[livekit]"        # LiveKit adapter (SIP + AudioStream)
-cd python && pip install -e ".[pipecat]"        # Pipecat adapter
-cd python && pip install -e ".[all]"            # Both
-# Import paths: agent_transport.sip.livekit, agent_transport.audio_stream.livekit
-
-# 3. Install LiveKit plugins
-pip install livekit-plugins-silero livekit-plugins-deepgram livekit-plugins-openai
-pip install livekit-plugins-turn-detector       # Optional: ML-based turn detection
 ```
 
-### TypeScript / Node.js
-
-Minimum versions: `@livekit/agents>=1.2`, `@livekit/rtc-node>=0.13`
-
-```bash
-# 1. Build the native Rust binding
-cd crates/agent-transport-node && npm run build
-
-# 2. Install the SIP adapter
-cd node/agent-transport-sip-livekit && npm install && npm run build
-
-# 3. Install LiveKit plugins
-npm install @livekit/agents @livekit/agents-plugin-silero \
-  @livekit/agents-plugin-deepgram @livekit/agents-plugin-openai \
-  @livekit/agents-plugin-livekit zod
-
-# 4. Set up npm workspaces and install LiveKit plugins
-cd ../.. && npm install  # root package.json links workspaces
-npm install @livekit/agents @livekit/agents-plugin-silero \
-  @livekit/agents-plugin-deepgram @livekit/agents-plugin-openai \
-  @livekit/agents-plugin-livekit zod
-
-# 5. Download turn detection models
-npx tsx examples/livekit/sip_agent.ts download-files
-
-# 6. Run
-npx tsx examples/livekit/sip_agent.ts dev
-```
+> **CMake 4.x:** If you see `Compatibility with CMake < 3.5 has been removed`, set `CMAKE_POLICY_VERSION_MINIMUM=3.5` in your environment.
 
 ## Examples
 
@@ -192,14 +157,7 @@ See also: [Feature Flags & CLI Phone docs](docs/features.md)
 
 ## Releasing
 
-Publishing is label-driven. Add a label to your PR before merging to `main`:
-
-| Label | Registry | Version file |
-|-------|----------|-------------|
-| `release-python-sdk` | PyPI | `crates/agent-transport-python/pyproject.toml` |
-| `release-node-sdk` | npm | `crates/agent-transport-node/package.json` |
-
-Python and Node releases are independent. Bump the version, add the label, merge — the CI handles the rest.
+Publishing is label-driven. Bump the version, add `release-python-sdk` or `release-node-sdk` label to your PR, and merge — CI handles the rest. Python and Node releases are independent.
 
 ## License
 

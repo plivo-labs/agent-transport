@@ -31,6 +31,7 @@ __pycache__/
 dist/
 *.whl
 .venv/
+*.abi3.so
 
 # PJSIP build artifacts (within submodule — git ignores submodule contents anyway)
 pjproject/pjlib/include/pj/config_site.h
