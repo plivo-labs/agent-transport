@@ -91,6 +91,31 @@ jobs:
               apt-get update && apt-get install -y cmake libopus-dev
             fi
 
+      - name: Verify wheel contents
+        shell: bash
+        run: |
+          python${{ matrix.python-version }} -c "
+          import zipfile, glob, sys
+          wheels = glob.glob('crates/agent-transport-python/dist/*.whl')
+          assert wheels, 'No wheel found'
+          z = zipfile.ZipFile(wheels[0])
+          names = z.namelist()
+          required = [
+              'agent_transport/__init__.py',
+              'agent_transport/sip/__init__.py',
+              'agent_transport/sip/livekit/__init__.py',
+              'agent_transport/sip/pipecat/__init__.py',
+              'agent_transport/audio_stream/__init__.py',
+              'agent_transport/audio_stream/livekit/__init__.py',
+              'agent_transport/audio_stream/pipecat/__init__.py',
+          ]
+          missing = [r for r in required if r not in names]
+          if missing:
+              print('FAIL: missing from wheel:', missing)
+              sys.exit(1)
+          print(f'OK: wheel contains all adapter subpackages ({len([n for n in names if n.startswith(\"agent_transport/\")])} files)')
+          "
+
       - name: Upload wheels
         if: github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
