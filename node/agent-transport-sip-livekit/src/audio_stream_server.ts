@@ -26,6 +26,7 @@ import { AudioStreamEndpoint } from 'agent-transport';
 import { initializeLogger, InferenceRunner, runWithJobContext } from '@livekit/agents';
 import { AudioStreamJobContext } from './audio_stream_context.js';
 import { JobProcess } from './agent_server.js';
+import { uploadReport } from './observability.js';
 
 export interface AudioStreamServerOptions {
   listenAddr?: string;
@@ -408,7 +409,18 @@ export class AudioStreamServer {
         const durationSec = (performance.now() - sessionStart) / 1000;
         this.sessionDurations.push(durationSec);
 
+        // Upload session report (transcript, metrics)
         if (ctx.session) {
+          try {
+            await uploadReport({
+              agentName: this.agentName,
+              session: ctx.session,
+              callId: sessionId,
+            });
+          } catch (e) {
+            console.warn(`Failed to upload session report for session ${sessionId}:`, e);
+          }
+
           try { await (ctx.session as any).close(); } catch {}
         }
 

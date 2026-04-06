@@ -22,6 +22,7 @@ import { mkdirSync } from 'node:fs';
 import { SipEndpoint } from 'agent-transport';
 import { initializeLogger, InferenceRunner, runWithJobContext, log as agentLog, voice } from '@livekit/agents';
 import { JobContext } from './session_context.js';
+import { uploadReport } from './observability.js';
 
 export class JobProcess {
   userData: Record<string, unknown> = {};
@@ -458,7 +459,7 @@ export class AgentServer {
         // Stop Rust recording if active
         try { this.ep!.stopRecording(sessionId); } catch {}
 
-        // Log usage
+        // Log usage and upload session report
         if (ctx.session) {
           try {
             const usage = (ctx.session as any).usage;
@@ -466,6 +467,19 @@ export class AgentServer {
               console.log(`Call ${sessionId} usage:`, JSON.stringify(usage));
             }
           } catch {}
+
+          // Upload session report (transcript, audio, metrics)
+          try {
+            await uploadReport({
+              agentName: this.agentName,
+              session: ctx.session,
+              callId,
+              recordingPath: this.recording ? `${this.recordingDir}/call_${callId}.ogg` : undefined,
+              recordingStartedAt: callStart,
+            });
+          } catch (e) {
+            console.warn(`Failed to upload session report for call ${callId}:`, e);
+          }
         }
 
         // Close session
