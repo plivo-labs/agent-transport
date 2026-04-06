@@ -30,7 +30,7 @@
   "scripts": {
     "build": "CMAKE_POLICY_VERSION_MINIMUM=3.5 napi build --release --no-js",
     "build:debug": "CMAKE_POLICY_VERSION_MINIMUM=3.5 napi build --no-js",
-    "build:livekit": "cd ../../node/agent-transport-livekit && npm run build && cp -r dist ../../crates/agent-transport-node/livekit",
+    "build:livekit": "cd ../../node/agent-transport-livekit && npm run build && mkdir -p ../../crates/agent-transport-node/livekit && cp -r dist/* ../../crates/agent-transport-node/livekit/",
     "build:all": "npm run build && npm run build:livekit"
   },
   "peerDependencies": {
