@@ -1,4 +1,5 @@
-# Override .gitignore for npm: include livekit/ in published package
+# Override .gitignore for npm: include livekit/ and .node in published package
 src/
 Cargo.toml
 build.rs
+!*.node
