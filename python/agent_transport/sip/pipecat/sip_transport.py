@@ -177,12 +177,11 @@ class SipInputTransport(BaseInputTransport):
             await self.push_frame(EndFrame())
         elif event_type == "beep_detected":
             await self._transport._call_event_handler(
-                "on_beep_detected", self._transport,
-                frequency_hz=event.get("frequency_hz"),
-                duration_ms=event.get("duration_ms"),
+                "on_beep_detected",
+                event.get("frequency_hz"), event.get("duration_ms"),
             )
         elif event_type == "beep_timeout":
-            await self._transport._call_event_handler("on_beep_timeout", self._transport)
+            await self._transport._call_event_handler("on_beep_timeout")
 
 
 # ─── Output Transport ───────────────────────────────────────────────────────
