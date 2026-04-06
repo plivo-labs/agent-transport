@@ -1,6 +1,6 @@
 {
   "name": "agent-transport",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "SIP and audio streaming transport for AI voice agents (pure Rust)",
   "type": "module",
   "main": "index.js",
