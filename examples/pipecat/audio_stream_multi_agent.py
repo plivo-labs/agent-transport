@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "agent-transport[pipecat]",
+#     "python-dotenv",
+#     "loguru",
+#     "pipecat-ai[deepgram,openai,silero]",
+# ]
+# ///
 """Pipecat multi-agent over Plivo audio streaming.
 
 Greeter → Sales/Support handoff via function calling.
-
-Prerequisites:
-    pip install "pipecat-ai[deepgram,openai,silero]" python-dotenv loguru
 """
 
 import os

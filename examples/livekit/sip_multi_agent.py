@@ -1,3 +1,14 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "agent-transport[livekit]",
+#     "python-dotenv",
+#     "livekit-plugins-deepgram",
+#     "livekit-plugins-openai",
+#     "livekit-plugins-silero",
+#     "livekit-plugins-turn-detector",
+# ]
+# ///
 """SIP multi-agent with handoff and tool calling.
 
 Demonstrates multiple agents that can hand off to each other:
@@ -9,8 +20,8 @@ Each agent can have its own instructions and tools. Returning an Agent
 from a function tool triggers automatic handoff.
 
 Usage:
-    python examples/livekit/livekit_multi_agent.py start
-    python examples/livekit/livekit_multi_agent.py dev
+    uv run examples/livekit/sip_multi_agent.py start
+    uv run examples/livekit/sip_multi_agent.py dev
 """
 
 import logging
