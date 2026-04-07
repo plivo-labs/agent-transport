@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "agent-transport"
-version = "0.1.6"
+version = "0.1.7"
 description = "SIP and audio streaming transport for AI voice agents (pure Rust)"
 readme = "../../README.md"
 requires-python = ">=3.10"
