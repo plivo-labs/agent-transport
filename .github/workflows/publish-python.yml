@@ -12,7 +12,7 @@ on:
         required: true
 
 permissions:
-  contents: read
+  contents: write
   actions: read
 
 jobs:
@@ -75,3 +75,55 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+
+  release:
+    needs: [check, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+          TARGET_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          SDK_PREFIX="python"
+          SDK_LABEL="python"
+          TAG="${SDK_PREFIX}-v${VERSION}"
+
+          # Find previous tag for this SDK
+          PREV_TAG=$(git tag --list "${SDK_PREFIX}-v*" --sort=-v:refname | head -1)
+          BASE=${PREV_TAG:-$(git rev-list --max-parents=0 HEAD)}
+
+          # Extract PR numbers from commits in range
+          PR_NUMBERS=$(git log "$BASE"..HEAD --oneline | grep -oP '\(#\K[0-9]+(?=\))' | sort -u || true)
+
+          # Filter PRs by label and build notes
+          NOTES=""
+          for pr in $PR_NUMBERS; do
+            LABELS=$(gh pr view "$pr" --json labels --jq '.labels[].name' 2>/dev/null || echo "")
+            if echo "$LABELS" | grep -qE "^(core|${SDK_LABEL})$"; then
+              TITLE=$(gh pr view "$pr" --json title --jq '.title')
+              AUTHOR=$(gh pr view "$pr" --json author --jq '.author.login')
+              NOTES+="- ${TITLE} (#${pr}) @${AUTHOR}"$'\n'
+            fi
+          done
+
+          # Fallback if no labeled PRs found
+          if [ -z "$NOTES" ]; then
+            NOTES="Release ${SDK_PREFIX} v${VERSION}"
+            if [ -n "$PREV_TAG" ]; then
+              NOTES+=$'\n\n'"**Full changelog**: ${PREV_TAG}...${TAG}"
+            fi
+          fi
+
+          gh release create "$TAG" \
+            --target "$TARGET_SHA" \
+            --title "Python SDK v${VERSION}" \
+            --notes "$NOTES"

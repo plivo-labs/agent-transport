@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Pipecat voice agent over Plivo audio streaming.
-
-Prerequisites:
-    pip install "pipecat-ai[deepgram,openai,silero]" python-dotenv loguru soundfile
-"""
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "agent-transport[pipecat]",
+#     "python-dotenv",
+#     "loguru",
+#     "pipecat-ai[deepgram,openai,silero]",
+#     "soundfile",
+# ]
+# ///
+"""Pipecat voice agent over Plivo audio streaming."""
 
 import os
 

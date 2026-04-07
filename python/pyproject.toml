@@ -13,8 +13,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-livekit = ["livekit-agents>=1.5"]
-pipecat = ["pipecat-ai>=0.0.108"]
+livekit = [
+    "aiohttp",
+    "python-dotenv",
+    "livekit-agents>=1.5",
+    "livekit-plugins-deepgram",
+    "livekit-plugins-openai",
+    "livekit-plugins-silero",
+    "livekit-plugins-turn-detector",
+]
+pipecat = ["python-dotenv", "pipecat-ai>=0.0.108"]
 all = ["agent-transport-adapters[livekit,pipecat]"]
 
 [tool.setuptools.packages.find]
