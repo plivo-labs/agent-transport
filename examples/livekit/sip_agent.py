@@ -1,3 +1,14 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "agent-transport[livekit]",
+#     "python-dotenv",
+#     "livekit-plugins-deepgram",
+#     "livekit-plugins-openai",
+#     "livekit-plugins-silero",
+#     "livekit-plugins-turn-detector",
+# ]
+# ///
 """SIP voice agent with tool calling and DTMF support.
 
 Inbound:  SIP INVITE arrives -> agent answers and starts conversation
@@ -8,9 +19,9 @@ DTMF events come through room.on("sip_dtmf_received"), built-in tools like
 send_dtmf_events work out of the box.
 
 Usage:
-    python examples/livekit/sip_agent.py start       # production
-    python examples/livekit/sip_agent.py dev         # dev mode
-    python examples/livekit/sip_agent.py debug       # full debug
+    uv run examples/livekit/sip_agent.py start       # production
+    uv run examples/livekit/sip_agent.py dev         # dev mode
+    uv run examples/livekit/sip_agent.py debug       # full debug
 """
 
 import logging

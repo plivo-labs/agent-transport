@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "agent-transport",
+#     "sounddevice",
+#     "numpy",
+# ]
+# ///
 """
 CLI Phone — make a real SIP call and talk from your terminal.
 
 Uses agent_transport for SIP + sounddevice for mic/speaker.
 
-Prerequisites:
-    cd crates/agent-transport-python && maturin develop
-    pip install sounddevice numpy
-
 Usage:
     # Outbound call:
     SIP_USERNAME=xxx SIP_PASSWORD=yyy \
-        python examples/cli_phone.py sip:+15551234567@phone.plivo.com
+        uv run examples/cli/phone.py sip:+15551234567@phone.plivo.com
 
     # Inbound (wait for a call):
-    SIP_USERNAME=xxx SIP_PASSWORD=yyy python examples/cli_phone.py
+    SIP_USERNAME=xxx SIP_PASSWORD=yyy uv run examples/cli/phone.py
 
 Keyboard controls during call:
     0-9, *, #   Send DTMF digit

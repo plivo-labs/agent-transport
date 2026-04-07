@@ -1,3 +1,14 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "agent-transport[livekit]",
+#     "python-dotenv",
+#     "livekit-plugins-deepgram",
+#     "livekit-plugins-openai",
+#     "livekit-plugins-silero",
+#     "livekit-plugins-turn-detector",
+# ]
+# ///
 """Audio streaming multi-agent with handoff and tool calling.
 
 Demonstrates multiple agents that can hand off to each other over
@@ -19,8 +30,8 @@ Setup:
     </Response>
 
 Usage:
-    python examples/livekit/audio_stream_multi_agent.py start
-    python examples/livekit/audio_stream_multi_agent.py dev
+    uv run examples/livekit/audio_stream_multi_agent.py start
+    uv run examples/livekit/audio_stream_multi_agent.py dev
 """
 
 import logging
