@@ -1,3 +1,14 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "agent-transport[livekit]",
+#     "python-dotenv",
+#     "livekit-plugins-deepgram",
+#     "livekit-plugins-openai",
+#     "livekit-plugins-silero",
+#     "livekit-plugins-turn-detector",
+# ]
+# ///
 """Audio streaming voice agent with tool calling and DTMF support.
 
 Plivo connects to your WebSocket server and streams audio bidirectionally.
@@ -17,9 +28,9 @@ Setup:
     </Response>
 
 Usage:
-    python examples/livekit/audio_stream_agent.py start       # production
-    python examples/livekit/audio_stream_agent.py dev         # dev mode
-    python examples/livekit/audio_stream_agent.py debug       # full debug
+    uv run examples/livekit/audio_stream_agent.py start       # production
+    uv run examples/livekit/audio_stream_agent.py dev         # dev mode
+    uv run examples/livekit/audio_stream_agent.py debug       # full debug
 """
 
 import logging

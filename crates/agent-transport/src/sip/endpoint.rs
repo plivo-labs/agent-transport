@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -78,8 +78,9 @@ struct EndpointState {
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
 
-/// Set up RTP transport: parse remote SDP, bind socket, create RtpTransport,
-/// start send/recv loops, wire channels into the CallContext.
+/// Parse remote SDP, bind RTP socket, create RtpTransport, start send/recv loops.
+/// Returns (local_ip, rtp_port, negotiated SdpAnswer, remote RTP address).
+/// Caller builds the appropriate SDP — `build_offer` for outbound, `build_answer` for inbound.
 async fn setup_rtp(
     ctx: &mut CallContext,
     remote_sdp_bytes: &[u8],
@@ -89,7 +90,7 @@ async fn setup_rtp(
     etx: &Sender<EndpointEvent>,
     call_id: &str,
     input_sample_rate: u32, output_sample_rate: u32,
-) -> Result<(String, SocketAddr)> {
+) -> Result<(IpAddr, u16, sdp::SdpAnswer, SocketAddr)> {
     let answer = sdp::parse_answer(remote_sdp_bytes, codecs)?;
     let remote_rtp = SocketAddr::new(answer.remote_ip, answer.remote_port);
 
@@ -97,7 +98,6 @@ async fn setup_rtp(
     let rtp_port = rtp_sock.local_addr().unwrap().port();
     let ip = public_addr.map(|a| a.ip())
         .unwrap_or_else(|| local_ip_str.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into()));
-    let local_sdp = sdp::build_offer(ip, rtp_port, codecs);
 
     let dtmf_pt = answer.dtmf_payload_type.unwrap_or(crate::sip::rtp_transport::DEFAULT_DTMF_PT);
     debug!("Call {} negotiated: codec={:?} dtmf_pt={} ptime={}ms remote_rtp={}", call_id, answer.codec, dtmf_pt, answer.ptime_ms, remote_rtp);
@@ -111,10 +111,9 @@ async fn setup_rtp(
     ctx.rtp = Some(rtp);
     ctx.incoming_rx = irx;
     ctx.session.state = CallState::Confirmed;
-    ctx.local_sdp = Some(local_sdp.clone());
 
     let _ = etx.try_send(EndpointEvent::CallMediaActive { call_id: call_id.to_string() });
-    Ok((local_sdp, remote_rtp))
+    Ok((ip, rtp_port, answer, remote_rtp))
 }
 
 /// Watch dialog state for remote BYE and emit CallTerminated.
@@ -164,7 +163,7 @@ fn start_session_timer(
                 let sd = ctx.server_dialog.clone();
                 (body, cd, sd)
             };
-            let hdrs = vec![rsip::Header::Other("Content-Type".into(), "application/sdp".into())];
+            let hdrs = vec![rsip::Header::ContentType("application/sdp".into())];
             if let Some(ref d) = reinvite_info.1 {
                 let _ = handle.block_on(d.reinvite(Some(hdrs), Some(reinvite_info.0)));
             } else if let Some(ref d) = reinvite_info.2 {
@@ -464,8 +463,9 @@ impl SipEndpoint {
             ctx.session = session.clone();
             ctx.client_dialog = Some(dialog);
 
-            // Set up RTP (shared with inbound)
-            let (_, remote_rtp) = setup_rtp(&mut ctx, resp.body(), &cfg.codecs, pa, &la_str, &etx, &call_id, cfg.input_sample_rate, cfg.output_sample_rate).await?;
+            // Set up RTP — for outbound, the offer was already sent in the INVITE
+            let (ip, rtp_port, _negotiated, remote_rtp) = setup_rtp(&mut ctx, resp.body(), &cfg.codecs, pa, &la_str, &etx, &call_id, cfg.input_sample_rate, cfg.output_sample_rate).await?;
+            ctx.local_sdp = Some(sdp::build_offer(ip, rtp_port, &cfg.codecs));
 
             // Watch for remote BYE
             spawn_dialog_watcher(dr, call_id.clone(), st.clone(), etx.clone(), cc.clone());
@@ -502,8 +502,12 @@ impl SipEndpoint {
                 } else if code >= 200 && code < 300 {
                     let remote_sdp = ctx.server_dialog.as_ref().unwrap().initial_request().body().to_vec();
                     // Note: setup_rtp awaits UdpSocket::bind (microseconds). Lock held briefly.
-                    let (local_sdp, remote_rtp) = setup_rtp(ctx, &remote_sdp, &cfg.codecs, pa, &la_str, &etx, &call_id, cfg.input_sample_rate, cfg.output_sample_rate).await?;
-                    ctx.server_dialog.as_ref().unwrap().accept(None, Some(local_sdp.into_bytes())).map_err(err)?;
+                    let (ip, rtp_port, negotiated, remote_rtp) = setup_rtp(ctx, &remote_sdp, &cfg.codecs, pa, &la_str, &etx, &call_id, cfg.input_sample_rate, cfg.output_sample_rate).await?;
+                    // Build SDP answer with negotiated codec, ptime, DTMF PT, rtcp-mux
+                    let local_sdp = sdp::build_answer(ip, rtp_port, &negotiated);
+                    ctx.local_sdp = Some(local_sdp.clone());
+                    let hdrs = vec![rsip::Header::ContentType("application/sdp".into())];
+                    ctx.server_dialog.as_ref().unwrap().accept(Some(hdrs), Some(local_sdp.into_bytes())).map_err(err)?;
                     info!("Inbound call {} connected to {}", call_id, remote_rtp);
                     Some(ctx.cancel.clone())
                 } else { None }
@@ -556,7 +560,7 @@ impl SipEndpoint {
                 match method.as_str() {
                     "sip_info" | "info" => {
                         let body = format!("Signal={}\r\nDuration=160\r\n", d);
-                        let hdrs = vec![rsip::Header::Other("Content-Type".into(), "application/dtmf-relay".into())];
+                        let hdrs = vec![rsip::Header::ContentType("application/dtmf-relay".into())];
                         if let Some(ref dl) = ctx.client_dialog { let _ = dl.info(Some(hdrs), Some(body.into_bytes())).await; }
                         else if let Some(ref dl) = ctx.server_dialog { let _ = dl.info(Some(hdrs), Some(body.into_bytes())).await; }
                     }
@@ -577,7 +581,7 @@ impl SipEndpoint {
                 let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
                 (ctx.client_dialog.clone(), ctx.server_dialog.clone())
             };
-            let hdrs = vec![rsip::Header::Other("Content-Type".into(), ct)];
+            let hdrs = vec![rsip::Header::ContentType(ct.into())];
             if let Some(d) = cd { d.info(Some(hdrs), Some(b.into_bytes())).await.map_err(err)?; }
             else if let Some(d) = sd { d.info(Some(hdrs), Some(b.into_bytes())).await.map_err(err)?; }
             Ok(())
@@ -614,7 +618,7 @@ impl SipEndpoint {
                     .replace("a=sendrecv", "a=sendonly");
                 (ctx.client_dialog.clone(), ctx.server_dialog.clone(), sdp, ctx.held.clone())
             };
-            let hdrs = vec![rsip::Header::Other("Content-Type".into(), "application/sdp".into())];
+            let hdrs = vec![rsip::Header::ContentType("application/sdp".into())];
             if let Some(d) = cd { d.reinvite(Some(hdrs), Some(sdp.into_bytes())).await.map_err(err)?; }
             else if let Some(d) = sd { d.reinvite(Some(hdrs), Some(sdp.into_bytes())).await.map_err(err)?; }
             held.store(true, Ordering::Relaxed);
@@ -635,7 +639,7 @@ impl SipEndpoint {
                     .replace("a=inactive", "a=sendrecv");
                 (ctx.client_dialog.clone(), ctx.server_dialog.clone(), sdp, ctx.held.clone())
             };
-            let hdrs = vec![rsip::Header::Other("Content-Type".into(), "application/sdp".into())];
+            let hdrs = vec![rsip::Header::ContentType("application/sdp".into())];
             if let Some(d) = cd { d.reinvite(Some(hdrs), Some(sdp.into_bytes())).await.map_err(err)?; }
             else if let Some(d) = sd { d.reinvite(Some(hdrs), Some(sdp.into_bytes())).await.map_err(err)?; }
             held.store(false, Ordering::Relaxed);

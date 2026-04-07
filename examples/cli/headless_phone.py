@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "agent-transport",
+# ]
+# ///
 """
 Headless CLI Phone — multi-turn SIP test without a sound card.
 
@@ -8,11 +14,11 @@ Designed for VPS / CI testing.
 
 Usage:
     SIP_USERNAME=xxx SIP_PASSWORD=yyy \
-        python examples/cli/headless_phone.py sip:DEST@phone.plivo.com
+        uv run examples/cli/headless_phone.py sip:DEST@phone.plivo.com
 
     # Wait for incoming call:
     SIP_USERNAME=xxx SIP_PASSWORD=yyy \
-        python examples/cli/headless_phone.py
+        uv run examples/cli/headless_phone.py
 """
 
 import os

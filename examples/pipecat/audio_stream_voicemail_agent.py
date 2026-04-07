@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "agent-transport[pipecat]",
+#     "python-dotenv",
+#     "loguru",
+#     "pipecat-ai[deepgram,openai,silero]",
+# ]
+# ///
 """Pipecat voicemail agent over Plivo audio streaming — beep detection.
 
 Detects voicemail beep on incoming audio, leaves a message.
 If no beep (human answered), starts a conversation instead.
-
-Prerequisites:
-    pip install "pipecat-ai[deepgram,openai,silero]" python-dotenv loguru
 """
 
 import os

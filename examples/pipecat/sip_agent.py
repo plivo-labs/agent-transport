@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Pipecat voice agent over SIP via agent-transport.
-
-Prerequisites:
-    pip install "pipecat-ai[deepgram,openai,silero]" python-dotenv loguru
-"""
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "agent-transport[pipecat]",
+#     "python-dotenv",
+#     "loguru",
+#     "pipecat-ai[deepgram,openai,silero]",
+# ]
+# ///
+"""Pipecat voice agent over SIP via agent-transport."""
 
 import os
 
