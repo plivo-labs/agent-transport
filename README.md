@@ -110,19 +110,29 @@ Full examples: [`audio_stream_agent.py`](examples/pipecat/audio_stream_agent.py)
 
 ## Installation
 
-### For LiveKit Agents
+### Python
+
+#### For LiveKit Agents
 
 ```bash
 pip install "agent-transport[livekit]"
 ```
 
-### For Pipecat
+#### For Pipecat
 
 ```bash
 pip install "agent-transport[pipecat]"
 ```
 
 Minimum versions: `livekit-agents>=1.5`, `pipecat-ai>=0.0.108`
+
+### Node.js
+
+#### For LiveKit Agents
+
+```bash
+npm install agent-transport @livekit/agents @livekit/rtc-node
+```
 
 [Building from source](docs/compile.md)
 
