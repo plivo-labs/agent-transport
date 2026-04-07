@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "agent-transport",
+#     "sounddevice",
+#     "numpy",
+# ]
+# ///
 """
 CLI Phone Advanced — test SIP transport methods (flush, clear_buffer, wait_for_playout, pause, resume).
 
 Simulates how LiveKit/Pipecat frameworks use the transport layer by playing
 audio files through the SIP call and exercising segment lifecycle methods.
 
-Prerequisites:
-    cd crates/agent-transport-python && maturin develop
-    pip install sounddevice numpy
-
 Usage:
     SIP_USERNAME=xxx SIP_PASSWORD=yyy \
-        python examples/cli_phone_advanced.py sip:+15551234567@phone.plivo.com
+        uv run examples/cli/phone_advanced.py sip:+15551234567@phone.plivo.com
 
 Keyboard controls during call:
     0-9, *, #   Send DTMF digit

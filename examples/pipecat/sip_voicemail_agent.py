@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "agent-transport[pipecat]",
+#     "python-dotenv",
+#     "loguru",
+#     "pipecat-ai[deepgram,openai,silero]",
+# ]
+# ///
 """Pipecat voicemail agent over SIP — outbound call with beep detection.
 
 Makes an outbound call, detects voicemail beep, leaves a message.
 If a human answers (beep timeout), starts a conversation instead.
-
-Prerequisites:
-    pip install "pipecat-ai[deepgram,openai,silero]" python-dotenv loguru
 """
 
 import os
