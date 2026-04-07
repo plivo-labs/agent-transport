@@ -97,7 +97,7 @@ async fn setup_rtp(
     let rtp_port = rtp_sock.local_addr().unwrap().port();
     let ip = public_addr.map(|a| a.ip())
         .unwrap_or_else(|| local_ip_str.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into()));
-    let local_sdp = sdp::build_offer(ip, rtp_port, codecs);
+    let local_sdp = sdp::build_answer(ip, rtp_port, codecs, &answer);
 
     let dtmf_pt = answer.dtmf_payload_type.unwrap_or(crate::sip::rtp_transport::DEFAULT_DTMF_PT);
     debug!("Call {} negotiated: codec={:?} dtmf_pt={} ptime={}ms remote_rtp={}", call_id, answer.codec, dtmf_pt, answer.ptime_ms, remote_rtp);
@@ -503,7 +503,8 @@ impl SipEndpoint {
                     let remote_sdp = ctx.server_dialog.as_ref().unwrap().initial_request().body().to_vec();
                     // Note: setup_rtp awaits UdpSocket::bind (microseconds). Lock held briefly.
                     let (local_sdp, remote_rtp) = setup_rtp(ctx, &remote_sdp, &cfg.codecs, pa, &la_str, &etx, &call_id, cfg.input_sample_rate, cfg.output_sample_rate).await?;
-                    ctx.server_dialog.as_ref().unwrap().accept(None, Some(local_sdp.into_bytes())).map_err(err)?;
+                    let hdrs = vec![rsip::Header::Other("Content-Type".into(), "application/sdp".into())];
+                    ctx.server_dialog.as_ref().unwrap().accept(Some(hdrs), Some(local_sdp.into_bytes())).map_err(err)?;
                     info!("Inbound call {} connected to {}", call_id, remote_rtp);
                     Some(ctx.cancel.clone())
                 } else { None }
