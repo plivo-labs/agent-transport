@@ -9,7 +9,7 @@ All audio codec/resampling/pacing is handled in Rust. Python only bridges frames
 - All Plivo features: mute, recording, checkpoint, background audio, etc.
 
 Frame handling:
-- OutputAudioRawFrame → send_audio_bytes (Rust encodes + paces at 20ms)
+- OutputAudioRawFrame → send_audio_notify (Rust backpressure + 20ms send loop pacing)
 - InterruptionFrame → clear_buffer (sends clearAudio to Plivo)
 - OutputDTMFFrame → send_dtmf (sends sendDTMF to Plivo)
 - OutputTransportMessageFrame → send_raw_message (JSON pass-through over WS)
@@ -25,7 +25,7 @@ chunking, and bot speaking detection.
 
 import asyncio
 import json
-import time
+
 from typing import Any, Dict, Optional
 
 from loguru import logger
@@ -220,9 +220,7 @@ class AudioStreamOutputTransport(BaseOutputTransport):
             return
         self._started = True
         await super().start(frame)
-        # Clock-based pacing (matches Pipecat WebSocket transport)
-        self._send_interval = (self.audio_chunk_size / self.sample_rate) / 2
-        self._next_send_time = 0.0
+        self._loop = asyncio.get_running_loop()
         await self.set_transport_ready(frame)
 
     def _supports_native_dtmf(self) -> bool:
@@ -234,24 +232,43 @@ class AudioStreamOutputTransport(BaseOutputTransport):
         await loop.run_in_executor(None, lambda: self._ep.send_dtmf(self._sid, digit))
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
-        """Send audio frame to audio stream with clock-based pacing.
+        """Send audio frame to audio stream with Rust backpressure.
 
-        Matches Pipecat's WebSocket transport _write_audio_sleep() pattern.
-        The Rust send loop handles actual 20ms packetization and sending.
+        Audio pacing is handled entirely in Rust (20ms tokio::time::interval).
+        Python pushes frames as fast as Rust can accept them:
+        1. Push audio to Rust buffer via send_audio_notify with callback
+        2. If buffer below threshold, callback fires immediately → return
+        3. If above threshold, callback deferred until send loop drains
+        4. Callback resolves Future via call_soon_threadsafe → return
+        No asyncio.sleep — no jitter, no underruns.
         """
+        capture_fut = self._loop.create_future()
+
+        def _on_complete():
+            def _resolve():
+                if not capture_fut.done():
+                    capture_fut.set_result(None)
+            try:
+                self._loop.call_soon_threadsafe(_resolve)
+            except RuntimeError:
+                if not capture_fut.done():
+                    try:
+                        capture_fut.set_result(None)
+                    except Exception:
+                        pass
+
         try:
-            self._ep.send_audio_bytes(self._sid, frame.audio, frame.sample_rate, frame.num_channels)
+            self._ep.send_audio_notify(
+                self._sid,
+                frame.audio,
+                frame.sample_rate,
+                frame.num_channels,
+                _on_complete,
+            )
         except Exception:
             return False
 
-        # Clock-based pacing (same as Pipecat WebSocket transport _write_audio_sleep)
-        current_time = time.monotonic()
-        sleep_duration = max(0, self._next_send_time - current_time)
-        await asyncio.sleep(sleep_duration)
-        if sleep_duration == 0:
-            self._next_send_time = time.monotonic() + self._send_interval
-        else:
-            self._next_send_time += self._send_interval
+        await capture_fut
         return True
 
     def queued_frames(self) -> int:
@@ -292,8 +309,6 @@ class AudioStreamOutputTransport(BaseOutputTransport):
                 self._ep.clear_buffer(self._sid)
             except Exception as e:
                 logger.debug("clear_buffer on interruption failed: {}", e)
-            # Reset pacing clock on interruption (matches Pipecat WebSocket transport)
-            self._next_send_time = 0.0
 
         await super().process_frame(frame, direction)
 

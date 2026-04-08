@@ -10,7 +10,7 @@ All audio codec/resampling/pacing is handled in Rust. Python only bridges frames
 - Audio: mute, recording, background audio, flush/playout
 
 Frame handling:
-- OutputAudioRawFrame → send_audio_bytes (Rust encodes + paces at 20ms via RTP)
+- OutputAudioRawFrame → send_audio_notify (Rust backpressure + 20ms RTP pacing)
 - InterruptionFrame → clear_buffer
 - OutputDTMFFrame → send_dtmf (RFC 2833 or SIP INFO)
 - OutputTransportMessageFrame → send_info (SIP INFO with JSON body)
@@ -24,7 +24,7 @@ Pipecat's BaseOutputTransport MediaSender infrastructure.
 
 import asyncio
 import json
-import time
+
 from typing import Any, Dict, Optional
 
 from loguru import logger
@@ -218,9 +218,7 @@ class SipOutputTransport(BaseOutputTransport):
             return
         self._started = True
         await super().start(frame)
-        # Compute send interval for clock-based pacing (matches Pipecat WebSocket transport)
-        self._send_interval = (self.audio_chunk_size / self.sample_rate) / 2
-        self._next_send_time = 0.0
+        self._loop = asyncio.get_running_loop()
         await self.set_transport_ready(frame)
 
     def _supports_native_dtmf(self) -> bool:
@@ -232,30 +230,43 @@ class SipOutputTransport(BaseOutputTransport):
         await loop.run_in_executor(None, lambda: self._ep.send_dtmf(self._cid, digit))
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
-        """Send audio frame to SIP call with clock-based pacing.
+        """Send audio frame to SIP call with Rust backpressure.
 
-        Matches Pipecat's WebSocket transport _write_audio_sleep() pattern:
-        simulate audio device timing so frames are paced at real-time rate.
-        The Rust RTP loop handles the actual 20ms packetization and sending.
+        Audio pacing is handled entirely in Rust (20ms tokio::time::interval).
+        Python pushes frames as fast as Rust can accept them:
+        1. Push audio to Rust buffer via send_audio_notify with callback
+        2. If buffer below threshold, callback fires immediately → return
+        3. If above threshold, callback deferred until RTP loop drains
+        4. Callback resolves Future via call_soon_threadsafe → return
+        No asyncio.sleep — no jitter, no underruns.
         """
-        if not hasattr(self, '_audio_log_count'):
-            self._audio_log_count = 0
-        self._audio_log_count += 1
-        if self._audio_log_count <= 3 or self._audio_log_count % 100 == 0:
-            logger.debug(f"write_audio_frame #{self._audio_log_count}: sr={frame.sample_rate} ch={frame.num_channels} bytes={len(frame.audio)} samples={len(frame.audio)//2} chunk_size={self.audio_chunk_size} transport_sr={self.sample_rate}")
+        capture_fut = self._loop.create_future()
+
+        def _on_complete():
+            def _resolve():
+                if not capture_fut.done():
+                    capture_fut.set_result(None)
+            try:
+                self._loop.call_soon_threadsafe(_resolve)
+            except RuntimeError:
+                if not capture_fut.done():
+                    try:
+                        capture_fut.set_result(None)
+                    except Exception:
+                        pass
+
         try:
-            self._ep.send_audio_bytes(self._cid, frame.audio, frame.sample_rate, frame.num_channels)
+            self._ep.send_audio_notify(
+                self._cid,
+                frame.audio,
+                frame.sample_rate,
+                frame.num_channels,
+                _on_complete,
+            )
         except Exception:
             return False
 
-        # Clock-based pacing (same as Pipecat WebSocket transport _write_audio_sleep)
-        current_time = time.monotonic()
-        sleep_duration = max(0, self._next_send_time - current_time)
-        await asyncio.sleep(sleep_duration)
-        if sleep_duration == 0:
-            self._next_send_time = time.monotonic() + self._send_interval
-        else:
-            self._next_send_time += self._send_interval
+        await capture_fut
         return True
 
     def queued_frames(self) -> int:
@@ -291,7 +302,6 @@ class SipOutputTransport(BaseOutputTransport):
                 self._ep.clear_buffer(self._cid)
             except Exception as e:
                 logger.warning(f"clear_buffer on interruption failed: {e}")
-            self._next_send_time = 0.0
 
     async def stop(self, frame: EndFrame):
         loop = asyncio.get_running_loop()
