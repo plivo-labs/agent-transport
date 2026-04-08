@@ -1,6 +1,6 @@
 {
   "name": "agent-transport-darwin-arm64",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "cpu": [
     "arm64"
   ],
