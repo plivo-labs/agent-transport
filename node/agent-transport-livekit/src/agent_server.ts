@@ -410,7 +410,7 @@ export class AgentServer {
         const sessionDir = `/tmp/agent-sessions`;
         const stub = {
           room: ctx.room,
-          job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: false },
+          job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: false, room: { sid: ctx.room.sid, name: ctx.room.name } },
           _primaryAgentSession: undefined as any,
           sessionDirectory: sessionDir,
           proc: { executorType: null },
