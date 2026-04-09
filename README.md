@@ -134,7 +134,7 @@ Minimum versions: `livekit-agents>=1.5`, `pipecat-ai>=0.0.108`
 npm install agent-transport @livekit/agents @livekit/rtc-node
 ```
 
-[Building from source](docs/compile.md)
+[Building from source](docs/compile.md) | [Local development](docs/local-development.md)
 
 ## Examples
 

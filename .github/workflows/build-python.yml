@@ -75,9 +75,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Copy Python adapters into crate
-        run: mkdir -p crates/agent-transport-python/python && cp -r python/agent_transport crates/agent-transport-python/python/agent_transport
-
       - uses: PyO3/maturin-action@v1
         with:
           working-directory: crates/agent-transport-python

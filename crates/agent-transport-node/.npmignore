@@ -1,5 +1,7 @@
 src/
+adapters/
 Cargo.toml
 build.rs
 *.node
 npm/
+tsconfig.livekit.json

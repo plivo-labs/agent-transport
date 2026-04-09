@@ -1,8 +1,0 @@
-{
-  "name": "agent-transport-adapters",
-  "version": "0.1.0",
-  "description": "Adapters for agent-transport (LiveKit, Pipecat integration)",
-  "main": "adapters/index.js",
-  "types": "adapters/index.d.ts",
-  "license": "MIT"
-}

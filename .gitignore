@@ -41,5 +41,8 @@ audio/temp/
 testing/
 todos/
 real_tests/
-python/build/
 recording_*.ogg
+
+# Python crate build artifacts
+crates/agent-transport-python/adapters/agent_transport/*.so
+crates/agent-transport-python/adapters/agent_transport/*.dylib*
