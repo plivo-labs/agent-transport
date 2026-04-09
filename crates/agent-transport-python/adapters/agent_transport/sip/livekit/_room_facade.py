@@ -359,10 +359,18 @@ class TransportRoom(EventEmitter):
 # ─── Stub Job Context ────────────────────────────────────────────────────────
 
 @dataclass
+class _StubJobRoom:
+    """Minimal stub for job.room — provides .sid for inference headers."""
+    sid: str = ""
+    name: str = ""
+
+
+@dataclass
 class _StubJob:
     """Minimal stub for agent.Job protobuf — provides fields AgentSession reads."""
     id: str
     agent_name: str
+    room: _StubJobRoom | None = None
     enable_recording: bool = True
 
 
@@ -375,7 +383,11 @@ class _StubJobContext:
 
     def __init__(self, room: TransportRoom, agent_name: str = "agent"):
         self._room = room
-        self._job = _StubJob(id=f"job-{room._sid}", agent_name=agent_name)
+        self._job = _StubJob(
+            id=f"job-{room._sid}",
+            agent_name=agent_name,
+            room=_StubJobRoom(sid=room.sid, name=room.name),
+        )
         self._primary_agent_session = None
         self._shutdown_callbacks: list = []
         self.session_directory = Path("/tmp/agent-sessions")
