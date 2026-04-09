@@ -64,16 +64,17 @@ Publish is triggered by PR labels — no tags or GitHub Releases needed.
 1. Bump the version in the relevant file:
    - **Python**: `crates/agent-transport-python/pyproject.toml`
    - **Node**: `crates/agent-transport-node/package.json` + all `crates/agent-transport-node/npm/*/package.json`
-2. Add labels to the PR:
+2. **Version bumps must be in a dedicated PR** — do not mix version bumps with feature changes. Both Python and Node can be bumped together in the same PR, but the PR should contain only version changes.
+3. Add labels to the PR:
    - **Release trigger** (required to publish):
      - `release-python-sdk` — publishes to PyPI
      - `release-node-sdk` — publishes to npm
-   - **Release notes** (required for changelog generation):
+   - Release PRs should only have release trigger labels. Do **not** apply feature labels (`python`, `node`, `core`) to version bump PRs.
+   - **Release notes labels** (for feature/fix PRs only):
      - `python` — include this PR in Python release notes
      - `node` — include this PR in Node release notes
      - `core` — include this PR in both Python and Node release notes
-   - A release PR should have both a trigger label and a notes label (e.g. `release-node-sdk` + `node`).
-3. Merge the PR to `main`. The build workflow runs, then the publish workflow picks up artifacts and publishes.
+4. Merge the PR to `main`. The build workflow runs, then the publish workflow picks up artifacts and publishes.
 
 Python and Node releases are independent — you can release one without the other.
 
