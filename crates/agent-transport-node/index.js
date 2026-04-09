@@ -26,7 +26,14 @@ let binding;
 try {
   binding = require(pkg);
 } catch {
-  binding = require('./agent-transport.node');
+  try {
+    binding = require('./agent-transport.node');
+  } catch {
+    throw new Error(
+      `Failed to load native binding for ${key}. ` +
+      `Install the package ("npm install agent-transport") or build from source ("npm run build").`
+    );
+  }
 }
 
 export const { SipEndpoint, AudioStreamEndpoint } = binding;
