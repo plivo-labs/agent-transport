@@ -47,14 +47,14 @@ npm run build:livekit
 ### Python
 
 ```bash
-cd crates/agent-transport-python && pip install -e ".[all]"
+pip install -e "crates/agent-transport-python[all]"
 SIP_USERNAME=xxx SIP_PASSWORD=yyy python examples/livekit/sip_agent.py
 ```
 
 ### Node
 
 ```bash
-cd crates/agent-transport-node && npm install && npm run build:all
+cd crates/agent-transport-node && npm install && npm run build:all && cd ../..
 SIP_USERNAME=xxx SIP_PASSWORD=yyy npx tsx examples/livekit/sip_agent.ts
 ```
 
