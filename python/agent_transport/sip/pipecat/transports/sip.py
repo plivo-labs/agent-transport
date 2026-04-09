@@ -194,8 +194,14 @@ class SipServerTransport:
             return fn
         return decorator
 
-    async def call(self, dest_uri: str, headers: Optional[Dict[str, str]] = None) -> Optional[str]:
+    async def call(self, dest_uri: str, from_uri: Optional[str] = None, headers: Optional[Dict[str, str]] = None) -> Optional[str]:
         """Make an outbound SIP call.
+
+        Args:
+            dest_uri: Destination SIP URI (e.g., "sip:+1234567890@phone.plivo.com")
+            from_uri: Optional caller ID SIP URI (e.g., "sip:+0987654321@phone.plivo.com").
+                      If None, uses the registered AOR.
+            headers: Optional custom SIP headers.
 
         Returns session_id if successful, None otherwise.
         """
@@ -204,7 +210,7 @@ class SipServerTransport:
         loop = asyncio.get_running_loop()
         try:
             session_id = await loop.run_in_executor(
-                None, lambda: self._ep.call(dest_uri, headers=headers)
+                None, lambda: self._ep.call(dest_uri, from_uri=from_uri, headers=headers)
             )
             return session_id
         except Exception as e:
@@ -451,8 +457,11 @@ class SipServerTransport:
     async def _call_handler(self, request: "web.Request") -> "web.Response":
         """POST /call — make outbound call (non-blocking).
 
-        Body: {"to": "+1234567890" or "sip:user@domain", "from": "...", "headers": {...}}
+        Body: {"to": "+1234567890" or "sip:user@domain", "from": "sip:+number@domain", "headers": {...}}
         Returns immediately with session_id while call dials in background.
+
+        The "from" field sets the SIP From header (caller ID). If omitted,
+        the registered AOR is used. Should be a valid SIP URI or phone number.
         """
         try:
             body = await request.json()
@@ -462,12 +471,21 @@ class SipServerTransport:
             if not raw_to:
                 return web.json_response({"error": "missing 'to' field"}, status=400)
 
-            # Normalize: add sip: prefix and @domain if missing
+            # Normalize destination: add sip: prefix and @domain if missing
             dest = raw_to
             if not dest.startswith("sip:"):
                 dest = "sip:" + dest
             if "@" not in dest.split(":", 1)[1]:
                 dest = dest + "@" + self._sip_server
+
+            # Normalize from_uri: same sip: prefix and @domain normalization
+            from_uri = None
+            if raw_from:
+                from_uri = raw_from
+                if not from_uri.startswith("sip:"):
+                    from_uri = "sip:" + from_uri
+                if "@" not in from_uri.split(":", 1)[1]:
+                    from_uri = from_uri + "@" + self._sip_server
 
             # Non-blocking: generate session_id, dial in background
             import uuid
@@ -477,11 +495,11 @@ class SipServerTransport:
             async def _dial():
                 try:
                     returned_id = await loop.run_in_executor(
-                        None, lambda: self._ep.call(dest, headers=headers, session_id=session_id)
+                        None, lambda: self._ep.call(dest, from_uri=from_uri, headers=headers, session_id=session_id)
                     )
-                    logger.info(f"Outbound call {returned_id} to {dest} connected")
+                    logger.info("Outbound call {} to {} connected (from={})", returned_id, dest, from_uri or "default")
                 except Exception as e:
-                    logger.warning(f"Outbound call {session_id} to {dest} failed: {e}")
+                    logger.warning("Outbound call {} to {} failed: {}", session_id, dest, e)
 
             asyncio.create_task(_dial())
             return web.json_response({

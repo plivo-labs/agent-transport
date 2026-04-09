@@ -1,7 +1,7 @@
 {
-  "name": "@agent-transport/sip-livekit",
+  "name": "@agent-transport/livekit",
   "version": "0.1.0",
-  "description": "LiveKit Agents SIP transport adapter for agent-transport",
+  "description": "LiveKit Agents adapter for agent-transport",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -10,13 +10,7 @@
     "dev": "tsc --watch"
   },
   "dependencies": {
-    "@livekit/agents-plugin-deepgram": "^1.2.2",
-    "@livekit/agents-plugin-livekit": "^1.2.2",
-    "@livekit/agents-plugin-openai": "^1.2.2",
-    "@livekit/agents-plugin-silero": "^1.2.2",
-    "agent-transport": "file:../../crates/agent-transport-node",
-    "dotenv": "^17.3.1",
-    "zod": "^4.3.6"
+    "agent-transport": "file:../../crates/agent-transport-node"
   },
   "peerDependencies": {
     "@livekit/agents": ">=1.2.0",

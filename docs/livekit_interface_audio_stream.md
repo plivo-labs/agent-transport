@@ -155,7 +155,7 @@ from agent_transport.audio_stream.livekit import AudioStreamServer, JobContext, 
 ### TypeScript
 
 ```typescript
-import { AudioStreamServer, JobProcess, type AudioStreamJobContext } from '@agent-transport/sip-livekit';
+import { AudioStreamServer, JobProcess, type AudioStreamJobContext } from 'agent-transport/livekit';
 ```
 
 ---

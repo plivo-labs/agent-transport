@@ -11,7 +11,7 @@
  *   npx ts-node examples/livekit/sip_multi_agent.ts dev
  */
 
-import { AgentServer, JobProcess, type JobContext } from '@agent-transport/sip-livekit';
+import { AgentServer, JobProcess, type JobContext } from 'agent-transport/livekit';
 import { voice, llm, metrics, getJobContext } from '@livekit/agents';
 import * as deepgram from '@livekit/agents-plugin-deepgram';
 import * as openai from '@livekit/agents-plugin-openai';

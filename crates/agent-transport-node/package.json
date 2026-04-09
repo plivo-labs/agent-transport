@@ -1,11 +1,27 @@
 {
   "name": "agent-transport",
-  "version": "0.1.3",
+  "version": "0.1.6",
   "description": "SIP and audio streaming transport for AI voice agents (pure Rust)",
   "type": "module",
   "main": "index.js",
   "types": "index.d.ts",
   "license": "MIT",
+  "exports": {
+    ".": {
+      "import": "./index.js",
+      "types": "./index.d.ts"
+    },
+    "./livekit": {
+      "import": "./livekit/index.js",
+      "types": "./livekit/index.d.ts"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "livekit/",
+    "README.md"
+  ],
   "napi": {
     "binaryName": "agent-transport",
     "targets": [
@@ -19,7 +35,17 @@
   },
   "scripts": {
     "build": "CMAKE_POLICY_VERSION_MINIMUM=3.5 napi build --release --no-js",
-    "build:debug": "CMAKE_POLICY_VERSION_MINIMUM=3.5 napi build --no-js"
+    "build:debug": "CMAKE_POLICY_VERSION_MINIMUM=3.5 napi build --no-js",
+    "build:livekit": "cd ../../node/agent-transport-livekit && npm run build && mkdir -p ../../crates/agent-transport-node/livekit && cp -r dist/* ../../crates/agent-transport-node/livekit/",
+    "build:all": "npm run build && npm run build:livekit"
+  },
+  "peerDependencies": {
+    "@livekit/agents": ">=1.2.0",
+    "@livekit/rtc-node": ">=0.13.0"
+  },
+  "peerDependenciesMeta": {
+    "@livekit/agents": { "optional": true },
+    "@livekit/rtc-node": { "optional": true }
   },
   "devDependencies": {
     "@napi-rs/cli": "^3"

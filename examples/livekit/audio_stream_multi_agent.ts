@@ -14,7 +14,7 @@
  *   npx ts-node examples/livekit/audio_stream_multi_agent.ts dev
  */
 
-import { AudioStreamServer, JobProcess, type AudioStreamJobContext } from '@agent-transport/sip-livekit';
+import { AudioStreamServer, JobProcess, type AudioStreamJobContext } from 'agent-transport/livekit';
 import { voice, llm, metrics, getJobContext } from '@livekit/agents';
 import * as deepgram from '@livekit/agents-plugin-deepgram';
 import * as openai from '@livekit/agents-plugin-openai';

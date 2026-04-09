@@ -31,7 +31,7 @@ python/                       # Python adapters
 │       └── livekit/          # LiveKit AudioStreamServer + audio stream I/O adapters
 
 node/
-├── agent-transport-sip-livekit/  # TypeScript LiveKit adapters (SIP + AudioStream)
+├── agent-transport-livekit/  # TypeScript LiveKit adapters (SIP + AudioStream)
 ```
 
 ## Build
@@ -64,9 +64,15 @@ Publish is triggered by PR labels — no tags or GitHub Releases needed.
 1. Bump the version in the relevant file:
    - **Python**: `crates/agent-transport-python/pyproject.toml`
    - **Node**: `crates/agent-transport-node/package.json` + all `crates/agent-transport-node/npm/*/package.json`
-2. Add the label to the PR:
-   - `release-python-sdk` — publishes to PyPI
-   - `release-node-sdk` — publishes to npm
+2. Add labels to the PR:
+   - **Release trigger** (required to publish):
+     - `release-python-sdk` — publishes to PyPI
+     - `release-node-sdk` — publishes to npm
+   - **Release notes** (required for changelog generation):
+     - `python` — include this PR in Python release notes
+     - `node` — include this PR in Node release notes
+     - `core` — include this PR in both Python and Node release notes
+   - A release PR should have both a trigger label and a notes label (e.g. `release-node-sdk` + `node`).
 3. Merge the PR to `main`. The build workflow runs, then the publish workflow picks up artifacts and publishes.
 
 Python and Node releases are independent — you can release one without the other.

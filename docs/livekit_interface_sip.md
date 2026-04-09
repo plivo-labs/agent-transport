@@ -312,8 +312,8 @@ from agent_transport.sip.livekit import SipAudioInput, SipAudioOutput  # low-lev
 ### TypeScript
 
 ```typescript
-import { AgentServer, JobContext } from '@agent-transport/sip-livekit';
-import { SipAudioInput, SipAudioOutput } from '@agent-transport/sip-livekit'; // low-level
+import { AgentServer, JobContext } from 'agent-transport/livekit';
+import { SipAudioInput, SipAudioOutput } from 'agent-transport/livekit'; // low-level
 ```
 
 ---
@@ -321,7 +321,7 @@ import { SipAudioInput, SipAudioOutput } from '@agent-transport/sip-livekit'; //
 ## TypeScript Quick Start
 
 ```typescript
-import { AgentServer, type JobContext } from '@agent-transport/sip-livekit';
+import { AgentServer, type JobContext } from 'agent-transport/livekit';
 import { voice, llm, metrics } from '@livekit/agents';
 import * as deepgram from '@livekit/agents-plugin-deepgram';
 import * as openai from '@livekit/agents-plugin-openai';

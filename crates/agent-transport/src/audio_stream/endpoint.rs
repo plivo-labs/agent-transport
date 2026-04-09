@@ -395,7 +395,7 @@ async fn run_ws_server(
         tokio::select! {
             _ = cancel.cancelled() => break,
             result = listener.accept() => {
-                let (stream, peer) = match result {
+                let (mut stream, peer) = match result {
                     Ok(v) => v,
                     Err(e) => { warn!("TCP accept error: {}", e); continue; }
                 };
@@ -403,6 +403,25 @@ async fn run_ws_server(
                 let sid = format!("ws-{:016x}", rand::random::<u64>());
                 let (s, e, c, p, r) = (sessions.clone(), etx.clone(), cancel.clone(), protocol.clone(), recording_mgr.clone());
                 tokio::spawn(async move {
+                    // Peek at the request to detect plain HTTP health checks (e.g., ALB).
+                    // If the request lacks "upgrade" header, respond with HTTP 200 and close.
+                    // This lets ALB health checks pass on the WebSocket port.
+                    let mut peek_buf = [0u8; 512];
+                    let n = match stream.peek(&mut peek_buf).await {
+                        Ok(n) => n,
+                        Err(_) => { return; }
+                    };
+                    let peek_str = String::from_utf8_lossy(&peek_buf[..n]);
+                    if !peek_str.to_ascii_lowercase().contains("upgrade") {
+                        // Plain HTTP request (no WebSocket upgrade) — respond with 200 OK
+                        use tokio::io::AsyncWriteExt;
+                        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+                        let _ = stream.try_write(resp);
+                        let _ = stream.shutdown().await;
+                        debug!("Health check from {} — responded 200 OK", peer);
+                        return;
+                    }
+
                     let ws = match tokio_tungstenite::accept_async(stream).await {
                         Ok(ws) => ws,
                         Err(e) => { warn!("WS handshake failed from {}: {}", peer, e); return; }
