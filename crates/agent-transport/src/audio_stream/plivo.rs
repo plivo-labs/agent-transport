@@ -177,16 +177,18 @@ impl StreamProtocol for PlivoProtocol {
     // Plivo does not support muteStream/unmuteStream.
     // Pause uses clearAudio instead (handled in endpoint.rs).
 
-    fn hangup(&self, call_id: &str, rt: &tokio::runtime::Runtime) {
-        if self.auth_id.is_empty() { return; }
-        let (auth_id, auth_token, cid) = (self.auth_id.clone(), self.auth_token.clone(), call_id.to_string());
-        rt.block_on(async {
+    fn hangup(&self, call_id: &str, rt: &tokio::runtime::Runtime, override_auth_id: Option<&str>, override_auth_token: Option<&str>) -> Option<tokio::task::JoinHandle<()>> {
+        let auth_id = override_auth_id.map(|s| s.to_string()).unwrap_or_else(|| self.auth_id.clone());
+        let auth_token = override_auth_token.map(|s| s.to_string()).unwrap_or_else(|| self.auth_token.clone());
+        if auth_id.is_empty() { return None; }
+        let cid = call_id.to_string();
+        Some(rt.spawn(async move {
             let url = format!("https://api.plivo.com/v1/Account/{}/Call/{}/", auth_id, cid);
             match reqwest::Client::new().delete(&url).basic_auth(&auth_id, Some(&auth_token)).send().await {
                 Ok(r) if r.status().is_success() || r.status().as_u16() == 404 => info!("Call {} hung up", cid),
                 Ok(r) => warn!("Hangup: {} {}", r.status(), r.text().await.unwrap_or_default()),
                 Err(e) => warn!("Hangup: {}", e),
             }
-        });
+        }))
     }
 }

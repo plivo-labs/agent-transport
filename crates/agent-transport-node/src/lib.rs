@@ -913,7 +913,9 @@ impl AudioStreamEndpoint {
     }
 
     #[napi]
-    pub fn hangup(&self, session_id: String) -> Result<()> { self.inner.hangup(&session_id).map_err(napi_err) }
+    pub fn hangup(&self, session_id: String, auth_id: Option<String>, auth_token: Option<String>) -> Result<()> {
+        self.inner.hangup(&session_id, auth_id.as_deref(), auth_token.as_deref()).map_err(napi_err)
+    }
 
     #[napi]
     pub fn send_raw_message(&self, session_id: String, message: String) -> Result<()> {
