@@ -70,6 +70,9 @@ pub struct AudioStreamEndpoint {
     event_rx: Receiver<EndpointEvent>,
     cancel: CancellationToken,
     recording_mgr: Arc<crate::recorder::RecordingManager>,
+    /// In-flight hangup REST API tasks. Awaited during shutdown to ensure
+    /// Plivo DELETE requests complete before the runtime is dropped.
+    inflight_hangups: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl AudioStreamEndpoint {
@@ -96,7 +99,7 @@ impl AudioStreamEndpoint {
         info!("Audio streaming endpoint on ws://{}", config.listen_addr);
         Ok(Self {
             config, protocol, runtime: rt, sessions, event_tx: etx, event_rx: erx,
-            cancel, recording_mgr,
+            cancel, recording_mgr, inflight_hangups: Mutex::new(Vec::new()),
         })
     }
 
@@ -309,12 +312,16 @@ impl AudioStreamEndpoint {
 
     // ─── Call control ────────────────────────────────────────────────────
 
-    pub fn hangup(&self, session_id: &str) -> Result<()> {
+    pub fn hangup(&self, session_id: &str, auth_id: Option<&str>, auth_token: Option<&str>) -> Result<()> {
         let call_id = {
             let sess = self.sessions.lock().unwrap().remove(session_id);
             match sess { Some(s) => { cleanup_session(session_id, &s, &self.recording_mgr); s.call_id.clone() }, None => return Ok(()) }
         };
-        self.protocol.hangup(&call_id, &self.runtime);
+        if let Some(h) = self.protocol.hangup(&call_id, &self.runtime, auth_id, auth_token) {
+            let mut handles = self.inflight_hangups.lock().unwrap();
+            handles.retain(|h| !h.is_finished());
+            handles.push(h);
+        }
         Ok(())
     }
 
@@ -370,7 +377,15 @@ impl AudioStreamEndpoint {
         self.cancel.cancel();
         if self.config.auto_hangup {
             let ids: Vec<String> = self.sessions.lock().unwrap().keys().cloned().collect();
-            for id in ids { let _ = self.hangup(&id); }
+            for id in ids { let _ = self.hangup(&id, None, None); }
+        }
+        // Wait for ALL in-flight hangup REST calls (both explicit and auto-hangup)
+        // to complete before returning, so dropping the runtime won't cancel them.
+        let handles: Vec<_> = self.inflight_hangups.lock().unwrap().drain(..).collect();
+        if !handles.is_empty() {
+            self.runtime.block_on(async {
+                for h in handles { let _ = h.await; }
+            });
         }
         info!("Audio streaming shut down");
         Ok(())

@@ -129,9 +129,12 @@ pub trait StreamProtocol: Send + Sync + 'static {
     /// Build a "send DTMF" command.
     fn build_send_dtmf(&self, digits: &str) -> String;
 
-    /// Hang up the call via provider's API (REST, WebSocket command, etc.).
-    /// Called from a blocking context (tokio runtime).
-    fn hangup(&self, call_id: &str, rt: &tokio::runtime::Runtime);
+    /// Hang up the call via provider's REST API.
+    /// Spawns the HTTP request on the runtime and returns a `JoinHandle` so callers
+    /// can optionally await completion (e.g. during shutdown). Safe to call from
+    /// both sync and async contexts — never blocks the current thread.
+    /// Optional `auth_id`/`auth_token` override per-call credentials for multi-tenant use.
+    fn hangup(&self, call_id: &str, rt: &tokio::runtime::Runtime, auth_id: Option<&str>, auth_token: Option<&str>) -> Option<tokio::task::JoinHandle<()>>;
 
     /// Build a "mute stream" command to pause audio output on the provider side.
     /// Returns None if the provider doesn't support server-side mute.

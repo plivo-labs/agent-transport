@@ -112,7 +112,7 @@ declare module 'agent-transport' {
     sendDtmf(sessionId: string, digits: string): void;
     sendRawMessage(sessionId: string, message: string): void;
     queuedFrames(sessionId: string): number;
-    hangup(sessionId: string): void;
+    hangup(sessionId: string, authId?: string, authToken?: string): void;
     detectBeep(sessionId: string, timeoutMs?: number, minDurationMs?: number, maxDurationMs?: number): void;
     cancelBeepDetection(sessionId: string): void;
     pollEvent(): EventInfo | null;

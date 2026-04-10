@@ -887,9 +887,11 @@ impl AudioStreamEndpoint {
     }
 
     /// Hang up via Plivo REST API. Releases GIL (blocks on HTTP request).
-    fn hangup(&self, py: Python, session_id: &str) -> PyResult<()> {
+    /// Optional auth_id/auth_token override per-call credentials for multi-tenant use.
+    #[pyo3(signature = (session_id, auth_id=None, auth_token=None))]
+    fn hangup(&self, py: Python, session_id: &str, auth_id: Option<&str>, auth_token: Option<&str>) -> PyResult<()> {
         let inner = &self.inner;
-        py.allow_threads(move || inner.hangup(session_id)).map_err(py_err)
+        py.allow_threads(move || inner.hangup(session_id, auth_id, auth_token)).map_err(py_err)
     }
 
     /// Send a raw text message over the WebSocket.

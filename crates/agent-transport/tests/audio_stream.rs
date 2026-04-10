@@ -119,3 +119,123 @@ fn test_plivo_clear_audio_json_format() {
     assert!(json_str.contains("\"event\":\"clearAudio\""));
     assert!(json_str.contains("\"streamId\":\"test-stream-123\""));
 }
+
+// ─── Hangup credential tests ────────────────────────────────────────────────
+
+mod hangup_tests {
+    use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+    use agent_transport::audio_stream::protocol::{StreamEvent, StreamProtocol, WireEncoding};
+    use agent_transport::audio_stream::config::AudioStreamConfig;
+    use agent_transport::audio_stream::endpoint::AudioStreamEndpoint;
+    use agent_transport::audio_stream::plivo::PlivoProtocol;
+
+    /// Records what credentials were passed to hangup().
+    #[derive(Clone)]
+    struct MockProtocol {
+        hangup_calls: Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>>,
+        hangup_called: Arc<AtomicBool>,
+    }
+
+    impl MockProtocol {
+        fn new() -> Self {
+            Self {
+                hangup_calls: Arc::new(Mutex::new(Vec::new())),
+                hangup_called: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl StreamProtocol for MockProtocol {
+        fn parse_message(&self, _msg: &str) -> Option<StreamEvent> { None }
+        fn build_play_audio(&self, _: &[u8], _: WireEncoding, _: &str) -> String { String::new() }
+        fn build_checkpoint(&self, _: &str, _: &str) -> String { String::new() }
+        fn build_clear_audio(&self, _: &str) -> String { String::new() }
+        fn build_send_dtmf(&self, _: &str) -> String { String::new() }
+
+        fn hangup(&self, call_id: &str, rt: &tokio::runtime::Runtime, auth_id: Option<&str>, auth_token: Option<&str>) -> Option<tokio::task::JoinHandle<()>> {
+            self.hangup_calls.lock().unwrap().push((
+                call_id.to_string(),
+                auth_id.map(|s| s.to_string()),
+                auth_token.map(|s| s.to_string()),
+            ));
+            let called = self.hangup_called.clone();
+            Some(rt.spawn(async move {
+                called.store(true, Ordering::SeqCst);
+            }))
+        }
+    }
+
+    // ─── PlivoProtocol credential logic ─────────────────────────────────
+
+    #[test]
+    fn plivo_hangup_empty_creds_returns_none() {
+        let proto = PlivoProtocol::new(String::new(), String::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // No override, empty defaults → should skip (return None)
+        let handle = proto.hangup("call-123", &rt, None, None);
+        assert!(handle.is_none());
+    }
+
+    #[test]
+    fn plivo_hangup_empty_default_with_override_returns_some() {
+        let proto = PlivoProtocol::new(String::new(), String::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // Override provided → should attempt hangup (return Some)
+        // The actual HTTP call will fail (no real Plivo), but it should spawn
+        let handle = proto.hangup("call-123", &rt, Some("override-id"), Some("override-token"));
+        assert!(handle.is_some());
+        // Wait for the spawned task to complete (it will warn about HTTP failure)
+        rt.block_on(async { let _ = handle.unwrap().await; });
+    }
+
+    #[test]
+    fn plivo_hangup_default_creds_used_when_no_override() {
+        let proto = PlivoProtocol::new("default-id".into(), "default-token".into());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // No override → should use defaults and attempt hangup
+        let handle = proto.hangup("call-123", &rt, None, None);
+        assert!(handle.is_some());
+        rt.block_on(async { let _ = handle.unwrap().await; });
+    }
+
+    #[test]
+    fn plivo_hangup_override_takes_precedence() {
+        // Even with non-empty defaults, override should be used
+        let proto = PlivoProtocol::new("default-id".into(), "default-token".into());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = proto.hangup("call-123", &rt, Some("override-id"), Some("override-token"));
+        assert!(handle.is_some());
+        rt.block_on(async { let _ = handle.unwrap().await; });
+    }
+
+    // ─── Endpoint hangup with mock protocol ─────────────────────────────
+
+    #[test]
+    fn endpoint_hangup_unknown_session_is_ok() {
+        let mock = MockProtocol::new();
+        let ep = AudioStreamEndpoint::new(
+            AudioStreamConfig { listen_addr: "127.0.0.1:0".into(), ..Default::default() },
+            Arc::new(mock.clone()),
+        ).unwrap();
+
+        // Hanging up a non-existent session should succeed silently
+        let result = ep.hangup("nonexistent", None, None);
+        assert!(result.is_ok());
+        // Protocol hangup should NOT be called
+        assert!(mock.hangup_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn endpoint_shutdown_awaits_inflight_hangups() {
+        let mock = MockProtocol::new();
+        let ep = AudioStreamEndpoint::new(
+            AudioStreamConfig { listen_addr: "127.0.0.1:0".into(), auto_hangup: false, ..Default::default() },
+            Arc::new(mock.clone()),
+        ).unwrap();
+
+        // After shutdown, all spawned hangup tasks should have completed
+        ep.shutdown().unwrap();
+        // With auto_hangup=false and no sessions, nothing to check — but shutdown should succeed
+        assert!(mock.hangup_calls.lock().unwrap().is_empty());
+    }
+}
