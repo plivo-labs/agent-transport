@@ -17,21 +17,21 @@ crates/
 │   └── src/
 │       ├── sip/              # SIP transport (rsipstack + rtp)
 │       └── audio_stream/     # Plivo WebSocket audio streaming
-├── agent-transport-python/   # PyO3 bindings
-├── agent-transport-node/     # napi-rs bindings
+├── agent-transport-python/   # PyO3 bindings + Python adapters
+│   ├── src/                  # Rust PyO3 bindings
+│   └── adapters/
+│       └── agent_transport/  # Python adapters (SIP + audio stream)
+│           ├── sip/
+│           │   ├── livekit/  # LiveKit AgentServer + SIP I/O adapters
+│           │   └── pipecat/  # Pipecat SipTransport adapter
+│           └── audio_stream/
+│               ├── livekit/  # LiveKit AudioStreamServer + audio stream I/O adapters
+│               └── pipecat/  # Pipecat AudioStreamTransport + AudioStreamServer
+├── agent-transport-node/     # napi-rs bindings + Node adapters
+│   ├── src/                  # Rust napi-rs bindings
+│   └── adapters/
+│       └── livekit/          # TypeScript LiveKit adapters (SIP + AudioStream)
 └── beep-detector/            # Standalone beep detection
-
-python/                       # Python adapters
-├── agent_transport/
-│   ├── sip/
-│   │   ├── pipecat/          # Pipecat SipTransport adapter
-│   │   └── livekit/          # LiveKit AgentServer + SIP I/O adapters
-│   └── audio_stream/
-│       ├── pipecat/          # Pipecat AudioStreamTransport + AudioStreamServer
-│       └── livekit/          # LiveKit AudioStreamServer + audio stream I/O adapters
-
-node/
-├── agent-transport-livekit/  # TypeScript LiveKit adapters (SIP + AudioStream)
 ```
 
 ## Build
@@ -44,9 +44,8 @@ Requires: Rust, C compiler, CMake. On CMake 4.x, set `CMAKE_POLICY_VERSION_MINIM
 cargo build                                     # Core library
 cargo build --features audio-stream             # + Plivo audio streaming
 cargo build --features audio-processing         # + jitter buffer, PLC, comfort noise
-cd crates/agent-transport-python && pip install -e .  # Python binding (sets CMAKE env automatically)
-cd crates/agent-transport-node && npm run build       # Node binding (sets CMAKE env automatically)
-cd python && pip install -e ".[all]"                  # Python adapters
+cd crates/agent-transport-python && pip install -e ".[all]"  # Python binding + adapters
+cd crates/agent-transport-node && npm install && npm run build:all  # Node binding + adapters
 ```
 
 ## Key Design Principles

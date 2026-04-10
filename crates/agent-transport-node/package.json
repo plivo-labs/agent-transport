@@ -36,7 +36,7 @@
   "scripts": {
     "build": "CMAKE_POLICY_VERSION_MINIMUM=3.5 napi build --release --no-js",
     "build:debug": "CMAKE_POLICY_VERSION_MINIMUM=3.5 napi build --no-js",
-    "build:livekit": "cd ../../node/agent-transport-livekit && npm run build && mkdir -p ../../crates/agent-transport-node/livekit && cp -r dist/* ../../crates/agent-transport-node/livekit/",
+    "build:livekit": "tsc -p tsconfig.livekit.json",
     "build:all": "npm run build && npm run build:livekit"
   },
   "peerDependencies": {
@@ -48,6 +48,10 @@
     "@livekit/rtc-node": { "optional": true }
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3"
+    "@napi-rs/cli": "^3",
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0",
+    "@livekit/agents": ">=1.2.0",
+    "@livekit/rtc-node": ">=0.13.0"
   }
 }
