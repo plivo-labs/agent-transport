@@ -238,6 +238,10 @@ pub struct EventInfo {
     pub method: Option<String>,
     pub frequency_hz: Option<f64>,
     pub duration_ms: Option<u32>,
+    /// async_id for AudioCaptureComplete / AudioPlayoutComplete /
+    /// AudioBufferDrained / AudioCaptureError events. JS receives this as a
+    /// bigint because u64 may exceed JS's safe-integer range.
+    pub async_id: Option<i64>,
 }
 
 fn event_to_info(event: &EndpointEvent) -> EventInfo {
@@ -252,6 +256,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             method: None,
             frequency_hz: None,
             duration_ms: None,
+            async_id: None,
         },
         EndpointEvent::RegistrationFailed { error } => EventInfo {
             event_type: "registration_failed".into(),
@@ -263,6 +268,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             method: None,
             frequency_hz: None,
             duration_ms: None,
+            async_id: None,
         },
         EndpointEvent::Unregistered => EventInfo {
             event_type: "unregistered".into(),
@@ -274,6 +280,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             method: None,
             frequency_hz: None,
             duration_ms: None,
+            async_id: None,
         },
         EndpointEvent::CallRinging { session } => EventInfo {
             event_type: "call_ringing".into(),
@@ -285,6 +292,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             method: None,
             frequency_hz: None,
             duration_ms: None,
+            async_id: None,
         },
         EndpointEvent::CallStateChanged { session } => EventInfo {
             event_type: "call_state".into(),
@@ -296,6 +304,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             method: None,
             frequency_hz: None,
             duration_ms: None,
+            async_id: None,
         },
         EndpointEvent::CallAnswered { session } => EventInfo {
             event_type: "call_answered".into(),
@@ -307,6 +316,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             method: None,
             frequency_hz: None,
             duration_ms: None,
+            async_id: None,
         },
         EndpointEvent::CallTerminated { session, reason } => EventInfo {
             event_type: "call_terminated".into(),
@@ -318,6 +328,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             method: None,
             frequency_hz: None,
             duration_ms: None,
+            async_id: None,
         },
         EndpointEvent::DtmfReceived {
             call_id,
@@ -333,6 +344,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             method: Some(method.clone()),
             frequency_hz: None,
             duration_ms: None,
+            async_id: None,
         },
         EndpointEvent::BeepDetected {
             call_id,
@@ -348,6 +360,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             method: None,
             frequency_hz: Some(*frequency_hz),
             duration_ms: Some(*duration_ms),
+            async_id: None,
         },
         EndpointEvent::BeepTimeout { call_id } => EventInfo {
             event_type: "beep_timeout".into(),
@@ -359,6 +372,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             method: None,
             frequency_hz: None,
             duration_ms: None,
+            async_id: None,
         },
         EndpointEvent::Shutdown => EventInfo {
             event_type: "shutdown".into(),
@@ -370,6 +384,68 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             method: None,
             frequency_hz: None,
             duration_ms: None,
+            async_id: None,
+        },
+        EndpointEvent::AudioCaptureComplete {
+            session_id,
+            async_id,
+        } => EventInfo {
+            event_type: "audio_capture_complete".into(),
+            session_id: Some(session_id.clone()),
+            session: None,
+            error: None,
+            reason: None,
+            digit: None,
+            method: None,
+            frequency_hz: None,
+            duration_ms: None,
+            async_id: Some(*async_id as i64),
+        },
+        EndpointEvent::AudioPlayoutComplete {
+            session_id,
+            async_id,
+        } => EventInfo {
+            event_type: "audio_playout_complete".into(),
+            session_id: Some(session_id.clone()),
+            session: None,
+            error: None,
+            reason: None,
+            digit: None,
+            method: None,
+            frequency_hz: None,
+            duration_ms: None,
+            async_id: Some(*async_id as i64),
+        },
+        EndpointEvent::AudioBufferDrained {
+            session_id,
+            async_id,
+        } => EventInfo {
+            event_type: "audio_buffer_drained".into(),
+            session_id: Some(session_id.clone()),
+            session: None,
+            error: None,
+            reason: None,
+            digit: None,
+            method: None,
+            frequency_hz: None,
+            duration_ms: None,
+            async_id: Some(*async_id as i64),
+        },
+        EndpointEvent::AudioCaptureError {
+            session_id,
+            async_id,
+            error,
+        } => EventInfo {
+            event_type: "audio_capture_error".into(),
+            session_id: Some(session_id.clone()),
+            session: None,
+            error: Some(error.clone()),
+            reason: None,
+            digit: None,
+            method: None,
+            frequency_hz: None,
+            duration_ms: None,
+            async_id: Some(*async_id as i64),
         },
     }
 }
@@ -640,20 +716,24 @@ impl SipEndpoint {
         self.inner.send_background_audio(&session_id, &f).map_err(napi_err)
     }
 
-    /// Send raw PCM bytes with async completion notification (backpressure).
-    /// The callback fires when the buffer drains below threshold.
-    /// Matches Python's send_audio_notify pattern.
-    #[napi(ts_args_type = "sessionId: string, audio: Buffer, sampleRate: number, numChannels: number, notifyFn: () => void")]
-    pub fn send_audio_notify(&self, session_id: String, audio: Buffer, sample_rate: u32, num_channels: u32, notify_fn: JsFunction) -> Result<()> {
+    /// Push audio frame and return the async_id to await on the
+    /// endpoint's event channel.
+    ///
+    /// **Always returns the async_id** — JS MUST always await the
+    /// matching `audio_capture_complete` (or `audio_capture_error` on
+    /// cancel/flush/drop). Mirrors LiveKit's `capture_audio_frame`
+    /// invariant: every request produces exactly one completion event.
+    ///
+    /// Callers MUST subscribe to the event broker BEFORE calling — the
+    /// immediate-emit path can fire before this returns, and an
+    /// unsubscribed event would be lost.
+    #[napi]
+    pub fn send_audio_async(&self, session_id: String, audio: Buffer, sample_rate: u32, num_channels: u32) -> Result<BigInt> {
         let frame = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
-        let tsfn: ThreadsafeFunction<(), ErrorStrategy::CalleeHandled> =
-            notify_fn.create_threadsafe_function(0, |ctx: ThreadSafeCallContext<()>| {
-                Ok(vec![ctx.env.get_undefined()?])
-            })?;
-        let callback: Box<dyn FnOnce() + Send> = Box::new(move || {
-            tsfn.call(Ok(()), ThreadsafeFunctionCallMode::NonBlocking);
-        });
-        self.inner.send_audio_with_callback(&session_id, &frame, callback).map_err(napi_err)
+        self.inner
+            .send_audio_async(&session_id, &frame)
+            .map(BigInt::from)
+            .map_err(napi_err)
     }
 
     /// Receive audio frame, blocking until available or timeout (ms).
@@ -681,9 +761,12 @@ impl SipEndpoint {
         Ok(AsyncTask::new(RecvAudioTask { rx, timeout_ms: timeout_ms.unwrap_or(20) as u64 }))
     }
 
-    /// Wait for playout, non-blocking Promise. Runs on libuv thread pool.
+    /// Wait for playout via Condvar — Promise resolves when buffer empties OR timeout.
+    /// **Renamed in 0.2.0** from `waitForPlayoutAsync` (which now returns an
+    /// async_id for the new event-based API). Use this when you want a
+    /// timeout-bounded "wait for buffer to empty" Promise.
     #[napi(ts_return_type = "Promise<boolean>")]
-    pub fn wait_for_playout_async(&self, session_id: String, timeout_ms: Option<u32>) -> Result<AsyncTask<SipWaitForPlayoutTask>> {
+    pub fn wait_for_playout_blocking(&self, session_id: String, timeout_ms: Option<u32>) -> Result<AsyncTask<SipWaitForPlayoutTask>> {
         let notify = self.inner.playout_notify(&session_id).map_err(napi_err)?;
         Ok(AsyncTask::new(SipWaitForPlayoutTask { notify, timeout_ms: timeout_ms.unwrap_or(5000) as u64 }))
     }
@@ -700,18 +783,19 @@ impl SipEndpoint {
         self.inner.queued_duration_ms(&session_id).map_err(napi_err)
     }
 
-    /// Set callback for playout completion — fires when buffer drains to empty.
-    /// Matches WebRTC's audioSource.waitForPlayout(). Truly async, pause-aware.
-    #[napi(ts_args_type = "sessionId: string, notifyFn: () => void")]
-    pub fn wait_for_playout_notify(&self, session_id: String, notify_fn: JsFunction) -> Result<()> {
-        let tsfn: ThreadsafeFunction<(), ErrorStrategy::CalleeHandled> =
-            notify_fn.create_threadsafe_function(0, |ctx: ThreadSafeCallContext<()>| {
-                Ok(vec![ctx.env.get_undefined()?])
-            })?;
-        let callback: Box<dyn FnOnce() + Send> = Box::new(move || {
-            tsfn.call(Ok(()), ThreadsafeFunctionCallMode::NonBlocking);
-        });
-        self.inner.wait_for_playout_notify(&session_id, callback).map_err(napi_err)
+    /// Register an async_id for "buffer drained to empty" notification.
+    ///
+    /// **Always returns the async_id** — JS MUST always await the
+    /// matching `audio_playout_complete` (or `audio_capture_error` on
+    /// cancel/flush/drop). The completion event always fires
+    /// (immediately if buffer already empty, deferred if not).
+    /// Multiple concurrent waiters supported. Pause-aware.
+    #[napi]
+    pub fn wait_for_playout_async(&self, session_id: String) -> Result<BigInt> {
+        self.inner
+            .wait_for_playout_async(&session_id)
+            .map(BigInt::from)
+            .map_err(napi_err)
     }
 
     /// Audio sample rate in Hz.
@@ -932,19 +1016,18 @@ impl AudioStreamEndpoint {
         self.inner.send_background_audio(&session_id, &f).map_err(napi_err)
     }
 
-    /// Send raw PCM bytes with async completion notification (backpressure).
-    /// Matches SipEndpoint.send_audio_notify — used by SipAudioSource adapters.
-    #[napi(ts_args_type = "sessionId: string, audio: Buffer, sampleRate: number, numChannels: number, notifyFn: () => void")]
-    pub fn send_audio_notify(&self, session_id: String, audio: Buffer, sample_rate: u32, num_channels: u32, notify_fn: JsFunction) -> Result<()> {
+    /// Push audio frame and return the async_id to await on the
+    /// endpoint's event channel. See `SipEndpoint::sendAudioAsync` for
+    /// the full LiveKit-faithful contract — every request produces
+    /// exactly one completion event; callers MUST subscribe before
+    /// calling.
+    #[napi]
+    pub fn send_audio_async(&self, session_id: String, audio: Buffer, sample_rate: u32, num_channels: u32) -> Result<BigInt> {
         let frame = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
-        let tsfn: ThreadsafeFunction<(), ErrorStrategy::CalleeHandled> =
-            notify_fn.create_threadsafe_function(0, |ctx: ThreadSafeCallContext<()>| {
-                Ok(vec![ctx.env.get_undefined()?])
-            })?;
-        let callback: Box<dyn FnOnce() + Send> = Box::new(move || {
-            tsfn.call(Ok(()), ThreadsafeFunctionCallMode::NonBlocking);
-        });
-        self.inner.send_audio_with_callback(&session_id, &frame, callback).map_err(napi_err)
+        self.inner
+            .send_audio_async(&session_id, &frame)
+            .map(BigInt::from)
+            .map_err(napi_err)
     }
 
     #[napi]
@@ -974,9 +1057,12 @@ impl AudioStreamEndpoint {
         Ok(AsyncTask::new(RecvAudioTask { rx, timeout_ms: timeout_ms.unwrap_or(20) as u64 }))
     }
 
-    /// Wait for playout, non-blocking Promise. Runs on libuv thread pool.
+    /// Wait for playout via Plivo checkpoint Condvar — Promise resolves when
+    /// the server confirms playedStream OR timeout. **Renamed in 0.2.0** from
+    /// `waitForPlayoutAsync`; the new event-based `waitForPlayoutAsync` returns
+    /// a BigInt async_id instead.
     #[napi(ts_return_type = "Promise<boolean>")]
-    pub fn wait_for_playout_async(&self, session_id: String, timeout_ms: Option<u32>) -> Result<AsyncTask<WaitForPlayoutTask>> {
+    pub fn wait_for_playout_blocking(&self, session_id: String, timeout_ms: Option<u32>) -> Result<AsyncTask<WaitForPlayoutTask>> {
         let notify = self.inner.checkpoint_notify(&session_id).map_err(napi_err)?;
         Ok(AsyncTask::new(WaitForPlayoutTask { notify, timeout_ms: timeout_ms.unwrap_or(5000) as u64 }))
     }
@@ -1024,16 +1110,16 @@ impl AudioStreamEndpoint {
         self.inner.queued_duration_ms(&session_id).map_err(napi_err)
     }
 
-    #[napi(ts_args_type = "sessionId: string, notifyFn: () => void")]
-    pub fn wait_for_playout_notify(&self, session_id: String, notify_fn: JsFunction) -> Result<()> {
-        let tsfn: ThreadsafeFunction<(), ErrorStrategy::CalleeHandled> =
-            notify_fn.create_threadsafe_function(0, |ctx: ThreadSafeCallContext<()>| {
-                Ok(vec![ctx.env.get_undefined()?])
-            })?;
-        let callback: Box<dyn FnOnce() + Send> = Box::new(move || {
-            tsfn.call(Ok(()), ThreadsafeFunctionCallMode::NonBlocking);
-        });
-        self.inner.wait_for_playout_notify(&session_id, callback).map_err(napi_err)
+    /// Register an async_id for "buffer drained to empty" notification.
+    /// See `SipEndpoint::waitForPlayoutAsync` for the LiveKit-faithful
+    /// contract — always returns the async_id; the completion event
+    /// always fires.
+    #[napi]
+    pub fn wait_for_playout_async(&self, session_id: String) -> Result<BigInt> {
+        self.inner
+            .wait_for_playout_async(&session_id)
+            .map(BigInt::from)
+            .map_err(napi_err)
     }
 
     #[napi]
