@@ -40,10 +40,13 @@ import prometheus_client
 from aiohttp import web
 
 from agent_transport import AudioStreamEndpoint, init_logging
+from agent_transport._event import FfiEvent
+from agent_transport._event_sink import _on_event_from_rust
+from agent_transport._ffi_queue import GLOBAL
 from livekit.agents.inference_runner import _InferenceRunner
 from livekit.agents.utils.hw import get_cpu_monitor
 from livekit.agents.utils import MovingAverage
-from .audio_stream_io import AudioStreamInput, AudioStreamOutput
+from ._audio_io import TransportAudioInput, TransportAudioOutput
 from ._room_facade import TransportRoom, create_transport_context
 from ._aio_utils import call_setup as _call_setup
 from livekit.rtc.room import SipDTMF
@@ -195,6 +198,11 @@ class JobContext:
     _job_stub: Any = field(default=None, repr=False)
     _job_ctx_token: Any = field(default=None, repr=False)
     _event_listeners: dict = field(default_factory=dict, repr=False)
+    # 0.2.x post-Tier-A: pointer to the process-global FfiQueue. The
+    # constrained pyo3 dispatcher thread feeds it (one consumer of
+    # ``inner.events()``). Audio sources subscribe through it per-frame
+    # with a filter narrowing to (capture_audio_frame, source_handle).
+    _events: Any = field(default=None, repr=False)
     _proc: Any = field(default=None, repr=False)
     _shutdown_callbacks: list = field(default_factory=list, repr=False)
 
@@ -211,9 +219,17 @@ class JobContext:
         """
         self._session = session
 
-        # Wire audio stream I/O before session.start() is called
-        session.input.audio = AudioStreamInput(self.endpoint, self.session_id)
-        session.output.audio = AudioStreamOutput(self.endpoint, self.session_id)
+        # Wire audio stream I/O. TransportAudioOutput is a Pattern-A
+        # subclass of LiveKit's _ParticipantAudioOutput — buffering /
+        # forwarding / interrupt / playout logic are inherited verbatim,
+        # with our TransportAudioSource in place of rtc.AudioSource.
+        # ``events`` defaults to the process-global FfiQueue inside
+        # TransportAudioSource.
+        session.input.audio = TransportAudioInput(self.endpoint, self.session_id)
+        session.output.audio = TransportAudioOutput(
+            self.endpoint,
+            self.session_id,
+        )
 
         # Listen to session close event — handles agent-initiated shutdown
         @session.on("close")
@@ -286,6 +302,12 @@ class AudioStreamServer:
         agent_name: str = "audio-stream-agent",
         auth: Callable[..., bool | Coroutine] | None = None,
     ) -> None:
+        # Process-global FfiQueue (LiveKit-faithful mirror of
+        # ``FfiClient.instance.queue``). The pyo3 dispatcher thread
+        # spawned by ``set_event_sink`` does all the cross-thread
+        # ``call_soon_threadsafe`` plumbing — by the time events land
+        # here they're already on the asyncio loop.
+        self._events = GLOBAL
         self._listen_addr = listen_addr or os.environ.get("AUDIO_STREAM_ADDR", "0.0.0.0:8765")
         self._plivo_auth_id = plivo_auth_id or os.environ.get("PLIVO_AUTH_ID", "")
         self._plivo_auth_token = plivo_auth_token or os.environ.get("PLIVO_AUTH_TOKEN", "")
@@ -480,6 +502,14 @@ class AudioStreamServer:
         )
         logger.info("Audio stream WebSocket server on ws://%s", self._listen_addr)
 
+        # Wire the constrained pyo3 sink — spawns a dispatcher thread inside
+        # Rust that drains ``inner.events()``, translates each event to a
+        # LiveKit-shape :class:`FfiEvent` and ``GLOBAL.put``s it on the
+        # asyncio loop via ``call_soon_threadsafe``. Replaces the legacy
+        # ``run_in_executor(wait_for_event)`` pump, cutting 2-3 asyncio
+        # loop ticks per event.
+        self._ep.set_event_sink(_on_event_from_rust)
+
         # Start HTTP server
         http_app = self._build_http_app()
         runner = web.AppRunner(http_app)
@@ -488,8 +518,8 @@ class AudioStreamServer:
         await site.start()
         logger.info("HTTP server on http://%s:%d", self._host, self._port)
 
-        # Start event loop
-        event_task = asyncio.create_task(self._event_loop())
+        # Start lifecycle loop (subscribes to GLOBAL FfiQueue).
+        event_task = asyncio.create_task(self._lifecycle_loop())
 
         # Wait for shutdown signal
         stop = asyncio.Event()
@@ -594,119 +624,142 @@ class AudioStreamServer:
             "listen_addr": self._listen_addr,
         })
 
-    async def _event_loop(self) -> None:
-        """Event dispatcher — reads audio stream events and routes them.
+    async def _lifecycle_loop(self) -> None:
+        """Subscribe to GLOBAL FfiQueue for lifecycle events.
 
-        With the post-answer event refactor, Plivo's WebSocket ``start``
-        event maps directly to Rust's ``call_answered`` — the session is
-        created immediately. The two-phase ``incoming_call → call_media_active``
-        pattern from the SIP path is collapsed here because Plivo's start
-        event IS the post-answer moment (Plivo's media server has already
-        bridged PSTN↔WS when ``start`` arrives).
+        The pyo3 dispatcher thread (started by ``set_event_sink``) drains
+        ``inner.events()`` on the Rust side, translates each event to a
+        :class:`FfiEvent`, and ``GLOBAL.put``s on the asyncio loop via
+        ``call_soon_threadsafe``. By the time we ``await q.get()`` the
+        event is already on the loop — no ``run_in_executor`` round-trip,
+        so 2-3 asyncio ticks are saved per event vs. the previous
+        wait_for_event-based pump.
         """
         loop = asyncio.get_running_loop()
 
-        while True:
-            try:
-                ev = await loop.run_in_executor(None, self._ep.wait_for_event, 1000)
-            except Exception:
-                logger.exception("audio_stream wait_for_event failed")
-                break
+        def _filter(e: FfiEvent) -> bool:
+            kind = e.WhichOneof("message")
+            if kind == "room_event":
+                return True
+            if kind == "transport_event":
+                sub = e.transport_event.WhichOneof("event")
+                return sub in (
+                    "beep_detected", "beep_timeout",
+                    "endpoint_shutdown", "call_ringing",
+                )
+            return False
 
-            if not ev:
-                continue
+        q = GLOBAL.subscribe(loop=loop, filter_fn=_filter)
+        try:
+            while True:
+                e = await q.get()
+                try:
+                    if self._dispatch_event(e):
+                        break
+                except Exception:
+                    logger.exception("Error handling audio_stream FfiEvent %r", e.WhichOneof("message") if e else e)
+                finally:
+                    q.task_done()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            GLOBAL.unsubscribe(q)
 
-            try:
-                ev_type = ev["type"]
+    def _dispatch_event(self, e: FfiEvent) -> bool:
+        """Process a single FfiEvent. Returns True if the loop should exit."""
+        kind = e.WhichOneof("message")
 
-                if ev_type == "shutdown":
-                    # Sentinel pushed by ep.shutdown() — wake immediately
-                    # instead of waiting for the next 1s poll cycle.
-                    logger.debug("audio_stream event loop received shutdown sentinel")
-                    break
+        if kind == "transport_event":
+            sub = e.transport_event.WhichOneof("event")
+            if sub == "endpoint_shutdown":
+                logger.debug("audio_stream lifecycle loop received endpoint_shutdown")
+                return True
+            if sub == "beep_detected":
+                be = e.transport_event.beep_detected
+                session_id = be.source_handle
+                logger.info(
+                    "Beep detected on session %s (freq=%.0fHz, dur=%dms)",
+                    session_id, be.frequency_hz, be.duration_ms,
+                )
+                ctx = self._session_contexts.get(session_id)
+                if ctx:
+                    ctx._emit("beep_detected", be.frequency_hz, be.duration_ms)
+                    if ctx._room:
+                        ctx._room.emit("beep_detected", {
+                            "frequency_hz": be.frequency_hz,
+                            "duration_ms": be.duration_ms,
+                        })
+                return False
+            if sub == "beep_timeout":
+                session_id = e.transport_event.beep_timeout.source_handle
+                logger.debug("Beep timeout on session %s", session_id)
+                ctx = self._session_contexts.get(session_id)
+                if ctx:
+                    ctx._emit("beep_timeout")
+                    if ctx._room:
+                        ctx._room.emit("beep_timeout", {})
+                return False
+            return False
 
-                if ev_type == "call_answered":
-                    # Plivo WebSocket has sent `start` → Rust fired
-                    # CallAnswered → create the agent session. No pending
-                    # map and no wait-for-first-media gate (the silent-
-                    # line failure mode is gone).
-                    session = ev["session"]
-                    session_id = session.session_id
-                    plivo_call_uuid = session.remote_uri
-                    stream_id = session.local_uri if hasattr(session, "local_uri") else ""
-                    extra_headers = session.extra_headers if hasattr(session, "extra_headers") else {}
-                    if session_id in self._active_sessions:
-                        # Defensive: duplicate event or retry.
-                        continue
-                    logger.info(
-                        "Audio stream session %s connected (plivo_call_uuid=%s, stream_id=%s)",
-                        session_id, plivo_call_uuid, stream_id,
-                    )
-                    t = asyncio.create_task(
-                        self._start_session(session_id, plivo_call_uuid, stream_id, extra_headers)
-                    )
-                    self._background_tasks.add(t)
-                    t.add_done_callback(self._background_tasks.discard)
+        if kind == "room_event":
+            sub = e.room_event.WhichOneof("participant")
+            room_handle = e.room_event.room_handle
 
-                elif ev_type == "call_terminated":
-                    session_id = ev["session"].session_id
-                    reason = ev.get("reason", "unknown")
-                    logger.info("Session %s terminated (reason=%s)", session_id, reason)
+            if sub == "participant_connected":
+                info = e.room_event.participant_connected.info
+                session_id = info.session_id or room_handle
+                plivo_call_uuid = info.identity
+                stream_id = info.stream_id
+                extra_headers = info.extra_headers or {}
+                if session_id in self._active_sessions:
+                    return False  # duplicate event or retry
+                logger.info(
+                    "Audio stream session %s connected (plivo_call_uuid=%s, stream_id=%s)",
+                    session_id, plivo_call_uuid, stream_id,
+                )
+                t = asyncio.create_task(
+                    self._start_session(session_id, plivo_call_uuid, stream_id, extra_headers)
+                )
+                self._background_tasks.add(t)
+                t.add_done_callback(self._background_tasks.discard)
+                return False
 
-                    # Clear audio buffer immediately to abort any pending playout
-                    try:
-                        self._ep.clear_buffer(session_id)
-                    except Exception:
-                        pass
+            if sub == "participant_disconnected":
+                pd = e.room_event.participant_disconnected
+                session_id = pd.session_id or room_handle
+                logger.info("Session %s terminated (reason=%s)", session_id, pd.reason)
+                try:
+                    self._ep.clear_buffer(session_id)
+                except Exception:
+                    pass
+                # Wake _run_session (which holds _JobContextVar). The
+                # ``participant_disconnected`` emit must come from
+                # _run_session — not here — because LiveKit's RoomIO
+                # synchronously calls ``AgentSession._close_soon`` which
+                # captures the current task's context.
+                if session_id in self._session_ended_events:
+                    self._session_ended_events[session_id].set()
+                return False
 
-                    # Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
-                    # RoomIO._on_participant_disconnected will call _close_soon() → session closes
-                    ctx = self._session_contexts.get(session_id)
-                    if ctx and ctx._room:
-                        remote = ctx._room._remote
-                        remote.disconnect_reason = 1  # CLIENT_INITIATED
-                        ctx._room.emit("participant_disconnected", remote)
-
-                    if session_id in self._session_ended_events:
-                        self._session_ended_events[session_id].set()
-
-                elif ev_type == "dtmf_received":
-                    # Route DTMF to both ctx listeners AND Room facade
-                    session_id = ev.get("session_id", -1)
-                    digit = ev.get("digit", "")
+            if sub == "data_packet_received":
+                dp = e.room_event.data_packet_received.value
+                if dp and dp.sip_dtmf:
+                    session_id = room_handle
+                    digit = dp.sip_dtmf.digit
                     logger.debug("DTMF '%s' on session %s", digit, session_id)
                     ctx = self._session_contexts.get(session_id)
                     if ctx:
-                        # Emit on ctx for simple ctx.on("dtmf_received") pattern
                         ctx._emit("dtmf_received", digit)
-                        # Emit on Room facade for LiveKit GetDtmfTask compatibility
-                        # room.on("sip_dtmf_received", handler) receives SipDTMF(code, digit, participant)
                         if ctx._room:
-                            dtmf_ev = SipDTMF(code=ord(digit) if digit else 0, digit=digit,
-                                              participant=ctx._room._remote)
+                            dtmf_ev = SipDTMF(
+                                code=ord(digit) if digit else 0, digit=digit,
+                                participant=ctx._room._remote,
+                            )
                             ctx._room.emit("sip_dtmf_received", dtmf_ev)
+                return False
+            return False
 
-                elif ev_type == "beep_detected":
-                    session_id = ev.get("session_id", "")
-                    freq = ev.get("frequency_hz", 0.0)
-                    dur = ev.get("duration_ms", 0)
-                    logger.info("Beep detected on session %s (freq=%.0fHz, dur=%dms)", session_id, freq, dur)
-                    ctx = self._session_contexts.get(session_id)
-                    if ctx:
-                        ctx._emit("beep_detected", freq, dur)
-                        if ctx._room:
-                            ctx._room.emit("beep_detected", {"frequency_hz": freq, "duration_ms": dur})
-
-                elif ev_type == "beep_timeout":
-                    session_id = ev.get("session_id", "")
-                    logger.debug("Beep timeout on session %s", session_id)
-                    ctx = self._session_contexts.get(session_id)
-                    if ctx:
-                        ctx._emit("beep_timeout")
-                        if ctx._room:
-                            ctx._room.emit("beep_timeout", {})
-            except Exception:
-                logger.exception("Error handling audio_stream event %r", ev.get("type") if isinstance(ev, dict) else ev)
+        return False
 
     async def _start_session(self, session_id: str, plivo_call_uuid: str, stream_id: str, extra_headers: dict) -> None:
         session_ended = asyncio.Event()
@@ -740,10 +793,21 @@ class AudioStreamServer:
             _job_stub=job_stub,
             _job_ctx_token=job_ctx_token,
             _proc=self._proc,
+            _events=self._events,
         )
         self._session_contexts[session_id] = ctx
 
         async def _run_session():
+            # Re-set _JobContextVar in this task's own context so late
+            # ``session.close`` listeners (e.g.
+            # ``livekit.agents.beta.tools.end_call._on_session_close``)
+            # find the context regardless of how the close emit is
+            # scheduled. The parent context's set() returns a token
+            # scoped to the parent — child tasks inherit the value but
+            # not always reliably under heavy async churn.
+            from livekit.agents.job import _JobContextVar
+            _JobContextVar.set(job_stub)
+
             node = _nodename()
             STREAM_SESSIONS_TOTAL.labels(nodename=node).inc()
             session_start = time.monotonic()
@@ -758,6 +822,23 @@ class AudioStreamServer:
                 logger.exception("Session %s handler failed", session_id)
             finally:
                 STREAM_SESSION_DURATION.labels(nodename=node).observe(time.monotonic() - session_start)
+
+                # Emit ``participant_disconnected`` from THIS task's
+                # context (which has ``_JobContextVar`` set). LiveKit's
+                # RoomIO listener synchronously calls
+                # ``AgentSession._close_soon`` →
+                # ``asyncio.create_task(_aclose_impl(...))``. The new
+                # task inherits the CURRENT context, so doing the emit
+                # here ensures the close task has the JobContextVar set
+                # and ``end_call.py:_on_session_close`` can call
+                # ``get_job_context()`` successfully.
+                if ctx and ctx._room and getattr(ctx._room, "_remote", None):
+                    try:
+                        remote = ctx._room._remote
+                        remote.disconnect_reason = 1  # CLIENT_INITIATED
+                        ctx._room.emit("participant_disconnected", remote)
+                    except Exception:
+                        logger.exception("participant_disconnected emit failed")
 
                 if ctx._session is not None:
                     try:
@@ -781,13 +862,24 @@ class AudioStreamServer:
                     self._ep.hangup(session_id)
                 except Exception:
                     pass
-                # Cleanup Room facade and JobContext
+                # Cleanup Room facade. We do NOT call
+                # ``_JobContextVar.reset(job_ctx_token)`` here: late
+                # ``session.close`` listeners (e.g.
+                # ``livekit.agents.beta.tools.end_call._on_session_close``)
+                # can fire AFTER ``session.aclose()`` returns and they
+                # need ``get_job_context()`` to work. The contextvar is
+                # scoped to this asyncio.Task and dies cleanly when the
+                # task exits, so explicit reset is unnecessary.
                 room._on_session_ended()
-                from livekit.agents.job import _JobContextVar
-                try:
-                    _JobContextVar.reset(job_ctx_token)
-                except ValueError:
-                    pass
+                # No EventWaiter to close in the LiveKit-faithful model —
+                # any in-flight ``capture_frame`` / ``wait_for_playout``
+                # is awaiting on its own per-call subscribed Queue. The
+                # Rust ``AudioBuffer::Drop`` emits an
+                # ``audio_capture_error { error: "buffer_dropped" }`` for
+                # every pending async_id when the session is torn down,
+                # which is dispatched through the FfiQueue and resolves
+                # each awaiter with a ``RuntimeError``. Per-call
+                # unsubscribe runs in the audio source's ``finally``.
                 self._active_sessions.pop(session_id, None)
                 self._session_ended_events.pop(session_id, None)
                 self._session_contexts.pop(session_id, None)

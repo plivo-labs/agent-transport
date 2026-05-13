@@ -4,8 +4,7 @@ import atexit
 import aiohttp
 from livekit.agents.utils import http_context
 
-from .sip_io import SipAudioInput, SipAudioOutput
-from .audio_stream_io import AudioStreamInput, AudioStreamOutput
+from ._audio_io import TransportAudioInput, TransportAudioOutput
 
 
 def _ensure_http_context():
@@ -61,8 +60,7 @@ CallContext = JobContext
 AudioStreamCallContext = AudioStreamJobContext
 
 __all__ = [
-    "SipAudioInput", "SipAudioOutput",
-    "AudioStreamInput", "AudioStreamOutput",
+    "TransportAudioInput", "TransportAudioOutput",
     "AgentServer", "JobContext", "JobProcess", "CallContext", "run_app",
     "AudioStreamServer", "AudioStreamJobContext", "AudioStreamCallContext",
     "TransportRoom",
