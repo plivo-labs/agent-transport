@@ -216,6 +216,16 @@ class AudioStreamInputTransport(BaseInputTransport):
             )
         elif event_type == "beep_timeout":
             await self._transport._call_event_handler("on_beep_timeout")
+        elif event_type in (
+            "audio_capture_complete",
+            "audio_playout_complete",
+            "audio_buffer_drained",
+            "audio_capture_error",
+        ):
+            # LiveKit-faithful FfiQueue dispatch: every async_id event
+            # goes into the shared transport broker. OutputTransport
+            # subscribes per-frame inside write_audio_frame.
+            self._transport._events.put(event)
 
 
 # ─── Output Transport ───────────────────────────────────────────────────────
@@ -260,6 +270,15 @@ class AudioStreamOutputTransport(BaseOutputTransport):
         self._sid = session_id
         self._transport = transport
         self._started = False
+        # FfiQueue lives on self._transport (one per AudioStreamTransport
+        # instance, shared by Input + Output). InputTransport puts;
+        # OutputTransport subscribes per-frame.
+        from agent_transport._ffi_queue import (
+            ASYNC_ID_EVENT_TYPES as _ASYNC_ID_EVENT_TYPES,
+            DEFAULT_WAIT_TIMEOUT as _DEFAULT_WAIT_TIMEOUT,
+        )
+        self._async_id_event_types = _ASYNC_ID_EVENT_TYPES
+        self._wait_timeout = _DEFAULT_WAIT_TIMEOUT
 
     async def start(self, frame: StartFrame):
         if self._started:
@@ -278,43 +297,46 @@ class AudioStreamOutputTransport(BaseOutputTransport):
         await loop.run_in_executor(None, lambda: self._ep.send_dtmf(self._sid, digit))
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
-        """Send audio frame to audio stream with Rust backpressure.
+        """Send audio frame with LiveKit-faithful subscribe-before-request.
 
-        Audio pacing is handled entirely in Rust (20ms tokio::time::interval).
-        Python pushes frames as fast as Rust can accept them:
-        1. Push audio to Rust buffer via send_audio_notify with callback
-        2. If buffer below threshold, callback fires immediately → return
-        3. If above threshold, callback deferred until send loop drains
-        4. Callback resolves Future via call_soon_threadsafe → return
-        No asyncio.sleep — no jitter, no underruns.
+        Subscribe → call send_audio_async → wait_for(predicate) →
+        unsubscribe (finally). The subscribe happens BEFORE the FFI call
+        so an immediate-emit completion event lands in our Queue.
         """
-        capture_fut = self._loop.create_future()
+        sid = self._sid
 
-        def _on_complete():
-            def _resolve():
-                if not capture_fut.done():
-                    capture_fut.set_result(None)
-            try:
-                self._loop.call_soon_threadsafe(_resolve)
-            except RuntimeError:
-                if not capture_fut.done():
-                    try:
-                        capture_fut.set_result(None)
-                    except Exception:
-                        pass
-
-        try:
-            self._ep.send_audio_notify(
-                self._sid,
-                frame.audio,
-                frame.sample_rate,
-                frame.num_channels,
-                _on_complete,
+        def _is_ours(e: dict) -> bool:
+            return (
+                e.get("type") in self._async_id_event_types
+                and e.get("session_id") == sid
             )
-        except Exception:
-            return False
 
-        await capture_fut
+        queue = self._transport._events.subscribe(
+            loop=asyncio.get_running_loop(),
+            filter_fn=_is_ours,
+        )
+        try:
+            try:
+                async_id = self._ep.send_audio_async(
+                    self._sid,
+                    frame.audio,
+                    frame.sample_rate,
+                    frame.num_channels,
+                )
+            except Exception:
+                return False
+            try:
+                ev = await queue.wait_for(
+                    lambda e: e.get("async_id") == async_id,
+                    timeout=self._wait_timeout,
+                )
+            except asyncio.TimeoutError:
+                return False
+        finally:
+            self._transport._events.unsubscribe(queue)
+
+        if ev.get("type") == "audio_capture_error":
+            return False
         return True
 
     def queued_frames(self) -> int:
@@ -427,6 +449,11 @@ class AudioStreamTransport(BaseTransport):
         self._params = params
         self._session_data = session_data or {}
         self._event_queue = _event_queue  # per-session queue from server
+        # Shared FfiQueue for this transport — InputTransport's event
+        # loop puts async_id events into it; OutputTransport subscribes
+        # per-frame.
+        from agent_transport._ffi_queue import FfiQueue
+        self._events: FfiQueue = FfiQueue()
         self._input: Optional[AudioStreamInputTransport] = None
         self._output: Optional[AudioStreamOutputTransport] = None
 

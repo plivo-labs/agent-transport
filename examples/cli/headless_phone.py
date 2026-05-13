@@ -326,36 +326,17 @@ def main():
             send_silence(ep, session_id, 0.5, call_ended)
 
     # ──────────────────────────────────────────────────────────
-    # TURN 3: INTERRUPT — speak while agent is still talking
+    # TURN 3: Wait for agent response, then say goodbye
     # ──────────────────────────────────────────────────────────
     if not call_ended.is_set():
-        print("\n--- TURN 3: INTERRUPT — speak while agent is talking ---")
-        print("  Waiting for agent to START speaking...")
-        # Wait for agent speech to begin
-        wait_for_speech(received_samples, recv_lock, timeout_s=10.0)
-
-        if not call_ended.is_set():
-            # Agent is speaking — wait 1s then interrupt!
-            print("  Agent is speaking, waiting 1s then interrupting...")
-            send_silence(ep, session_id, 1.0, call_ended)
-
-            clip = clips.get("interrupt") or clips.get("greeting") or list(clips.values())[0]
-            print("  >>> INTERRUPTING NOW <<<")
-            send_audio_realtime(ep, session_id, clip, "TURN3-INTERRUPT", call_ended)
-            send_silence(ep, session_id, 0.5, call_ended)
-
-    # ──────────────────────────────────────────────────────────
-    # TURN 4: Wait for agent recovery, then say goodbye
-    # ──────────────────────────────────────────────────────────
-    if not call_ended.is_set():
-        print("\n--- TURN 4: Agent recovers from interrupt, we say goodbye ---")
+        print("\n--- TURN 3: Agent responds, we say goodbye ---")
         print("  Waiting for agent to finish speaking...")
         wait_for_speech(received_samples, recv_lock, timeout_s=10.0)
         wait_for_silence(received_samples, recv_lock, timeout_s=15.0, silence_duration=1.0)
 
         if not call_ended.is_set():
             clip = clips.get("goodbye") or clips.get("greeting") or list(clips.values())[0]
-            send_audio_realtime(ep, session_id, clip, "TURN4-GOODBYE", call_ended)
+            send_audio_realtime(ep, session_id, clip, "TURN3-GOODBYE", call_ended)
             send_silence(ep, session_id, 1.0, call_ended)
 
     # ──────────────────────────────────────────────────────────
