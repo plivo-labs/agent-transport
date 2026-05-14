@@ -19,7 +19,7 @@ license = "MIT"
 # CI test pins those attribute names and the `_forward_audio` source string
 # against an installed LiveKit and FAILS on drift. Update the pin and the
 # drift test together when validating a new LiveKit major.
-livekit = ["aiohttp", "livekit-agents>=1.5,<2"]
+livekit = ["aiohttp", "livekit-agents>=1.5.9,<2"]
 pipecat = ["pipecat-ai>=0.0.108"]
 all = ["agent-transport[livekit,pipecat]"]
 

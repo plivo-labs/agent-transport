@@ -1,27 +1,35 @@
 """Minimal ``rtc.Room``-shape stubs for Pattern-A inheritance.
 
 LiveKit's :class:`~livekit.agents.voice.room_io._output._ParticipantAudioOutput`
-references ``self._room`` from a handful of places — chiefly:
+references ``self._room`` from a handful of places:
 
-* ``self._room.local_participant.publish_track(track, options)`` and
+* ``self._room.local_participant.publish_track(track, options)`` +
   ``await self._publication.wait_for_subscription()`` inside
-  ``_publish_track``.
-* ``self._room.on("reconnected", ...)`` / ``off("reconnected", ...)`` in
-  ``start``/``aclose``.
+  ``_publish_track`` — we OVERRIDE ``_publish_track`` so this path
+  never executes on our subclass.
+* ``self._room.local_participant.identity`` / ``track_publications``
+  inside the transcription paths.
+* ``self._room.isconnected()`` as a guard on the transcription publish
+  path — we return ``False`` so transcription short-circuits cleanly.
 
-Our :class:`TransportAudioOutput` overrides ``_publish_track`` so the
-``publish_track`` call never happens; the room is only used by the
-``on``/``off`` reconnection hooks. We just need stubs that satisfy the
-attribute access without doing anything.
+``on``/``off`` are kept as a safety net but are no longer registered
+by :class:`_ParticipantAudioOutput` itself: LiveKit removed the
+``reconnected`` listener and ``_republish_task`` in 1.5.9. Other
+LiveKit classes (``_ParticipantInput``, ``_ParticipantTranscriptionOutput``,
+``RoomIO``) do still call ``room.on``/``room.off``, but those classes
+do not receive our :class:`_FakeRoom` — they receive the real
+``rtc.Room`` constructed by the LiveKit framework. The stubs are
+retained as cheap insurance in case a future LiveKit minor reintroduces
+listener wiring on the audio-output path; the drift test would fail
+loudly first.
 
 Why not pass the real ``TransportRoom`` (our agent-facing facade)?
 ``TransportRoom`` is wired to ``ctx.room``, fires per-call lifecycle
-events to user code, and would fan ``reconnected`` listeners to nothing
-meaningful — its protocol is for the agent author, not the
-``_ParticipantAudioOutput``. Keeping the two cleanly separated avoids
-accidental cross-coupling: if LiveKit adds new internal room access in a
-future ``_ParticipantAudioOutput`` patch, we want to fail loudly in
-review rather than silently routing it through ``TransportRoom``.
+events to user code, and would conflate audio-output internals with the
+agent-author protocol. Keeping them cleanly separated avoids accidental
+cross-coupling: if LiveKit adds new internal room access in a future
+``_ParticipantAudioOutput`` patch, we want to fail loudly in review
+rather than silently routing it through ``TransportRoom``.
 """
 
 from __future__ import annotations
@@ -58,12 +66,11 @@ class _FakeRoom:
 
     Implements only the surface area touched by the base output:
 
-    * :meth:`on` / :meth:`off` — ``_ParticipantAudioOutput.start``
-      registers ``reconnected`` listener; ``aclose`` unregisters it. We
-      no-op both — there's no underlying WebRTC connection to reconnect
-      to.
+    * :meth:`on` / :meth:`off` — kept as a safety net; the LiveKit
+      ``reconnected``-listener path was removed in 1.5.9 (see module
+      docstring).
     * :attr:`local_participant` — used inside ``_publish_track`` (which
-      we override) and ``_publish_transcription``.
+      we override) and the transcription path.
     * :meth:`isconnected` — guards transcription publish; return False
       so the transcription path short-circuits cleanly (we surface
       transcripts through user-level handlers, not WebRTC data tracks).

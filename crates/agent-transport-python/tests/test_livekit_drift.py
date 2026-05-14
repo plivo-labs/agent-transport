@@ -102,8 +102,10 @@ _REQUIRED_INSTANCE_ATTRS = (
     "_flush_task",
     # _publish_track + aclose touch this.
     "_room",
-    # On reconnect, parent uses _republish_task; cleared on aclose.
-    "_republish_task",
+    # NOTE: ``_republish_task`` and the ``_on_reconnected`` listener path
+    # were removed by LiveKit in 1.5.9. Our ``_FakeRoom`` still exposes
+    # ``on``/``off`` for forward-compat in case the listener returns; the
+    # base no longer registers it.
 )
 
 
