@@ -183,22 +183,40 @@ class AudioStreamInputTransport(BaseInputTransport):
                 logger.exception("AudioStreamInputTransport handler failed for event %r", event.get("type") if isinstance(event, dict) else event)
 
     async def _event_loop_from_endpoint(self):
-        """Poll events directly from endpoint (standalone, no server)."""
-        loop = asyncio.get_running_loop()
-        while self._started:
-            try:
-                event = await loop.run_in_executor(
-                    None, lambda: self._ep.wait_for_event(timeout_ms=100)
-                )
-            except Exception as e:
-                logger.debug("AudioStreamInputTransport endpoint event_loop error: {}", e)
-                break
-            if event is None:
-                continue
-            try:
-                await self._handle_event(event)
-            except Exception:
-                logger.exception("AudioStreamInputTransport handler failed for event %r", event.get("type") if isinstance(event, dict) else event)
+        """Subscribe to GLOBAL_DICT for events on our session id.
+
+        Used when this transport is constructed without a server (no
+        ``_event_queue`` provided) — standalone tests / dev setups.
+        """
+        from agent_transport._event_sink import _on_event_from_rust
+        from agent_transport._ffi_queue import GLOBAL_DICT
+        # Install the shared sink (idempotent across endpoint instances).
+        try:
+            self._ep.set_event_sink(_on_event_from_rust)
+        except Exception:
+            logger.debug("set_event_sink failed (already installed?)", exc_info=True)
+
+        sid = self._sid
+
+        def _is_ours(e: dict) -> bool:
+            return e.get("session_id") == sid
+
+        queue = GLOBAL_DICT.subscribe(filter_fn=_is_ours)
+        try:
+            while self._started:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    logger.debug("AudioStreamInputTransport endpoint event_loop error: {}", e)
+                    break
+                try:
+                    await self._handle_event(event)
+                except Exception:
+                    logger.exception("AudioStreamInputTransport handler failed for event %r", event.get("type") if isinstance(event, dict) else event)
+        finally:
+            GLOBAL_DICT.unsubscribe(queue)
 
     async def _handle_event(self, event):
         """Process a single event."""
@@ -335,7 +353,12 @@ class AudioStreamOutputTransport(BaseOutputTransport):
         finally:
             self._transport._events.unsubscribe(queue)
 
-        if ev.get("type") == "audio_capture_error":
+        if ev.get("type") == "audio_capture_error" or ev.get("cancelled"):
+            # Either a real error (audio_capture_error with non-empty
+            # reason) or a clear-induced silent discard (Rust emits
+            # AudioCaptureComplete with cancelled=true on clear_buffer).
+            # Both mean the frame did NOT reach the wire — surface that
+            # to pipecat's MediaSender via the `False` return.
             return False
         return True
 
@@ -368,32 +391,31 @@ class AudioStreamOutputTransport(BaseOutputTransport):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Handle InterruptionFrame → clearAudio before base class processing.
 
-        Sends clearAudio to Plivo (clears server-side buffer) and clears the
-        local AudioBuffer (fires pending completion callbacks). The base class
-        then cancels and restarts the MediaSender audio task.
+        Sends clearAudio to Plivo (clears server-side buffer) and
+        clears the local AudioBuffer (cancels pending captures with
+        ``cancelled=true``). The base class then cancels and restarts
+        the MediaSender audio task.
+
+        ``clear_buffer`` is idempotent on terminated sessions (0.2.0
+        Terminated lifecycle short-circuits) so no defensive
+        ``try/except`` is needed — a raised exception now indicates a
+        real misuse (e.g. unknown session id).
         """
         if isinstance(frame, InterruptionFrame):
-            try:
-                self._ep.clear_buffer(self._sid)
-            except Exception as e:
-                logger.debug("clear_buffer on interruption failed: {}", e)
+            self._ep.clear_buffer(self._sid)
 
         await super().process_frame(frame, direction)
 
     async def stop(self, frame: EndFrame):
+        # ``hangup`` is idempotent on terminated sessions. No
+        # try/except needed.
         loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(None, lambda: self._ep.hangup(self._sid))
-        except Exception as e:
-            logger.debug("hangup on stop failed: {}", e)
+        await loop.run_in_executor(None, lambda: self._ep.hangup(self._sid))
         await super().stop(frame)
 
     async def cancel(self, frame: CancelFrame):
         loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(None, lambda: self._ep.hangup(self._sid))
-        except Exception as e:
-            logger.debug("hangup on cancel failed: {}", e)
+        await loop.run_in_executor(None, lambda: self._ep.hangup(self._sid))
         await super().cancel(frame)
 
 
