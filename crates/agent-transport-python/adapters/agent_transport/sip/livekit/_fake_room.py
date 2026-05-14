@@ -1,27 +1,22 @@
 """Minimal ``rtc.Room``-shape stubs for Pattern-A inheritance.
 
 LiveKit's :class:`~livekit.agents.voice.room_io._output._ParticipantAudioOutput`
-references ``self._room`` from a handful of places:
+references ``self._room`` from three places:
 
 * ``self._room.local_participant.publish_track(track, options)`` +
   ``await self._publication.wait_for_subscription()`` inside
   ``_publish_track`` — we OVERRIDE ``_publish_track`` so this path
   never executes on our subclass.
 * ``self._room.local_participant.identity`` / ``track_publications``
-  inside the transcription paths.
+  in the transcription path.
 * ``self._room.isconnected()`` as a guard on the transcription publish
   path — we return ``False`` so transcription short-circuits cleanly.
 
-``on``/``off`` are kept as a safety net but are no longer registered
-by :class:`_ParticipantAudioOutput` itself: LiveKit removed the
-``reconnected`` listener and ``_republish_task`` in 1.5.9. Other
-LiveKit classes (``_ParticipantInput``, ``_ParticipantTranscriptionOutput``,
-``RoomIO``) do still call ``room.on``/``room.off``, but those classes
-do not receive our :class:`_FakeRoom` — they receive the real
-``rtc.Room`` constructed by the LiveKit framework. The stubs are
-retained as cheap insurance in case a future LiveKit minor reintroduces
-listener wiring on the audio-output path; the drift test would fail
-loudly first.
+That's the entire surface area. LiveKit 1.5.9 removed the
+``reconnected`` listener and ``_republish_task`` field from
+``_ParticipantAudioOutput`` (no more ``room.on``/``room.off`` on the
+audio-output base class). The drift test fails loudly if a future
+LiveKit minor reintroduces listener wiring.
 
 Why not pass the real ``TransportRoom`` (our agent-facing facade)?
 ``TransportRoom`` is wired to ``ctx.room``, fires per-call lifecycle
@@ -66,9 +61,6 @@ class _FakeRoom:
 
     Implements only the surface area touched by the base output:
 
-    * :meth:`on` / :meth:`off` — kept as a safety net; the LiveKit
-      ``reconnected``-listener path was removed in 1.5.9 (see module
-      docstring).
     * :attr:`local_participant` — used inside ``_publish_track`` (which
       we override) and the transcription path.
     * :meth:`isconnected` — guards transcription publish; return False
@@ -76,25 +68,10 @@ class _FakeRoom:
       transcripts through user-level handlers, not WebRTC data tracks).
     """
 
-    __slots__ = ("local_participant", "_listeners")
+    __slots__ = ("local_participant",)
 
     def __init__(self, identity: str = "agent") -> None:
         self.local_participant = _FakeLocalParticipant(identity)
-        self._listeners: dict[str, list[Any]] = {}
-
-    def on(self, event_name: str, callback: Any) -> Any:
-        """Register a listener. Returns the callback so decorators work."""
-        self._listeners.setdefault(event_name, []).append(callback)
-        return callback
-
-    def off(self, event_name: str, callback: Any) -> None:
-        """Remove a listener. Idempotent — calling off for an unregistered
-        listener is a no-op (matches rtc.Room behavior)."""
-        listeners = self._listeners.get(event_name, [])
-        try:
-            listeners.remove(callback)
-        except ValueError:
-            pass
 
     def isconnected(self) -> bool:
         """We're not connected to a LiveKit WebRTC room. Transcription
