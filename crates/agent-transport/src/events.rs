@@ -76,9 +76,18 @@ pub enum EndpointEvent {
     /// Replaces the old `pending_complete` Python callback. The event
     /// pattern is mandatory: Rust threads do NOT invoke Python callbacks,
     /// which was the source of the GIL+Mutex AB-BA deadlock seen in prod.
+    ///
+    /// `cancelled` is `true` when the completion was synthesized by
+    /// `clear_buffer()` (or an equivalent buffer drop / session
+    /// teardown) rather than a real RTP/WS send. LiveKit consumers
+    /// ignore this field — clear semantics for them are silent-discard,
+    /// matching `rtc.AudioSource.clear_queue` behaviour. Pipecat's
+    /// `write_audio_frame -> bool` API checks it so the frame counts as
+    /// dropped rather than delivered.
     AudioCaptureComplete {
         session_id: String,
         async_id: u64,
+        cancelled: bool,
     },
 
     /// All queued audio for this session has been played out — the buffer
@@ -208,6 +217,7 @@ mod tests {
             EndpointEvent::AudioCaptureComplete {
                 session_id: "s".into(),
                 async_id: 42,
+                cancelled: false,
             }
             .callback_name(),
             "audio_capture_complete"

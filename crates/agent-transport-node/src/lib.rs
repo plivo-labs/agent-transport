@@ -242,6 +242,12 @@ pub struct EventInfo {
     /// AudioBufferDrained / AudioCaptureError events. JS receives this as a
     /// bigint because u64 may exceed JS's safe-integer range.
     pub async_id: Option<i64>,
+    /// Set on AudioCaptureComplete only: `true` if the completion was
+    /// synthesized by `clear_buffer()` (or buffer drop on session
+    /// teardown), `false` for a real send completion. LiveKit ignores
+    /// this field; pipecat-style adapters that surface a delivered/
+    /// dropped boolean from `write_audio_frame` check it.
+    pub cancelled: Option<bool>,
 }
 
 fn event_to_info(event: &EndpointEvent) -> EventInfo {
@@ -257,6 +263,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             frequency_hz: None,
             duration_ms: None,
             async_id: None,
+            cancelled: None,
         },
         EndpointEvent::RegistrationFailed { error } => EventInfo {
             event_type: "registration_failed".into(),
@@ -269,6 +276,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             frequency_hz: None,
             duration_ms: None,
             async_id: None,
+            cancelled: None,
         },
         EndpointEvent::Unregistered => EventInfo {
             event_type: "unregistered".into(),
@@ -281,6 +289,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             frequency_hz: None,
             duration_ms: None,
             async_id: None,
+            cancelled: None,
         },
         EndpointEvent::CallRinging { session } => EventInfo {
             event_type: "call_ringing".into(),
@@ -293,6 +302,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             frequency_hz: None,
             duration_ms: None,
             async_id: None,
+            cancelled: None,
         },
         EndpointEvent::CallStateChanged { session } => EventInfo {
             event_type: "call_state".into(),
@@ -305,6 +315,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             frequency_hz: None,
             duration_ms: None,
             async_id: None,
+            cancelled: None,
         },
         EndpointEvent::CallAnswered { session } => EventInfo {
             event_type: "call_answered".into(),
@@ -317,6 +328,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             frequency_hz: None,
             duration_ms: None,
             async_id: None,
+            cancelled: None,
         },
         EndpointEvent::CallTerminated { session, reason } => EventInfo {
             event_type: "call_terminated".into(),
@@ -329,6 +341,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             frequency_hz: None,
             duration_ms: None,
             async_id: None,
+            cancelled: None,
         },
         EndpointEvent::DtmfReceived {
             call_id,
@@ -345,6 +358,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             frequency_hz: None,
             duration_ms: None,
             async_id: None,
+            cancelled: None,
         },
         EndpointEvent::BeepDetected {
             call_id,
@@ -361,6 +375,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             frequency_hz: Some(*frequency_hz),
             duration_ms: Some(*duration_ms),
             async_id: None,
+            cancelled: None,
         },
         EndpointEvent::BeepTimeout { call_id } => EventInfo {
             event_type: "beep_timeout".into(),
@@ -373,6 +388,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             frequency_hz: None,
             duration_ms: None,
             async_id: None,
+            cancelled: None,
         },
         EndpointEvent::Shutdown => EventInfo {
             event_type: "shutdown".into(),
@@ -385,10 +401,12 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             frequency_hz: None,
             duration_ms: None,
             async_id: None,
+            cancelled: None,
         },
         EndpointEvent::AudioCaptureComplete {
             session_id,
             async_id,
+            cancelled,
         } => EventInfo {
             event_type: "audio_capture_complete".into(),
             session_id: Some(session_id.clone()),
@@ -400,6 +418,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             frequency_hz: None,
             duration_ms: None,
             async_id: Some(*async_id as i64),
+            cancelled: Some(*cancelled),
         },
         EndpointEvent::AudioPlayoutComplete {
             session_id,
@@ -415,6 +434,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             frequency_hz: None,
             duration_ms: None,
             async_id: Some(*async_id as i64),
+            cancelled: None,
         },
         EndpointEvent::AudioBufferDrained {
             session_id,
@@ -430,6 +450,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             frequency_hz: None,
             duration_ms: None,
             async_id: Some(*async_id as i64),
+            cancelled: None,
         },
         EndpointEvent::AudioCaptureError {
             session_id,
@@ -446,6 +467,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             frequency_hz: None,
             duration_ms: None,
             async_id: Some(*async_id as i64),
+            cancelled: None,
         },
     }
 }

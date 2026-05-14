@@ -40,10 +40,19 @@ class CaptureAudioFrameCallback:
     by their FFI handle (a ``u64``); we identify them by our session_id
     string. Consumers filter by ``source_handle == self._id`` to scope
     the event to their own audio source.
+
+    ``cancelled`` is our extension (no LiveKit equivalent): ``True``
+    when this completion was synthesized by ``clear_buffer()`` (the
+    pending capture was discarded silently rather than transmitted).
+    LiveKit consumers ignore this — clear semantics for them are
+    silent-discard, matching their ``rtc.AudioSource.clear_queue``
+    behaviour. Pipecat's ``write_audio_frame -> bool`` API checks it
+    so a cleared frame counts as dropped, not delivered.
     """
     async_id: int = 0
     error: str = ""
     source_handle: str = ""
+    cancelled: bool = False
 
 
 @dataclass(slots=True)

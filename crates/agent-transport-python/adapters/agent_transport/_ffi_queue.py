@@ -210,6 +210,18 @@ Tests that need to swap the broker should use :func:`get_global` and
 hazards when modules are reloaded)."""
 
 
+GLOBAL_DICT: "FfiQueue" = FfiQueue()
+"""Process-wide dict-shaped FfiQueue — sibling of :data:`GLOBAL`.
+
+LiveKit-shape consumers subscribe to :data:`GLOBAL` and receive
+``FfiEvent`` dataclass instances. Pipecat-shape consumers subscribe
+here and receive the raw Rust event dict (``{"type": "...",
+"session_id": "...", ...}``) directly. The event sink fans out to
+both, so a process can host LiveKit + pipecat adapters
+simultaneously without either fighting the other for the single
+``set_event_sink`` slot."""
+
+
 def get_global() -> "FfiQueue":
     """Accessor for the singleton — preferred over direct ``GLOBAL`` access
     in code that may need to be re-bound under test."""

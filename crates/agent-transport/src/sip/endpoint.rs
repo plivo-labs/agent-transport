@@ -1104,6 +1104,7 @@ impl SipEndpoint {
                 let _ = self.event_tx.try_send(EndpointEvent::AudioCaptureComplete {
                     session_id: call_id.to_string(),
                     async_id,
+                    cancelled: false,
                 });
                 return Ok(async_id);
             }

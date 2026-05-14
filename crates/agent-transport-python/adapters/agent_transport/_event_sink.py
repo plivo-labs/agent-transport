@@ -57,7 +57,7 @@ from ._event import (
     SipDTMF,
     TransportEvent,
 )
-from ._ffi_queue import GLOBAL
+from ._ffi_queue import GLOBAL, GLOBAL_DICT
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +95,14 @@ def _on_event_from_rust(event_dict: Mapping[str, Any]) -> None:
             GLOBAL.put(ev)
         except Exception:
             logger.exception("event sink: GLOBAL.put failed")
+    # Parallel fan-out to the dict-shaped broker for pipecat-style
+    # consumers. Same event payload, no translation — pipecat reads
+    # ``event["session"].session_id`` and similar attribute-on-PyO3
+    # accesses that LiveKit-shape FfiEvent would have flattened.
+    try:
+        GLOBAL_DICT.put(dict(event_dict))
+    except Exception:
+        logger.exception("event sink: GLOBAL_DICT.put failed")
 
 
 def _build_ffi_events(d: Mapping[str, Any]):
@@ -162,6 +170,7 @@ def _build_ffi_event(d: Mapping[str, Any]) -> FfiEvent | None:
                 async_id=int(d.get("async_id", 0)),
                 error="",
                 source_handle=str(d.get("session_id", "")),
+                cancelled=bool(d.get("cancelled", False)),
             )
         )
     if ev_type == "audio_capture_error":

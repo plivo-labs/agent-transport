@@ -260,10 +260,12 @@ fn event_to_dict<'py>(py: Python<'py>, event: &EndpointEvent) -> PyResult<Bound<
         EndpointEvent::AudioCaptureComplete {
             session_id,
             async_id,
+            cancelled,
         } => {
             dict.set_item("type", "audio_capture_complete")?;
             dict.set_item("session_id", session_id)?;
             dict.set_item("async_id", async_id)?;
+            dict.set_item("cancelled", cancelled)?;
         }
         EndpointEvent::AudioPlayoutComplete {
             session_id,

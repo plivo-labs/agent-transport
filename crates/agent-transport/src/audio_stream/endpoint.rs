@@ -146,6 +146,7 @@ impl AudioStreamEndpoint {
                 let _ = self.event_tx.try_send(EndpointEvent::AudioCaptureComplete {
                     session_id: session_id.to_string(),
                     async_id,
+                    cancelled: false,
                 });
                 return Ok(async_id);
             }
@@ -1121,7 +1122,7 @@ mod terminated_state_tests {
         let start = std::time::Instant::now();
         while start.elapsed() < deadline {
             match ep.event_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(EndpointEvent::AudioCaptureComplete { session_id, async_id }) => {
+                Ok(EndpointEvent::AudioCaptureComplete { session_id, async_id, .. }) => {
                     out.push((session_id, async_id));
                 }
                 Ok(_) => continue,

@@ -160,6 +160,7 @@ impl AudioBuffer {
             self.emit(EndpointEvent::AudioCaptureComplete {
                 session_id: self.session_id.clone(),
                 async_id,
+                cancelled: false,
             });
         }
         Ok(())
@@ -259,6 +260,7 @@ impl AudioBuffer {
             self.emit(EndpointEvent::AudioCaptureComplete {
                 session_id: self.session_id.clone(),
                 async_id,
+                cancelled: false,
             });
         }
         for async_id in playouts_to_fire {
@@ -357,6 +359,7 @@ impl AudioBuffer {
             self.emit(EndpointEvent::AudioCaptureComplete {
                 session_id: self.session_id.clone(),
                 async_id,
+                cancelled: true,
             });
         }
         for async_id in playouts {
@@ -682,14 +685,18 @@ mod tests {
     // ─── clear semantics ─────────────────────────────────────────────────
 
     #[test]
-    fn test_clear_emits_success_for_both() {
+    fn test_clear_emits_cancelled_complete_for_pending() {
         // Pinned to LiveKit's `rtc.AudioSource.clear_queue` FFI semantics:
-        // pending captures complete with success (frame discarded silently),
+        // pending captures complete with success (frame silently discarded),
         // pending playouts complete with success. NOT an error — caller's
         // `await audio_source.capture_frame(frame)` should NOT raise on a
         // user-triggered clear, otherwise LiveKit's base
         // ``_ParticipantAudioOutput._forward_audio`` task dies on the first
         // interruption.
+        //
+        // The completion carries `cancelled=true` so non-LiveKit consumers
+        // (pipecat's `write_audio_frame -> bool`) can distinguish a real
+        // delivery from a clear-induced silent discard.
         let (buf, rx) = new_buf();
         buf.push(&vec![0i16; 2000], 1).unwrap();
         buf.add_pending_playout(2);
@@ -703,14 +710,50 @@ mod tests {
         let errors = capture_error_ids(&events);
         assert!(errors.is_empty(), "clear must not emit AudioCaptureError; got {:?}", errors);
 
-        // Both async_ids must receive completion events.
-        let mut completes: Vec<u64> = events.iter().filter_map(|e| match e {
-            EndpointEvent::AudioCaptureComplete { async_id, .. } => Some(*async_id),
+        // The capture completion must carry cancelled=true (clear marker).
+        let cap_complete = events.iter().find_map(|e| match e {
+            EndpointEvent::AudioCaptureComplete { async_id, cancelled, .. } => Some((*async_id, *cancelled)),
+            _ => None,
+        }).expect("AudioCaptureComplete must be emitted");
+        assert_eq!(cap_complete, (1, true), "cleared capture must report cancelled=true");
+
+        // The playout completion is symmetric (no cancelled field on playout
+        // — neither LiveKit nor pipecat distinguishes drained vs cleared
+        // for playout).
+        let playout_id = events.iter().find_map(|e| match e {
             EndpointEvent::AudioPlayoutComplete { async_id, .. } => Some(*async_id),
             _ => None,
-        }).collect();
-        completes.sort();
-        assert_eq!(completes, vec![1, 2]);
+        }).expect("AudioPlayoutComplete must be emitted");
+        assert_eq!(playout_id, 2);
+    }
+
+    #[test]
+    fn test_normal_drain_emits_cancelled_false() {
+        // Counter-test: a drain-induced AudioCaptureComplete (the buffer
+        // emptied via the RTP send loop, not via clear) carries
+        // `cancelled=false`. Pinning this so a future refactor can't
+        // accidentally mark all completions cancelled.
+        let (buf, rx) = new_buf();
+
+        // Below threshold → immediate emit.
+        buf.push(&vec![0i16; 100], 7).unwrap();
+        let events = drain_events(&rx);
+        let cap = events.iter().find_map(|e| match e {
+            EndpointEvent::AudioCaptureComplete { async_id, cancelled, .. } => Some((*async_id, *cancelled)),
+            _ => None,
+        }).expect("AudioCaptureComplete must be emitted");
+        assert_eq!(cap, (7, false), "below-threshold immediate emit must report cancelled=false");
+
+        // Above threshold → deferred emit on drain.
+        buf.push(&vec![0i16; 2000], 8).unwrap();
+        assert!(drain_events(&rx).is_empty(), "no event yet — buffer still full");
+        let _ = buf.drain(500);
+        let events = drain_events(&rx);
+        let cap = events.iter().find_map(|e| match e {
+            EndpointEvent::AudioCaptureComplete { async_id, cancelled, .. } => Some((*async_id, *cancelled)),
+            _ => None,
+        }).expect("AudioCaptureComplete must be emitted on drain");
+        assert_eq!(cap, (8, false), "drain-emitted completion must report cancelled=false");
     }
 
     // ─── flush semantics ─────────────────────────────────────────────────
