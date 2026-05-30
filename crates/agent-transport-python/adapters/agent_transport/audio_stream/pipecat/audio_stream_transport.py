@@ -10,7 +10,9 @@ All audio codec/resampling/pacing is handled in Rust. Python only bridges frames
 
 Frame handling:
 - OutputAudioRawFrame → send_audio_notify (Rust backpressure + 20ms send loop pacing)
-- InterruptionFrame → clear_buffer (sends clearAudio to Plivo)
+- InterruptionFrame → handled by BaseOutputTransport's MediaSender task
+  cancellation (we deliberately do NOT send clearAudio to Plivo; see
+  process_frame below for why)
 - OutputDTMFFrame → send_dtmf (sends sendDTMF to Plivo)
 - OutputTransportMessageFrame → send_raw_message (JSON pass-through over WS)
 - EndFrame/CancelFrame → hangup (REST API DELETE)
@@ -36,9 +38,7 @@ try:
     from pipecat.audio.dtmf.types import KeypadEntry
     from pipecat.frames.frames import (
         CancelFrame, EndFrame, Frame, InputAudioRawFrame,
-        InputDTMFFrame, InterruptionFrame, OutputAudioRawFrame,
-        OutputTransportMessageFrame, OutputTransportMessageUrgentFrame,
-        StartFrame, StopFrame,
+        InputDTMFFrame, OutputAudioRawFrame, StartFrame,
     )
     from pipecat.processors.frame_processor import FrameDirection
     from pipecat.transports.base_input import BaseInputTransport

@@ -11,7 +11,8 @@ All audio codec/resampling/pacing is handled in Rust. Python only bridges frames
 
 Frame handling:
 - OutputAudioRawFrame → send_audio_notify (Rust backpressure + 20ms RTP pacing)
-- InterruptionFrame → clear_buffer
+- InterruptionFrame → clear_buffer (local RTP send-buffer drop; no network
+  message — cheap, tightens barge-in latency. See process_frame below)
 - OutputDTMFFrame → send_dtmf (RFC 2833 or SIP INFO)
 - OutputTransportMessageFrame → send_info (SIP INFO with JSON body)
 - EndFrame/CancelFrame → hangup
@@ -38,8 +39,7 @@ try:
     from pipecat.frames.frames import (
         CancelFrame, EndFrame, Frame, InputAudioRawFrame,
         InputDTMFFrame, InterruptionFrame, OutputAudioRawFrame,
-        OutputTransportMessageFrame, OutputTransportMessageUrgentFrame,
-        StartFrame, StopFrame,
+        StartFrame,
     )
     from pipecat.processors.frame_processor import FrameDirection
     from pipecat.transports.base_input import BaseInputTransport

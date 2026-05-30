@@ -33,7 +33,6 @@ Shutdown behavior (SIGINT/SIGTERM):
 """
 
 import asyncio
-import json
 import logging
 import os
 import signal
@@ -354,7 +353,10 @@ class AgentServer:
         # Session IDs are strings (returned by Rust CallSession.session_id).
         # The type hints used `int` before — purely cosmetic since Python dict
         # keys are duck-typed, but fix them so mypy/pyright don't scream.
-        self._active_calls: dict[str, asyncio.Task] = {}
+        # Value is None for a slot reserved synchronously by the
+        # participant_connected handler (dedup placeholder) and the real Task
+        # once _start_call has scheduled _run_call.
+        self._active_calls: dict[str, asyncio.Task | None] = {}
         self._call_ended_events: dict[str, asyncio.Event] = {}
         self._call_contexts: dict[str, JobContext] = {}
         # Strong-reference set for fire-and-forget asyncio tasks (outbound
@@ -941,6 +943,14 @@ class AgentServer:
                 if session_id in self._active_calls:
                     return False  # duplicate / retry
 
+                # Reserve the slot SYNCHRONOUSLY (before create_task) so a
+                # duplicate participant_connected delivered on the very next
+                # loop turn — before _start_call's own task has run and set
+                # the real task object at the end of _start_call — is deduped
+                # here. Mirrors the _outbound_session_ids reservation pattern.
+                # _start_call overwrites this None placeholder with the real
+                # task; the _run_call finally pops it.
+                self._active_calls[session_id] = None
                 t = asyncio.create_task(
                     self._start_call(session_id, remote_uri, direction="inbound")
                 )

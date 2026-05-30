@@ -18,11 +18,10 @@ import logging
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Coroutine
+from typing import Any
 
 from livekit import rtc
 from livekit.rtc.event_emitter import EventEmitter
-from livekit.rtc.room import SipDTMF
 
 from ._aio_utils import control_executor as _control_executor
 from ._aio_utils import schedule_hangup
@@ -257,33 +256,6 @@ class _TransportLocalParticipant:
     async def set_attributes(self, attributes: dict[str, str]) -> None:
         self.attributes.update(attributes)
 
-    def register_rpc_method(self, method_name, handler=None):
-        """No-op RPC method registrar.
-
-        RPC relies on WebRTC data channels; see `perform_rpc` for the
-        rationale. We still accept calls in both decorator and imperative
-        form so existing code that unconditionally registers RPC handlers
-        during startup continues to import cleanly.
-        """
-        if handler is not None:
-            return handler
-        return lambda fn: fn
-
-    def unregister_rpc_method(self, method):
-        """No-op — see `register_rpc_method`."""
-        pass
-
-    def set_track_subscription_permissions(self, *, allow_all_participants=True,
-                                           participant_permissions=None):
-        """No-op on SIP/audio_stream.
-
-        Track subscription permissions gate which participants can subscribe
-        to which tracks over WebRTC. Our transport has exactly one remote
-        peer (the caller) and exactly one local publisher (the agent);
-        there is nothing to gate.
-        """
-        pass
-
     async def perform_rpc(self, *, destination_identity, method, payload,
                           response_timeout=None):
         """RPC over data channels — not supported on SIP transport.
@@ -302,16 +274,6 @@ class _TransportLocalParticipant:
             "perform_rpc is not supported on SIP transport — use SIP INFO "
             "(send_info) or HTTP for control messages instead."
         )
-
-    async def send_file(self, file_path, **kw):
-        """No-op file send.
-
-        LiveKit WebRTC uses data-channel chunks to transfer arbitrary files
-        between participants. No SIP or Plivo analog exists. If bot code
-        needs to deliver files, use the HTTP server embedded in AgentServer
-        and send the URL via `send_raw_message` / SIP INFO.
-        """
-        pass
 
     async def stream_bytes(self, name, **kw):
         """No-op byte stream writer — see `stream_text` for rationale."""
@@ -367,8 +329,11 @@ class TransportRoom(EventEmitter):
         self._creation_time = datetime.datetime.now(datetime.timezone.utc)
         self._text_stream_handlers: dict[str, Any] = {}
         self._byte_stream_handlers: dict[str, Any] = {}
-        self._token: str | None = None
-        self._server_url: str | None = None
+        # Guards against emitting the rtc.Room "disconnected" event more than
+        # once. Both disconnect() (agent-initiated) and _on_session_ended()
+        # (server-initiated teardown) can run for the same call; the rtc.Room
+        # contract is that "disconnected" fires exactly once.
+        self._disconnected_emitted = False
 
     # ─── Properties (match rtc.Room) ─────────────────────────────────────
 
@@ -431,12 +396,23 @@ class TransportRoom(EventEmitter):
 
     async def connect(self, url="", token="", options=None):
         logger.debug("TransportRoom.connect() — already connected via transport (no WebRTC room)")
-        self._token = token
-        self._server_url = url
+
+    def _emit_disconnected_once(self):
+        """Emit the rtc.Room "disconnected" event at most once.
+
+        disconnect() (agent code calling room.disconnect()) and
+        _on_session_ended() (server teardown when the call ends) can both run
+        for a single call. LiveKit's rtc.Room fires "disconnected" exactly
+        once; mirror that so listeners (e.g. RoomIO) aren't double-notified.
+        """
+        if self._disconnected_emitted:
+            return
+        self._disconnected_emitted = True
+        self.emit("disconnected")
 
     async def disconnect(self):
         self._connected = False
-        self.emit("disconnected")
+        self._emit_disconnected_once()
 
     async def get_rtc_stats(self):
         return None
@@ -483,7 +459,7 @@ class TransportRoom(EventEmitter):
                 ep.stop_recording(session_id)
             except Exception:
                 pass
-        self.emit("disconnected")
+        self._emit_disconnected_once()
 
 
 # ─── Stub Job Context ────────────────────────────────────────────────────────
@@ -607,15 +583,17 @@ class TransportJobContextMixin:
         Also disables RecorderIO's Python-level recording to avoid double
         recording. Rust recording is more efficient for production.
 
-        IMPORTANT: We DO NOT mutate the caller's `options` dict in place.
-        Mutating user-supplied state is a footgun (the caller may reuse the
-        same dict for telemetry, a second session, etc., and would silently
-        find `audio: False`). Instead we mutate a defensive copy if needed
-        — but since LiveKit's RecorderIO checks `options.get("audio", ...)`
-        from the same dict we're handed, the only honest way to disable it
-        is to clear the audio flag. We do this on the live dict but document
-        the side effect, and we restore the original on session end so the
-        caller's dict round-trips.
+        IMPORTANT — side effect on `options`: we set ``options["audio"] =
+        False`` on the *live* dict we're handed. This is load-bearing, not a
+        bug: LiveKit's AgentSession reads ``self._recording_options["audio"]``
+        from this exact dict (voice/agent_session.py) to decide whether to
+        wire up RecorderIO. Copying the dict and mutating the copy would NOT
+        suppress RecorderIO, so the agent would record twice (once in Rust,
+        once in Python). The only way to disable RecorderIO is to clear the
+        flag on the dict LiveKit actually inspects. We capture the original
+        value and restore it in ``_on_session_end`` so the dict round-trips
+        across the session lifecycle and nothing downstream sees a leaked
+        ``audio: False``.
         """
         if not options.get("audio", False):
             return
