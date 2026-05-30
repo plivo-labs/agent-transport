@@ -39,7 +39,8 @@
     "build:debug": "CMAKE_POLICY_VERSION_MINIMUM=3.5 napi build --no-js && npm run postbuild:check",
     "postbuild:check": "node -e \"const fs=require('fs'); const snap='index.d.ts.snapshot'; if (!fs.existsSync(snap)) process.exit(0); const cur=fs.existsSync('index.d.ts')?fs.statSync('index.d.ts').size:0; const ref=fs.statSync(snap).size; if (cur < ref/2) { console.error('[postbuild] index.d.ts shrank ('+cur+' < '+ref+' bytes); napi may have clobbered it — restoring snapshot.'); fs.copyFileSync(snap,'index.d.ts'); } fs.unlinkSync(snap)\"",
     "build:livekit": "tsc -p tsconfig.livekit.json",
-    "build:all": "npm run build && npm run build:livekit"
+    "build:all": "npm run build && npm run build:livekit",
+    "test:livekit": "npm run build:livekit && node --test tests/*.test.mjs"
   },
   "peerDependencies": {
     "@livekit/agents": ">=1.2.0",

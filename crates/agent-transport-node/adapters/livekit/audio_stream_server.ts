@@ -26,6 +26,7 @@ import { AudioStreamEndpoint } from 'agent-transport';
 import { initializeLogger, InferenceRunner, runWithJobContext } from '@livekit/agents';
 import { AudioStreamJobContext } from './audio_stream_context.js';
 import { JobProcess } from './agent_server.js';
+import { closeSessionServices } from './_session_cleanup.js';
 
 export interface AudioStreamServerOptions {
   listenAddr?: string;
@@ -406,6 +407,13 @@ export class AudioStreamServer {
 
         if (ctx.session) {
           try { await (ctx.session as any).close(); } catch {}
+          // AgentSession.close() does NOT cascade-close the user-supplied
+          // STT/TTS/LLM, so their vendor WebSockets would leak per session
+          // on our long-lived in-process server. Close them explicitly
+          // after the session has closed, before hangup. Never throws.
+          await closeSessionServices(ctx.session, {
+            logger: (msg, err) => console.warn(`[session ${sessionId}] ${msg}`, err ?? ''),
+          });
         }
 
         // Stop Rust recording if active

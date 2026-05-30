@@ -48,7 +48,7 @@ from livekit.agents.utils.hw import get_cpu_monitor
 from livekit.agents.utils import MovingAverage
 from ._audio_io import TransportAudioInput, TransportAudioOutput
 from ._room_facade import TransportJobContextMixin, TransportRoom, create_transport_context
-from ._aio_utils import call_setup as _call_setup
+from ._aio_utils import call_setup as _call_setup, close_session_services
 from livekit.rtc.room import SipDTMF
 from .server import JobProcess
 
@@ -859,6 +859,14 @@ class AudioStreamServer:
                         await ctx._session.aclose()
                     except Exception:
                         pass
+                    # AgentSession.aclose() does NOT cascade-close the
+                    # user-supplied STT/TTS/LLM (verified against
+                    # livekit-agents 1.5.15), so their vendor WebSockets
+                    # would leak per session on our long-lived in-process
+                    # server. Close them explicitly after the session has
+                    # drained, before shutdown callbacks / hangup. Never
+                    # raises, so it cannot skip the steps below.
+                    await close_session_services(ctx._session, logger=logger)
                 # Fire shutdown callbacks once (no-op if shutdown() already
                 # dispatched them — _take_shutdown_callbacks() dedups).
                 await ctx._run_shutdown_callbacks("session ended")

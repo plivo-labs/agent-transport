@@ -22,6 +22,7 @@ import { mkdirSync } from 'node:fs';
 import { SipEndpoint } from 'agent-transport';
 import { initializeLogger, InferenceRunner, runWithJobContext, log as agentLog, voice } from '@livekit/agents';
 import { JobContext } from './session_context.js';
+import { closeSessionServices } from './_session_cleanup.js';
 
 export class JobProcess {
   userData: Record<string, unknown> = {};
@@ -538,6 +539,13 @@ export class AgentServer {
         // Close session
         if (ctx.session) {
           try { await (ctx.session as any).close(); } catch {}
+          // AgentSession.close() does NOT cascade-close the user-supplied
+          // STT/TTS/LLM, so their vendor WebSockets would leak per call on
+          // our long-lived in-process server. Close them explicitly after
+          // the session has closed, before hangup. Never throws.
+          await closeSessionServices(ctx.session, {
+            logger: (msg, err) => console.warn(`[call ${sessionId}] ${msg}`, err ?? ''),
+          });
         }
 
         // Hangup
