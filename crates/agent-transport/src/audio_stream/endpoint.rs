@@ -91,7 +91,10 @@ impl AudioStreamEndpoint {
     pub fn new(config: AudioStreamConfig, protocol: Arc<dyn StreamProtocol>) -> Result<Self> {
         if config.input_sample_rate == 0 || config.output_sample_rate == 0 { return Err(EndpointError::Other("sample_rate must be > 0".into())); }
         let rt = Runtime::new().map_err(|e| EndpointError::Other(e.to_string()))?;
-        let (etx, erx) = crossbeam_channel::unbounded();
+        // Bounded so a stalled Python dispatcher can't grow this without limit
+        // (OOM). Emits use try_send → drop-on-full; the dispatcher warns at a
+        // high-water mark well before the cap. See events::EVENT_CHANNEL_CAP.
+        let (etx, erx) = crossbeam_channel::bounded(crate::events::EVENT_CHANNEL_CAP);
         let cancel = CancellationToken::new();
         let sessions = Arc::new(Mutex::new(HashMap::new()));
 
@@ -504,7 +507,20 @@ impl AudioStreamEndpoint {
         self.cancel.cancel();
         if self.config.auto_hangup {
             let ids: Vec<String> = self.sessions.lock_or_recover().keys().cloned().collect();
+            let had_sessions = !ids.is_empty();
             for id in ids { let _ = self.hangup(&id); }
+            // hangup() now enqueues the Plivo REST DELETE (and the WS Close frame
+            // is sent via the per-session writer task) as DETACHED async work on
+            // `self.runtime`. On shutdown the runtime is about to be dropped,
+            // which would abort those tasks before they flush. Give them a
+            // bounded window to complete so calls tear down cleanly on Plivo's
+            // side. Bounded by the hangup timeouts above; teardown-only, so it
+            // never affects live-call audio.
+            if had_sessions {
+                let _ = self.runtime.block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                });
+            }
         }
         // Push a Shutdown sentinel so adapters blocked on wait_for_event
         // wake immediately rather than waiting for the next poll timeout.

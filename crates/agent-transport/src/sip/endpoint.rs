@@ -531,7 +531,10 @@ impl SipEndpoint {
     pub fn new(config: EndpointConfig) -> Result<Self> {
         if config.input_sample_rate == 0 || config.output_sample_rate == 0 { return Err(EndpointError::Other("sample_rate must be > 0".into())); }
         let rt = Runtime::new().map_err(err)?;
-        let (etx, erx) = crossbeam_channel::unbounded();
+        // Bounded so a stalled Python dispatcher can't grow this without limit
+        // (OOM). Emits use try_send → drop-on-full; the dispatcher warns at a
+        // high-water mark well before the cap. See events::EVENT_CHANNEL_CAP.
+        let (etx, erx) = crossbeam_channel::bounded(crate::events::EVENT_CHANNEL_CAP);
         let cancel = CancellationToken::new();
         let state = Arc::new(Mutex::new(EndpointState {
             registered: false, calls: HashMap::new(),

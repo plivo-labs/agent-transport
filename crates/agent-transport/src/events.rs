@@ -1,5 +1,16 @@
 use crate::sip::call::CallSession;
 
+/// Capacity of the endpoint event channel (SIP + audio_stream).
+///
+/// Generous on purpose: in normal operation the dispatcher drains continuously
+/// and the queue stays near-empty, so this is never approached. Bounding it
+/// caps worst-case memory — a stalled Python dispatcher on an *unbounded*
+/// channel grows without limit (OOM → the whole process dies, all sessions).
+/// At the cap, `try_send` drops the event and the awaiter's 30s timeout handles
+/// the rare lost completion; the dispatcher logs a high-water warning long
+/// before the cap is reached. ~65k small events ≈ a few MB.
+pub const EVENT_CHANNEL_CAP: usize = 65_536;
+
 /// Events emitted by the SIP endpoint.
 #[derive(Debug, Clone)]
 pub enum EndpointEvent {
