@@ -41,7 +41,7 @@ from livekit.agents.utils.hw import get_cpu_monitor
 from livekit.agents.utils import MovingAverage
 from livekit.rtc.room import SipDTMF
 from ._audio_io import TransportAudioInput, TransportAudioOutput
-from ._room_facade import TransportRoom, create_transport_context
+from ._room_facade import TransportJobContextMixin, TransportRoom, create_transport_context
 from ._aio_utils import call_setup as _call_setup
 from ._aio_utils import control_executor as _control_executor
 from ._aio_utils import schedule_hangup
@@ -53,6 +53,10 @@ class JobProcess:
     """Stub matching LiveKit's JobProcess — holds prewarm data."""
     def __init__(self):
         self.userdata: dict[str, Any] = {}
+
+    @property
+    def executor_type(self):
+        return None
 
 
 _inference_ctx_token = None
@@ -179,7 +183,7 @@ class _LoadMonitor:
 
 
 @dataclass
-class JobContext:
+class JobContext(TransportJobContextMixin):
     """Context passed to the @sip_session handler — equivalent of LiveKit's JobContext.
 
     Matches LiveKit's standard pattern exactly:
@@ -291,7 +295,7 @@ class JobContext:
 
     def add_shutdown_callback(self, callback):
         """Register a callback to run when the session ends."""
-        self._shutdown_callbacks.append(callback)
+        super().add_shutdown_callback(callback)
 
 
 class AgentServer:
@@ -941,9 +945,6 @@ class AgentServer:
             agent_name=self._agent_name,
             caller_identity=remote_uri,
         )
-        job_stub, job_ctx_token = create_transport_context(
-            room, agent_name=self._agent_name)
-
         ctx = JobContext(
             session_id=session_id,
             remote_uri=remote_uri,
@@ -953,10 +954,18 @@ class AgentServer:
             _agent_name=self._agent_name,
             _call_ended=call_ended,
             _room=room,
-            _job_ctx_token=job_ctx_token,
             _proc=self._proc,
             _events=self._events,
         )
+        # Make the entrypoint's ctx the canonical job context so
+        # get_job_context() is ctx (unifies the dual JobContext, #92).
+        _, job_ctx_token = create_transport_context(
+            room,
+            agent_name=self._agent_name,
+            inference_executor=getattr(self, "_inference_executor", None),
+            context=ctx,
+        )
+        ctx._job_ctx_token = job_ctx_token
         self._call_contexts[session_id] = ctx
 
         async def _run_call():
@@ -967,7 +976,7 @@ class AgentServer:
             # inherit the value but not always reliably under heavy
             # async churn.
             from livekit.agents.job import _JobContextVar
-            _JobContextVar.set(job_stub)
+            _JobContextVar.set(ctx)
 
             node = _nodename()
             SIP_CALLS_TOTAL.labels(nodename=node, direction=direction).inc()
@@ -1010,13 +1019,9 @@ class AgentServer:
                         await ctx._session.aclose()
                     except Exception:
                         pass
-                for cb in ctx._shutdown_callbacks:
-                    try:
-                        result = cb()
-                        if asyncio.iscoroutine(result):
-                            await result
-                    except Exception:
-                        logger.exception("Shutdown callback failed")
+                # Fire shutdown callbacks once (no-op if shutdown() already
+                # dispatched them — _take_shutdown_callbacks() dedups).
+                await ctx._run_shutdown_callbacks("call ended")
                 try:
                     # Off-loop on the dedicated call-control executor: hangup is
                     # a blocking SIP BYE; awaiting it there keeps the loop free

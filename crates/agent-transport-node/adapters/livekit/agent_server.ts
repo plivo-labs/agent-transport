@@ -25,6 +25,7 @@ import { JobContext } from './session_context.js';
 
 export class JobProcess {
   userData: Record<string, unknown> = {};
+  executorType: unknown = null;
 }
 
 export interface AgentServerOptions {
@@ -481,6 +482,8 @@ export class AgentServer {
       callEnded,
       resolveCallEnded: resolveEnded,
       proc: this.proc,
+      inferenceExecutor: this.inferenceExecutor,
+      enableRecording: false,
     });
 
     const runCall = async () => {
@@ -488,28 +491,9 @@ export class AgentServer {
       const callStart = performance.now();
 
       try {
-        // Wrap in runWithJobContext so getJobContext().room works inside handler
-        // (matches LiveKit WebRTC where entrypoint runs inside job context)
-        const sessionDir = `/tmp/agent-sessions`;
-        const stub = {
-          room: ctx.room,
-          job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: false, room: { sid: ctx.room.sid, name: ctx.room.name } },
-          _primaryAgentSession: undefined as any,
-          sessionDirectory: sessionDir,
-          proc: { executorType: null },
-          inferenceExecutor: this.inferenceExecutor,
-          initRecording: () => {},
-          connect: async () => {},
-          addShutdownCallback: () => {},
-          shutdown: () => {},
-          is_fake_job: () => false,
-          isFakeJob: () => false,
-          worker_id: 'local',
-          workerId: 'local',
-        };
-
+        const sessionDir = ctx.sessionDirectory;
         if (runWithJobContext) {
-          await runWithJobContext(stub as any, () => this.entrypointFn!(ctx));
+          await runWithJobContext(ctx as any, () => this.entrypointFn!(ctx));
         } else {
           await this.entrypointFn!(ctx);
         }

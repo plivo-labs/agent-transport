@@ -364,6 +364,8 @@ export class AudioStreamServer {
       callEnded,
       resolveCallEnded: resolveEnded,
       proc: this.proc,
+      inferenceExecutor: this.inferenceExecutor,
+      enableRecording: false,
     });
 
     const runSession = async () => {
@@ -371,30 +373,9 @@ export class AudioStreamServer {
       const sessionStart = performance.now();
 
       try {
-        // Wrap in runWithJobContext
-        let agents: any;
-        try { agents = await import('@livekit/agents'); } catch {}
-
-        const sessionDir = `/tmp/agent-sessions`;
-        const stub = {
-          room: ctx.room,
-          job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: false, room: { sid: ctx.room.sid, name: ctx.room.name } },
-          _primaryAgentSession: undefined as any,
-          sessionDirectory: sessionDir,
-          proc: { executorType: null },
-          inferenceExecutor: this.inferenceExecutor,
-          initRecording: () => {},
-          connect: async () => {},
-          addShutdownCallback: () => {},
-          shutdown: () => {},
-          is_fake_job: () => false,
-          isFakeJob: () => false,
-          worker_id: 'local',
-          workerId: 'local',
-        };
-
-        if (agents?.runWithJobContext) {
-          await agents.runWithJobContext(stub, () => this.entrypointFn!(ctx));
+        const sessionDir = ctx.sessionDirectory;
+        if (runWithJobContext) {
+          await runWithJobContext(ctx as any, () => this.entrypointFn!(ctx));
         } else {
           await this.entrypointFn!(ctx);
         }
