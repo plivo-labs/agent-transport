@@ -155,7 +155,8 @@ fn setup_rtp_attach(
         itx,
         etx.clone(),
         call_id.to_string(),
-        ctx.session.direction,
+        ctx.terminated.clone(),
+        ctx.session.clone(),
         ctx.beep_detector.clone(),
         ctx.held.clone(),
         ctx.recorder.clone(),
@@ -911,17 +912,24 @@ impl SipEndpoint {
         let handle = self.runtime.handle().clone();
         let jh = self.runtime.spawn_blocking(move || {
         handle.block_on(async {
-            let s = st.lock_or_recover();
-            let ctx = s.calls.get(&call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
+            // Snapshot the handles under the lock, then DROP the guard before the
+            // digit loop. The loop awaits per-digit SIP INFO / RFC2833 sends
+            // (~160-200ms each); holding the global EndpointState mutex across
+            // those awaits would stall every other call for the whole DTMF burst.
+            let (client_dialog, server_dialog, rtp) = {
+                let s = st.lock_or_recover();
+                let ctx = s.calls.get(&call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
+                (ctx.client_dialog.clone(), ctx.server_dialog.clone(), ctx.rtp.clone())
+            };
             for d in digits.chars() {
                 match method.as_str() {
                     "sip_info" | "info" => {
                         let body = format!("Signal={}\r\nDuration=160\r\n", d);
                         let hdrs = vec![rsip::Header::ContentType("application/dtmf-relay".into())];
-                        if let Some(ref dl) = ctx.client_dialog { let _ = dl.info(Some(hdrs), Some(body.into_bytes())).await; }
-                        else if let Some(ref dl) = ctx.server_dialog { let _ = dl.info(Some(hdrs), Some(body.into_bytes())).await; }
+                        if let Some(ref dl) = client_dialog { let _ = dl.info(Some(hdrs), Some(body.into_bytes())).await; }
+                        else if let Some(ref dl) = server_dialog { let _ = dl.info(Some(hdrs), Some(body.into_bytes())).await; }
                     }
-                    _ => { if let Some(ref rtp) = ctx.rtp { let _ = rtp.send_dtmf_event(d, 200).await; } }
+                    _ => { if let Some(ref rtp) = rtp { let _ = rtp.send_dtmf_event(d, 200).await; } }
                 }
             }
             Ok(())

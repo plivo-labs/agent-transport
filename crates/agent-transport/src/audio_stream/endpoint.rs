@@ -675,6 +675,25 @@ async fn handle_ws(
 
                 match event {
                     StreamEvent::Start { call_id, stream_id, encoding: enc, headers } => {
+                        // Defensive: a second `start` on this WS connection reuses
+                        // `sid` (the HashMap key), so the insert() below would
+                        // overwrite — and orphan — the previous session's send-loop
+                        // task: its CancellationToken clone is dropped un-signalled,
+                        // leaving the old loop running forever, draining/encoding/
+                        // sending against the same ws_tx as the new loop and leaking
+                        // its AudioBuffers. Plivo sends one start per connection, so
+                        // this only guards reconnect/replay/protocol quirks — but the
+                        // failure mode is a permanent runaway task. Tear the old one
+                        // down first (cleanup_session: cancels the old loop + clears
+                        // buffers + stops recording; NO CallTerminated emit, since the
+                        // same sid lives on with the new session).
+                        {
+                            let sessions_g = sessions.lock_or_recover();
+                            if let Some(old) = sessions_g.get(&sid) {
+                                warn!("duplicate `start` on session {} — tearing down previous", sid);
+                                cleanup_session(&sid, old, &recording_mgr);
+                            }
+                        }
                         encoding = enc;
                         upsampler = None; // Reset for new encoding
 
