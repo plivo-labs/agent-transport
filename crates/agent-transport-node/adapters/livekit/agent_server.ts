@@ -22,15 +22,16 @@
  *   server.run();
  */
 
-import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer, type Server, type IncomingMessage } from 'node:http';
 import { cpus } from 'node:os';
 import { hostname } from 'node:os';
 import { mkdirSync } from 'node:fs';
 import { SipEndpoint } from 'agent-transport';
-import { initializeLogger, InferenceRunner, runWithJobContext, log as agentLog, voice } from '@livekit/agents';
+import { initializeLogger, InferenceRunner, runWithJobContext, log as agentLog } from '@livekit/agents';
 import { JobContext } from './session_context.js';
 import { closeSessionServices } from './_session_cleanup.js';
-import { runServerCleanup, withTimeout, forceShutdownAgentSession } from './_session_teardown.js';
+import { runServerCleanup, forceShutdownAgentSession, installUnhandledRejectionHandler, registerSignalCleanup } from './_session_teardown.js';
+import { brokerFor, isAudioEvent } from './_audio_events.js';
 
 export class JobProcess {
   userData: Record<string, unknown> = {};
@@ -216,11 +217,9 @@ export class AgentServer {
    */
   async run(): Promise<void> {
     // Handle unhandled rejections from LiveKit SDK TTS abort paths gracefully
-    // (StreamAdapter rejects with undefined when TTS is cancelled during interruption)
-    process.on('unhandledRejection', (reason) => {
-      if (reason === undefined || reason === null) return; // TTS abort — benign
-      console.error('Unhandled rejection:', reason);
-    });
+    // (StreamAdapter rejects with undefined when TTS is cancelled during
+    // interruption). Idempotent — safe if both servers run in one process.
+    installUnhandledRejectionHandler();
 
     // Strip tsx/ts-node loader hooks from execArgv before any child process forks
     // (pino-pretty worker, inference subprocess). These hooks corrupt IPC channels.
@@ -325,6 +324,11 @@ export class AgentServer {
 
     // Create SIP endpoint and register
     this.ep = new SipEndpoint({ sipServer: this.sipServer });
+    // This server's sipEventLoop is the single reader of the endpoint event
+    // channel — claim the audio-event broker so it dispatches to us (and
+    // suppresses its standalone self-pump, preserving the single-reader
+    // invariant). SipAudioOutput awaits async-id completions via this broker.
+    brokerFor(this.ep).claimFeeder();
     this.ep.register(this.sipUsername, this.sipPassword);
 
     // Wait for registration
@@ -347,15 +351,10 @@ export class AgentServer {
     // On signal: hang up everything, run critical cleanup with short
     // timeouts, then process.exit. The Rust endpoint owns a background
     // thread that pins libuv, so natural exit isn't reliable — we force it.
-    const onSignal = async () => {
-      try {
-        await this.runCleanup();
-      } finally {
-        process.exit(0);
-      }
-    };
-    process.once('SIGINT', onSignal);
-    process.once('SIGTERM', onSignal);
+    // Idempotent registration: the signal listeners install once per process
+    // and run every registered server's cleanup, so two servers (or a second
+    // run()) don't double-register listeners.
+    registerSignalCleanup(() => this.runCleanup());
     await eventLoopDone;
   }
 
@@ -406,6 +405,15 @@ export class AgentServer {
       // waiting for the next 1 s waitForEvent timeout, then exit cleanly.
       if (ev.eventType === 'shutdown') {
         break;
+      }
+
+      // Route async-id audio completion events (audio_capture_complete /
+      // audio_playout_complete / audio_capture_error) to the broker, which
+      // resolves the pending SipAudioOutput captureFrame / waitForPlayout
+      // awaits. Must happen before call-lifecycle routing.
+      if (isAudioEvent(ev)) {
+        brokerFor(this.ep!).dispatch(ev);
+        continue;
       }
 
       if (ev.eventType === 'call_ringing' && ev.session) {

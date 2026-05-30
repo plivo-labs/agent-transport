@@ -86,6 +86,56 @@ export async function runServerCleanup(ctx: CleanupContext): Promise<void> {
   }
 }
 
+let unhandledRejectionHandlerInstalled = false;
+
+/**
+ * Idempotently install a process-wide `unhandledRejection` handler that
+ * swallows the benign `undefined`/`null` rejections LiveKit's TTS abort paths
+ * emit (StreamAdapter rejects with `undefined` when TTS is cancelled during
+ * interruption) and logs everything else.
+ *
+ * Guarded by a module-level flag so constructing both servers — or calling
+ * `run()` twice — registers the listener exactly once. Without the guard,
+ * `process.on('unhandledRejection', ...)` accumulates duplicate listeners
+ * (and trips Node's MaxListenersExceededWarning).
+ */
+export function installUnhandledRejectionHandler(): void {
+  if (unhandledRejectionHandlerInstalled) return;
+  unhandledRejectionHandlerInstalled = true;
+  process.on('unhandledRejection', (reason) => {
+    if (reason === undefined || reason === null) return; // TTS abort — benign
+    console.error('Unhandled rejection:', reason);
+  });
+}
+
+let signalHandlersInstalled = false;
+const signalCleanups: Array<() => Promise<void>> = [];
+
+/**
+ * Register a per-server SIGINT/SIGTERM cleanup callback and ensure the actual
+ * `process.once` signal listeners are installed exactly once for the process.
+ *
+ * Each server contributes its own cleanup (hang up its calls, drain its
+ * resources); on the first SIGINT/SIGTERM ALL registered cleanups run, then
+ * the process force-exits. Idempotent installation prevents duplicate signal
+ * listeners (and thus duplicate `process.exit`/cleanup) when both servers — or
+ * a second `run()` — are constructed in one process.
+ */
+export function registerSignalCleanup(cleanup: () => Promise<void>): void {
+  signalCleanups.push(cleanup);
+  if (signalHandlersInstalled) return;
+  signalHandlersInstalled = true;
+  const onSignal = async () => {
+    try {
+      await Promise.all(signalCleanups.map((c) => c().catch(() => {})));
+    } finally {
+      process.exit(0);
+    }
+  };
+  process.once('SIGINT', onSignal);
+  process.once('SIGTERM', onSignal);
+}
+
 const ACTIVITY_INPUT_GUARD_INSTALLED = Symbol('agentTransportActivityInputGuardInstalled');
 
 function guardActivityInput(activity: any): void {

@@ -24,14 +24,15 @@
  *   server.run();
  */
 
-import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer, type Server, type IncomingMessage } from 'node:http';
 import { hostname, cpus } from 'node:os';
 import { AudioStreamEndpoint } from 'agent-transport';
 import { initializeLogger, InferenceRunner, runWithJobContext } from '@livekit/agents';
 import { AudioStreamJobContext } from './audio_stream_context.js';
 import { JobProcess } from './agent_server.js';
 import { closeSessionServices } from './_session_cleanup.js';
-import { runServerCleanup, withTimeout, forceShutdownAgentSession } from './_session_teardown.js';
+import { runServerCleanup, forceShutdownAgentSession, installUnhandledRejectionHandler, registerSignalCleanup } from './_session_teardown.js';
+import { brokerFor, isAudioEvent } from './_audio_events.js';
 
 export interface AudioStreamServerOptions {
   listenAddr?: string;
@@ -133,11 +134,9 @@ export class AudioStreamServer {
   }
 
   async run(): Promise<void> {
-    // Handle unhandled rejections from LiveKit SDK TTS abort paths gracefully
-    process.on('unhandledRejection', (reason) => {
-      if (reason === undefined || reason === null) return;
-      console.error('Unhandled rejection:', reason);
-    });
+    // Handle unhandled rejections from LiveKit SDK TTS abort paths gracefully.
+    // Idempotent — safe if both servers run in one process.
+    installUnhandledRejectionHandler();
 
     // Strip tsx/ts-node loader hooks from execArgv before any child process forks
     const cleanArgv: string[] = [];
@@ -231,6 +230,10 @@ export class AudioStreamServer {
       inputSampleRate: this.sampleRate,
       outputSampleRate: this.sampleRate,
     });
+    // This server's eventLoop is the single reader of the endpoint event
+    // channel — claim the audio-event broker so SipAudioOutput async-id
+    // completions are dispatched to us (suppressing the broker self-pump).
+    brokerFor(this.ep).claimFeeder();
     console.log(`Audio stream WebSocket server on ws://${this.listenAddr}`);
 
     // Start HTTP server
@@ -244,15 +247,10 @@ export class AudioStreamServer {
     // On signal: hang up everything, run critical cleanup with short
     // timeouts, then process.exit. The Rust endpoint owns a background
     // thread that pins libuv, so natural exit isn't reliable — we force it.
-    const onSignal = async () => {
-      try {
-        await this.runCleanup();
-      } finally {
-        process.exit(0);
-      }
-    };
-    process.once('SIGINT', onSignal);
-    process.once('SIGTERM', onSignal);
+    // Idempotent registration: signal listeners install once per process and
+    // run every registered server's cleanup, so two servers (or a second
+    // run()) don't double-register listeners.
+    registerSignalCleanup(() => this.runCleanup());
     await eventLoopDone;
   }
 
@@ -306,6 +304,13 @@ export class AudioStreamServer {
       // Sentinel pushed by ep.shutdown() — wake immediately and exit cleanly.
       if (ev.eventType === 'shutdown') {
         break;
+      }
+
+      // Route async-id audio completion events to the broker (resolves the
+      // pending SipAudioOutput captureFrame / waitForPlayout awaits).
+      if (isAudioEvent(ev)) {
+        brokerFor(this.ep!).dispatch(ev);
+        continue;
       }
 
       if (ev.eventType === 'call_answered' && ev.session) {

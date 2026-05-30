@@ -1,13 +1,7 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{
-    ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode,
-};
-use napi::JsFunction;
 use napi_derive::napi;
 
 use agent_transport_core::{
@@ -472,8 +466,6 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
     }
 }
 
-type EventTsfn = ThreadsafeFunction<EventInfo, ErrorStrategy::CalleeHandled>;
-
 /// SIP endpoint — call control and audio I/O.
 #[napi]
 pub struct SipEndpoint {
@@ -481,8 +473,6 @@ pub struct SipEndpoint {
     // call methods from napi worker threads without blocking the main
     // Node event loop.
     inner: Arc<RustSipEndpoint>,
-    callbacks: Arc<Mutex<HashMap<String, Vec<EventTsfn>>>>,
-    event_thread_running: Arc<AtomicBool>,
 }
 
 #[napi]
@@ -532,44 +522,7 @@ impl SipEndpoint {
             RustSipEndpoint::new(rust_config).map_err(napi_err)?,
         );
 
-        Ok(Self {
-            inner,
-            callbacks: Arc::new(Mutex::new(HashMap::new())),
-            event_thread_running: Arc::new(AtomicBool::new(false)),
-        })
-    }
-
-    /// Register an event listener. Events: registered, registration_failed,
-    /// unregistered, call_ringing, call_state, call_answered,
-    /// call_terminated, dtmf_received, beep_detected, beep_timeout, shutdown
-    ///
-    /// ```js
-    /// // Observational pre-answer hook. Rust auto-answers right after.
-    /// ep.on('call_ringing', (event) => {
-    ///   console.log('Incoming call from', event.session.remoteUri);
-    /// });
-    ///
-    /// // Fires when call is answered and media is flowing. Start agent here.
-    /// ep.on('call_answered', (event) => {
-    ///   startAgent(event.session);
-    /// });
-    /// ```
-    #[napi(
-        ts_args_type = "eventName: string, callback: (event: EventInfo) => void"
-    )]
-    pub fn on(&self, event_name: String, callback: JsFunction) -> Result<()> {
-        let tsfn: EventTsfn =
-            callback.create_threadsafe_function(0, |ctx: ThreadSafeCallContext<EventInfo>| {
-                Ok(vec![ctx.value])
-            })?;
-
-        lock_or_recover(&self.callbacks)
-            .entry(event_name)
-            .or_default()
-            .push(tsfn);
-
-        self.ensure_event_loop();
-        Ok(())
+        Ok(Self { inner })
     }
 
     #[napi]
@@ -938,50 +891,9 @@ impl SipEndpoint {
     /// Shut down the endpoint. Stops event dispatch and tears down SIP stack.
     #[napi]
     pub fn shutdown(&self) -> Result<()> {
-        self.event_thread_running.store(false, Ordering::Relaxed);
         self.inner
             .shutdown()
             .map_err(napi_err)
-    }
-}
-
-impl SipEndpoint {
-    fn ensure_event_loop(&self) {
-        if self.event_thread_running.swap(true, Ordering::Relaxed) {
-            return;
-        }
-
-        let rx = self.inner.events();
-        let callbacks = self.callbacks.clone();
-        let running = self.event_thread_running.clone();
-
-        std::thread::spawn(move || {
-            while running.load(Ordering::Relaxed) {
-                match rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(event) => {
-                        let name = event.callback_name();
-                        let info = event_to_info(&event);
-
-                        // Clone tsfns under the lock, then release before invoking.
-                        // tsfn.call(NonBlocking) is non-blocking today, but holding
-                        // the mutex across any JS-bound call invites deadlock if a
-                        // callback tries to register a new handler via ep.on().
-                        let handlers: Vec<_> = {
-                            let cbs = lock_or_recover(&callbacks);
-                            cbs.get(name).cloned().unwrap_or_default()
-                        };
-                        for tsfn in &handlers {
-                            tsfn.call(
-                                Ok(info.clone()),
-                                ThreadsafeFunctionCallMode::NonBlocking,
-                            );
-                        }
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                }
-            }
-        });
     }
 }
 
