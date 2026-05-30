@@ -140,6 +140,7 @@ class TransportAudioSource:
         queue: Queue[FfiEvent] = self._events.subscribe(
             loop=self._loop,
             filter_fn=self._capture_filter,
+            key=self._id,  # only this session's completion events route here
         )
         try:
             async_id = self._ep.send_audio_async(
@@ -186,6 +187,7 @@ class TransportAudioSource:
         queue: Queue[FfiEvent] = self._events.subscribe(
             loop=self._loop,
             filter_fn=self._playout_filter,
+            key=self._id,  # only this session's playout events route here
         )
         try:
             async_id = self._ep.wait_for_playout_async(self._id)

@@ -176,3 +176,61 @@ async def test_queue_can_be_used_directly():
     q.put_nowait({"k": 1})
     item = await q.wait_for(lambda e: True, timeout=1.0)
     assert item == {"k": 1}
+
+
+# ─── Keyed (routed) dispatch — the O(N²)→O(per-session) optimization ─────────
+
+
+@pytest.mark.asyncio
+async def test_keyed_item_routes_only_to_matching_and_catchall():
+    """put(item, key=S) delivers to bucket[S] + the None catch-all, NOT to
+    subscribers keyed for a different session."""
+    fq = FfiQueue()
+    sub_a = fq.subscribe(key="sess-a")
+    sub_b = fq.subscribe(key="sess-b")
+    sub_all = fq.subscribe()  # catch-all (key=None)
+
+    fq.put({"id": "a"}, key="sess-a")
+
+    ev_a = await sub_a.wait_for(lambda e: True, timeout=1.0)
+    assert ev_a == {"id": "a"}
+    ev_all = await sub_all.wait_for(lambda e: True, timeout=1.0)
+    assert ev_all == {"id": "a"}
+    # sub_b (different session) must NOT have received it.
+    assert sub_b.empty()
+
+
+@pytest.mark.asyncio
+async def test_keyless_item_broadcasts_to_all_including_keyed():
+    """put(item) with no key is unroutable → broadcast to every subscriber so
+    nothing is missed (correctness fallback)."""
+    fq = FfiQueue()
+    sub_a = fq.subscribe(key="sess-a")
+    sub_b = fq.subscribe(key="sess-b")
+
+    fq.put({"id": "x"})  # key=None
+
+    assert (await sub_a.wait_for(lambda e: True, timeout=1.0)) == {"id": "x"}
+    assert (await sub_b.wait_for(lambda e: True, timeout=1.0)) == {"id": "x"}
+
+
+@pytest.mark.asyncio
+async def test_keyed_subscriber_does_not_get_other_session_events():
+    """A keyed subscriber must never receive another session's keyed event —
+    this is the invariant that makes the routing an optimization, not a leak."""
+    fq = FfiQueue()
+    sub_a = fq.subscribe(key="sess-a")
+    fq.put({"id": "b1"}, key="sess-b")
+    fq.put({"id": "b2"}, key="sess-b")
+    assert sub_a.empty()
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_keyed_cleans_bucket():
+    fq = FfiQueue()
+    sub = fq.subscribe(key="sess-a")
+    assert fq.subscriber_count() == 1
+    fq.unsubscribe(sub)
+    assert fq.subscriber_count() == 0
+    # A subsequent keyed put must not raise even though the bucket is gone.
+    fq.put({"id": "a"}, key="sess-a")

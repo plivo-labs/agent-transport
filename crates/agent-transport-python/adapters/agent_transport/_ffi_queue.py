@@ -98,6 +98,8 @@ _Subscriber = Tuple[
     Optional[Callable[[T], bool]],
 ]
 
+_UNSET = object()
+
 
 class FfiQueue(Generic[T]):
     """Multi-subscriber event broker for endpoint events.
@@ -118,17 +120,36 @@ class FfiQueue(Generic[T]):
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._subscribers: List[_Subscriber[T]] = []
+        # Subscribers bucketed by routing key (the session id they care about).
+        # The ``None`` bucket is the catch-all: those subscribers receive every
+        # item regardless of its key (filterless / multi-session consumers).
+        self._by_key: dict[Any, List[_Subscriber[T]]] = {}
+        # id(queue) -> key, so unsubscribe() finds the right bucket in O(1).
+        self._key_of: dict[int, Any] = {}
 
-    def put(self, item: T) -> None:
-        """Broadcast ``item`` to every subscribed queue, filtered.
+    def put(self, item: T, key: Any = None) -> None:
+        """Deliver ``item`` to the subscribers routed by ``key``, filtered.
 
-        If a subscriber's ``filter_fn`` raises, the item is delivered
-        anyway (LiveKit's behavior — filter errors must not silently
-        drop events).
+        ``key`` is the item's routing key (its session id), supplied by the
+        producer. Delivery set = subscribers registered for exactly ``key``
+        PLUS the catch-all (``None``-key) subscribers. If ``key`` is ``None``
+        (an unroutable item), the item is broadcast to ALL subscribers so
+        nothing is missed. ``filter_fn`` is still applied per subscriber, so
+        keying only narrows delivery to a superset of what the filter accepts —
+        it can never drop a wanted event. This turns the per-frame fan-out from
+        O(total subscribers) into O(this session's subscribers).
+
+        If a subscriber's ``filter_fn`` raises, the item is delivered anyway
+        (LiveKit's behavior — filter errors must not silently drop events).
         """
         with self._lock:
-            subscribers = list(self._subscribers)
+            if key is None:
+                subscribers = [s for bucket in self._by_key.values() for s in bucket]
+            else:
+                subscribers = list(self._by_key.get(key, ()))
+                catch_all = self._by_key.get(None)
+                if catch_all:
+                    subscribers.extend(catch_all)
         delivered = 0
         for queue, loop, filter_fn in subscribers:
             if filter_fn is not None:
@@ -160,36 +181,51 @@ class FfiQueue(Generic[T]):
         self,
         loop: Optional[asyncio.AbstractEventLoop] = None,
         filter_fn: Optional[Callable[[T], bool]] = None,
+        key: Any = None,
     ) -> Queue[T]:
         """Create a fresh queue and register it as a subscriber.
 
-        From the moment this returns, the queue receives every item
-        passed to :meth:`put` (subject to ``filter_fn``). Callers
-        SHOULD always unsubscribe in a finally block — otherwise the
-        queue retains references and grows unbounded.
+        From the moment this returns, the queue receives every item passed to
+        :meth:`put` whose routing key matches ``key`` (plus keyless/broadcast
+        items), subject to ``filter_fn``. ``key`` should be the session id the
+        subscriber cares about; ``None`` (the default) makes it a catch-all that
+        receives every item — preserving the old broadcast behavior for callers
+        that don't route. Callers SHOULD always unsubscribe in a finally block —
+        otherwise the queue retains references and grows unbounded.
         """
         queue: Queue[T] = Queue()
         loop = loop or asyncio.get_event_loop()
         with self._lock:
-            self._subscribers.append((queue, loop, filter_fn))
+            self._by_key.setdefault(key, []).append((queue, loop, filter_fn))
+            self._key_of[id(queue)] = key
         return queue
 
     def unsubscribe(self, queue: Queue[T]) -> None:
-        """Detach the queue from the subscriber list.
+        """Detach the queue from its bucket.
 
         Idempotent: calling unsubscribe on a queue that isn't subscribed
         is a no-op (covers the double-unsubscribe-in-finally case).
         """
         with self._lock:
-            for i, (q, _, _) in enumerate(self._subscribers):
-                if q is queue:
-                    self._subscribers.pop(i)
-                    return
+            key = self._key_of.pop(id(queue), _UNSET)
+            # Normally the bucket is known from _key_of; fall back to scanning
+            # every bucket if that mapping was somehow lost (defensive).
+            buckets = [key] if key is not _UNSET else list(self._by_key.keys())
+            for k in buckets:
+                bucket = self._by_key.get(k)
+                if not bucket:
+                    continue
+                for i, (q, _, _) in enumerate(bucket):
+                    if q is queue:
+                        bucket.pop(i)
+                        if not bucket:
+                            del self._by_key[k]
+                        return
 
     def subscriber_count(self) -> int:
         """Current number of subscribed queues (for tests / metrics)."""
         with self._lock:
-            return len(self._subscribers)
+            return sum(len(bucket) for bucket in self._by_key.values())
 
 
 # ─── Process-wide singleton ──────────────────────────────────────────────────

@@ -90,9 +90,19 @@ def _on_event_from_rust(event_dict: Mapping[str, Any]) -> None:
             "event_sink: type=%s count=%d → %d FfiEvent(s)",
             ev_type, count, len(events),
         )
+    # Routing key for the FfiQueue: per-frame async-id completion events carry
+    # ``session_id``, so keying lets put() dispatch only to that session's
+    # subscriber instead of scanning every concurrent call's subscriber.
+    # Lifecycle events that only carry a ``session`` object have no top-level
+    # session_id → key is None → broadcast (correct, and they're low-frequency).
+    _sid = event_dict.get("session_id")
+    # Match the exact form the subscribers key on: source_handle is built as
+    # ``str(session_id)`` (and audio_source subscribes with key=self._id, a str),
+    # so wrap here too. Absent session_id → None → broadcast.
+    key = str(_sid) if _sid is not None else None
     for ev in events:
         try:
-            GLOBAL.put(ev)
+            GLOBAL.put(ev, key=key)
         except Exception:
             logger.exception("event sink: GLOBAL.put failed")
     # Parallel fan-out to the dict-shaped broker for pipecat-style
@@ -100,7 +110,7 @@ def _on_event_from_rust(event_dict: Mapping[str, Any]) -> None:
     # ``event["session"].session_id`` and similar attribute-on-PyO3
     # accesses that LiveKit-shape FfiEvent would have flattened.
     try:
-        GLOBAL_DICT.put(dict(event_dict))
+        GLOBAL_DICT.put(dict(event_dict), key=key)
     except Exception:
         logger.exception("event sink: GLOBAL_DICT.put failed")
 
