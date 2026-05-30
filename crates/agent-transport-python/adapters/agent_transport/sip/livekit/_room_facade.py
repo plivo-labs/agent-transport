@@ -13,6 +13,7 @@ Architecture:
 
 import asyncio
 import datetime
+import inspect
 import logging
 import uuid
 from dataclasses import dataclass
@@ -706,17 +707,33 @@ class TransportJobContextMixin:
         self._shutdown_callbacks_fired = True
         return list(self._shutdown_callbacks)
 
+    @staticmethod
+    def _invoke_shutdown_callback(cb, reason: str):
+        """Invoke one shutdown callback and return its pending awaitable, or
+        ``None`` if it was a plain sync callback (or raised). Per-callback errors
+        are logged and swallowed so one bad callback can't block the rest.
+
+        Shared by the sync ``shutdown()`` and async ``_run_shutdown_callbacks()``
+        paths so the invoke / await-detection logic can't drift between them —
+        each path only differs in how it disposes of the returned awaitable
+        (await it vs. fire-and-forget on the loop).
+        """
+        try:
+            result = cb(reason)
+        except Exception:
+            logger.debug("shutdown callback failed", exc_info=True)
+            return None
+        return result if inspect.isawaitable(result) else None
+
     async def _run_shutdown_callbacks(self, reason: str = "") -> None:
         """Run shutdown callbacks once, awaiting any async ones."""
-        import inspect
-
         for cb in self._take_shutdown_callbacks():
-            try:
-                result = cb(reason)
-                if inspect.isawaitable(result):
-                    await result
-            except Exception:
-                logger.debug("shutdown callback failed", exc_info=True)
+            coro = self._invoke_shutdown_callback(cb, reason)
+            if coro is not None:
+                try:
+                    await coro
+                except Exception:
+                    logger.debug("async shutdown callback failed", exc_info=True)
 
     def shutdown(self, reason: str = ""):
         """Terminate the agent job and drop the underlying SIP/audio_stream call.
@@ -729,7 +746,6 @@ class TransportJobContextMixin:
         call is a no-op in the Rust core.
         """
         logger.info("JobContext.shutdown(reason=%r) — dropping call %s", reason, self._room._sid if self._room else "?")
-        import asyncio as _asyncio
         ep = self._room._ep if self._room else None
         session_id = self._room._sid if self._room else None
         if ep and session_id:
@@ -744,24 +760,20 @@ class TransportJobContextMixin:
         # with the reason string; add_shutdown_callback normalized the shape.
         # _take_shutdown_callbacks() guarantees once-only dispatch across
         # both shutdown() and the server's final cleanup.
-        import inspect
         for cb in self._take_shutdown_callbacks():
-            try:
-                result = cb(reason)
-                if inspect.isawaitable(result):
-                    # shutdown() is synchronous per LiveKit's contract, so
-                    # async user cleanup runs fire-and-forget on the loop.
-                    try:
-                        loop = _asyncio.get_event_loop()
-                        if loop.is_running():
-                            task = loop.create_task(result)
-                            task.add_done_callback(
-                                lambda t: t.exception() if not t.cancelled() else None
-                            )
-                    except Exception:
-                        pass
-            except Exception:
-                logger.debug("shutdown callback failed", exc_info=True)
+            coro = self._invoke_shutdown_callback(cb, reason)
+            if coro is not None:
+                # shutdown() is synchronous per LiveKit's contract, so async
+                # user cleanup runs fire-and-forget on the running loop.
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        task = loop.create_task(coro)
+                        task.add_done_callback(
+                            lambda t: t.exception() if not t.cancelled() else None
+                        )
+                except Exception:
+                    pass
 
     async def delete_room(self, room_name=""):
         """Drop the underlying SIP/audio_stream call.

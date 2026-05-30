@@ -634,6 +634,15 @@ class AgentServer:
         """
         logger.info("Shutting down...")
         if self._ep is not None:
+            # Hang up every active call up-front, synchronously and in order, so
+            # callers drop promptly before the slower cleanup steps below. Per-call
+            # hangups during normal operation go off-loop (control_executor) to
+            # avoid stalling OTHER live calls on the blocking SIP BYE — but here
+            # there are no live calls left to protect: the whole server is tearing
+            # down and about to os._exit. A blocking in-order loop is therefore the
+            # right choice — it guarantees every BYE is attempted before the
+            # process exits. Each call is bounded by the Rust hangup timeout, and
+            # ep.shutdown() below repeats the hangup idempotently.
             for session_id in list(self._active_calls.keys()):
                 try:
                     self._ep.hangup(session_id)

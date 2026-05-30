@@ -512,13 +512,19 @@ impl AudioStreamEndpoint {
             // hangup() now enqueues the Plivo REST DELETE (and the WS Close frame
             // is sent via the per-session writer task) as DETACHED async work on
             // `self.runtime`. On shutdown the runtime is about to be dropped,
-            // which would abort those tasks before they flush. Give them a
+            // which would abort those tasks before they flush. Give them a brief,
             // bounded window to complete so calls tear down cleanly on Plivo's
-            // side. Bounded by the hangup timeouts above; teardown-only, so it
-            // never affects live-call audio.
+            // side.
             if had_sessions {
+                // Best-effort flush window, deliberately sub-second so shutdown
+                // stays fast. This is NOT the per-request hangup ceiling
+                // (connect 2s / total 5s in `plivo.rs`): a slow provider response
+                // is cut off when the runtime drops just below — an accepted
+                // teardown-only tradeoff that never affects live-call audio.
+                const HANGUP_DRAIN: std::time::Duration =
+                    std::time::Duration::from_millis(750);
                 let _ = self.runtime.block_on(async {
-                    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                    tokio::time::sleep(HANGUP_DRAIN).await;
                 });
             }
         }

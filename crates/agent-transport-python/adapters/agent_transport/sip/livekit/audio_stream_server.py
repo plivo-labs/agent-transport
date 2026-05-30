@@ -562,6 +562,12 @@ class AudioStreamServer:
         """
         logger.info("Shutting down...")
         if self._ep is not None:
+            # Hang up every active session up-front so callers drop promptly
+            # before the slower cleanup steps below. Unlike SIP, audio_stream
+            # hangup is fire-and-forget in Rust (returns instantly; the REST
+            # DELETE is flushed by ep.shutdown()'s drain window), so this inline
+            # loop never blocks the loop thread. ep.shutdown() below repeats it
+            # idempotently.
             for session_id in list(self._active_sessions.keys()):
                 try:
                     self._ep.hangup(session_id)
