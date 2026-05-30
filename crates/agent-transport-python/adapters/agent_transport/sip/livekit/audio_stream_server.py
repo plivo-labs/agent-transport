@@ -52,6 +52,7 @@ from livekit.agents.utils import MovingAverage
 from ._audio_io import TransportAudioInput, TransportAudioOutput
 from ._room_facade import TransportJobContextMixin, TransportRoom, create_transport_context
 from ._aio_utils import call_setup as _call_setup, close_session_services
+from ._session_teardown import force_shutdown_agent_session
 from livekit.rtc.room import SipDTMF
 from .server import JobProcess
 
@@ -776,6 +777,16 @@ class AudioStreamServer:
                     self._ep.clear_buffer(session_id)
                 except Exception:
                     pass
+                # Synchronously begin tearing down the AgentSession so a
+                # buffered STT transcript delivered after disconnect can't
+                # trigger a wasted LLM + TTS turn on a dead session (#83).
+                # Must run here, on the wake branch, before we set the
+                # session-ended event — flipping the scheduling guard later
+                # (in _run_session's finally) would be too late.
+                ctx = self._session_contexts.get(session_id)
+                if ctx is not None and getattr(ctx, "_session", None) is not None:
+                    force_shutdown_agent_session(ctx._session, self._background_tasks)
+
                 # Wake _run_session (which holds _JobContextVar). The
                 # ``participant_disconnected`` emit must come from
                 # _run_session — not here — because LiveKit's RoomIO

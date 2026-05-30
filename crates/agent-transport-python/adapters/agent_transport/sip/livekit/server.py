@@ -61,6 +61,7 @@ from ._aio_utils import call_setup as _call_setup
 from ._aio_utils import close_session_services
 from ._aio_utils import control_executor as _control_executor
 from ._aio_utils import schedule_hangup
+from ._session_teardown import force_shutdown_agent_session
 
 logger = logging.getLogger("agent_transport.server")
 
@@ -949,6 +950,16 @@ class AgentServer:
                     self._ep.clear_buffer(session_id)
                 except Exception:
                     pass
+
+                # Synchronously begin tearing down the AgentSession so a
+                # buffered STT transcript delivered after disconnect can't
+                # trigger a wasted LLM + TTS turn on a dead call (issue #83).
+                # Must run here, on the event-loop wake branch, before we set
+                # the call-ended event — flipping the scheduling guard later
+                # (in _run_call's finally) would be too late.
+                ctx = self._call_contexts.get(session_id)
+                if ctx is not None and getattr(ctx, "_session", None) is not None:
+                    force_shutdown_agent_session(ctx._session, self._background_tasks)
 
                 # Wake _run_call (which holds _JobContextVar in its own
                 # task context). The participant_disconnected emit MUST

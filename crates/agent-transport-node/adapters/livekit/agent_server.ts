@@ -30,7 +30,7 @@ import { SipEndpoint } from 'agent-transport';
 import { initializeLogger, InferenceRunner, runWithJobContext, log as agentLog, voice } from '@livekit/agents';
 import { JobContext } from './session_context.js';
 import { closeSessionServices } from './_session_cleanup.js';
-import { runServerCleanup, withTimeout } from './_session_teardown.js';
+import { runServerCleanup, withTimeout, forceShutdownAgentSession } from './_session_teardown.js';
 
 export class JobProcess {
   userData: Record<string, unknown> = {};
@@ -109,7 +109,7 @@ export class AgentServer {
   private userdata: Record<string, unknown> = {};
   private proc = new JobProcess();
   private ep?: SipEndpoint;
-  private activeCalls = new Map<string, { promise: Promise<void>; resolveEnded: () => void; room?: any }>();
+  private activeCalls = new Map<string, { promise: Promise<void>; resolveEnded: () => void; room?: any; ctx?: any }>();
   private httpServer?: Server;
   private loadMonitor = new LoadMonitor();
   private inferenceExecutor: any = null;
@@ -443,9 +443,15 @@ export class AgentServer {
         const reason = ev.reason ?? 'unknown';
         console.log(`Call ${sessionId} terminated (reason=${reason})`);
 
+        const active = this.activeCalls.get(sessionId);
+        // Synchronously begin tearing down the AgentSession so a buffered STT
+        // transcript delivered after disconnect can't trigger a wasted LLM +
+        // TTS turn on a dead call (issue #83). Must run before the Room facade
+        // emits participant_disconnected (which schedules the async close).
+        forceShutdownAgentSession(active?.ctx?.session);
+
         // Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
         // RoomIO._on_participant_disconnected will call _close_soon() → session closes
-        const active = this.activeCalls.get(sessionId);
         if (active?.room) {
           active.room.emitParticipantDisconnected();
         }
@@ -574,7 +580,7 @@ export class AgentServer {
     };
 
     const callPromise = runCall();
-    this.activeCalls.set(sessionId, { promise: callPromise, resolveEnded, room: ctx.room });
+    this.activeCalls.set(sessionId, { promise: callPromise, resolveEnded, room: ctx.room, ctx });
   }
 
   // ─── HTTP server ────────────────────────────────────────────────
