@@ -22,6 +22,9 @@ from livekit import rtc
 from livekit.rtc.event_emitter import EventEmitter
 from livekit.rtc.room import SipDTMF
 
+from ._aio_utils import control_executor as _control_executor
+from ._aio_utils import schedule_hangup
+
 logger = logging.getLogger(__name__)
 
 
@@ -680,17 +683,20 @@ class _StubJobContext:
         call is a no-op in the Rust core.
         """
         logger.info("JobContext.shutdown(reason=%r) — dropping call %s", reason, self._room._sid if self._room else "?")
+        import asyncio as _asyncio
         ep = self._room._ep if self._room else None
         session_id = self._room._sid if self._room else None
         if ep and session_id:
-            try:
-                ep.hangup(session_id)
-            except Exception:
-                logger.debug("hangup during JobContext.shutdown failed", exc_info=True)
+            # hangup() is a Rust block_on (~50-200ms talking to Plivo/SIP).
+            # shutdown() is synchronous per LiveKit's EndCallTool contract and
+            # runs on the asyncio loop thread, so schedule the hangup off-loop
+            # (dedicated control executor) to avoid stalling other sessions for
+            # the network round-trip. Fire-and-forget; shutdown() must return
+            # synchronously. The async sibling delete_room() does the same.
+            schedule_hangup(ep.hangup, session_id)
         # Fire user-registered shutdown callbacks. LiveKit calls them with
         # the reason string; we do the same after add_shutdown_callback
         # normalized them to all take (reason,).
-        import asyncio as _asyncio
         for cb in self._shutdown_callbacks:
             try:
                 coro = cb(reason)
@@ -725,11 +731,12 @@ class _StubJobContext:
         if ep and session_id:
             try:
                 # ep.hangup is a Rust block_on call (~50-200ms talking to
-                # the SIP proxy). Run in executor so the asyncio loop
-                # isn't blocked while Rust talks to the network.
+                # the SIP proxy). Run on the dedicated call-control executor so
+                # the asyncio loop isn't blocked while Rust talks to the network
+                # and the audio forwarders' default pool isn't contended.
                 import asyncio as _asyncio
                 loop = _asyncio.get_running_loop()
-                await loop.run_in_executor(None, ep.hangup, session_id)
+                await loop.run_in_executor(_control_executor(), ep.hangup, session_id)
             except Exception:
                 logger.debug("hangup during JobContext.delete_room failed", exc_info=True)
 

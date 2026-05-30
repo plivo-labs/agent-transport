@@ -237,6 +237,11 @@ class JobContext:
             logger.info("Session %s closed (reason=%s)", self.session_id, getattr(ev, 'reason', 'unknown'))
             if self._call_ended is not None and not self._call_ended.is_set():
                 self._call_ended.set()
+            # AudioStreamEndpoint.hangup() is fire-and-forget in Rust: the Plivo
+            # REST DELETE is spawned on the endpoint's own tokio runtime and the
+            # call returns in microseconds. No Python thread (loop or executor)
+            # is held for the network round-trip, so calling it inline here does
+            # not stall the loop.
             try:
                 self.endpoint.hangup(self.session_id)
             except Exception:
@@ -859,6 +864,8 @@ class AudioStreamServer:
                     except Exception:
                         logger.exception("Shutdown callback failed")
                 try:
+                    # Fire-and-forget in Rust (Plivo REST DELETE spawned on the
+                    # endpoint's tokio runtime) — returns immediately, safe inline.
                     self._ep.hangup(session_id)
                 except Exception:
                     pass

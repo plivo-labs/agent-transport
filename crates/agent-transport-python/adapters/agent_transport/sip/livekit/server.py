@@ -43,6 +43,8 @@ from livekit.rtc.room import SipDTMF
 from ._audio_io import TransportAudioInput, TransportAudioOutput
 from ._room_facade import TransportRoom, create_transport_context
 from ._aio_utils import call_setup as _call_setup
+from ._aio_utils import control_executor as _control_executor
+from ._aio_utils import schedule_hangup
 
 logger = logging.getLogger("agent_transport.server")
 
@@ -246,10 +248,12 @@ class JobContext:
             logger.info("Call %s session closed (reason=%s)", self.session_id, getattr(ev, 'reason', 'unknown'))
             if self._call_ended is not None and not self._call_ended.is_set():
                 self._call_ended.set()
-            try:
-                self.endpoint.hangup(self.session_id)
-            except Exception:
-                pass
+            # hangup() is a Rust block_on (SIP BYE round-trip). This callback
+            # fires SYNCHRONOUSLY on the asyncio loop thread, so calling hangup
+            # inline stalls every other call on the loop. Schedule it off-loop
+            # on the dedicated call-control executor (isolated from the audio
+            # forwarders' default pool). ep.shutdown() teardown is the backstop.
+            schedule_hangup(self.endpoint.hangup, self.session_id)
 
         if logging.getLogger("agent_transport.sip").isEnabledFor(logging.DEBUG):
             @session.on("agent_state_changed")
@@ -1014,7 +1018,13 @@ class AgentServer:
                     except Exception:
                         logger.exception("Shutdown callback failed")
                 try:
-                    self._ep.hangup(session_id)
+                    # Off-loop on the dedicated call-control executor: hangup is
+                    # a blocking SIP BYE; awaiting it there keeps the loop free
+                    # for other calls' teardown without contending for the audio
+                    # forwarders' default pool.
+                    await asyncio.get_running_loop().run_in_executor(
+                        _control_executor(), self._ep.hangup, session_id
+                    )
                 except Exception:
                     pass
                 # Cleanup Room facade. We do NOT call

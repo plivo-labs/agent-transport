@@ -1,9 +1,76 @@
 """Async utilities matching LiveKit's utils.aio."""
 
 import asyncio
+import concurrent.futures
 import functools
 import inspect
-from typing import Any, Callable
+import logging
+from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
+
+
+# ─── Dedicated call-control executor ─────────────────────────────────────────
+#
+# Blocking call-control ops (notably ep.hangup, a Rust block_on doing a Plivo
+# REST DELETE / SIP BYE) must not run inline on the asyncio loop thread — that
+# stalls every session sharing the loop. They are scheduled off-loop via
+# run_in_executor. They must ALSO not share asyncio's DEFAULT ThreadPoolExecutor
+# with the per-call audio hot path: each active call permanently occupies one
+# default-pool worker via ``recv_audio_bytes_blocking``, so a burst of slow
+# hangups (mass disconnect / provider outage) on the default pool would starve
+# live calls' inbound audio. A dedicated, bounded pool caps that blast radius.
+
+_control_executor: Optional["concurrent.futures.ThreadPoolExecutor"] = None
+
+
+def control_executor() -> "concurrent.futures.ThreadPoolExecutor":
+    """Lazily-created dedicated thread pool for blocking call-control ops."""
+    global _control_executor
+    if _control_executor is None:
+        _control_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="at-callctl"
+        )
+    return _control_executor
+
+
+def _drain_exception(fut: "asyncio.Future") -> None:
+    """Retrieve a fire-and-forget future's exception so it is observable and
+    never left unretrieved on an orphaned Future.
+
+    ``loop.run_in_executor`` returns an asyncio.Future; calling ``exception()``
+    on a cancelled one raises ``CancelledError`` (a ``BaseException``, so not
+    caught by ``except Exception``). Guard the cancelled case explicitly so this
+    done-callback never re-raises into the loop's exception handler."""
+    if fut.cancelled():
+        return
+    try:
+        exc = fut.exception()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        return
+    if exc is not None:
+        logger.debug("async call-control op failed: %s", exc)
+
+
+def schedule_hangup(fn: Callable[..., Any], *args: Any) -> None:
+    """Fire-and-forget a blocking hangup off the event loop, on the dedicated
+    control executor. Used from SYNCHRONOUS callbacks that run on the loop
+    thread (``session.on("close")``, ``JobContext.shutdown``) and must return
+    without blocking. Falls back to an inline call when there is no running
+    loop. Any exception is retrieved and logged — never dropped silently nor
+    left on an orphaned Future."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            fn(*args)
+        except Exception:
+            logger.debug("inline hangup (no running loop) failed", exc_info=True)
+        return
+    fut = loop.run_in_executor(control_executor(), fn, *args)
+    fut.add_done_callback(_drain_exception)
 
 
 def _release_waiter(waiter: asyncio.Future[Any], *_: Any) -> None:
