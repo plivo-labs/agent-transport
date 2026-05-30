@@ -919,13 +919,16 @@ async fn handle_ws(
                         };
 
                         if let Some(ref rec_ref) = media_recorder {
-                            if let Ok(guard) = rec_ref.lock() {
-                                if let Some(ref rec) = *guard { rec.write_user_samples(&pcm); }
-                            }
+                            // lock_or_recover (not raw .lock()): a poisoned mutex
+                            // must not silently stop recording mid-call — recover
+                            // and keep writing, consistent with every other site.
+                            let guard = rec_ref.lock_or_recover();
+                            if let Some(ref rec) = *guard { rec.write_user_samples(&pcm); }
                         }
 
                         if let Some(ref bd_ref) = media_beep_det {
-                            if let Ok(mut g) = bd_ref.lock() {
+                            {
+                                let mut g = bd_ref.lock_or_recover();
                                 if let Some(ref mut det) = *g {
                                     match det.process_frame(&pcm) {
                                         BeepDetectorResult::Detected(e) => {
