@@ -4,6 +4,13 @@
  * Handles SIP registration, call routing, HTTP server (health/worker/metrics/call),
  * CLI (start/dev/debug), and call lifecycle management.
  *
+ * Shutdown behavior (SIGINT/SIGTERM): active calls are hung up, cleanup is
+ * bounded by short timeouts, then the process force-exits via
+ * `process.exit(0)`. The Rust endpoint owns background threads that can pin
+ * libuv, so natural exit isn't reliable. Flush recordings / observability
+ * POSTs per-session (e.g., from `ctx.session.on("close", ...)`) — NOT at
+ * server shutdown.
+ *
  * Usage:
  *   const server = new AgentServer({ sipUsername: '...', sipPassword: '...' });
  *
@@ -23,6 +30,7 @@ import { SipEndpoint } from 'agent-transport';
 import { initializeLogger, InferenceRunner, runWithJobContext, log as agentLog, voice } from '@livekit/agents';
 import { JobContext } from './session_context.js';
 import { closeSessionServices } from './_session_cleanup.js';
+import { runServerCleanup, withTimeout } from './_session_teardown.js';
 
 export class JobProcess {
   userData: Record<string, unknown> = {};
@@ -336,40 +344,43 @@ export class AgentServer {
     // Node's event loop forever.
     const eventLoopDone = this.sipEventLoop();
 
-    // Wait for shutdown signal
-    await new Promise<void>((resolve) => {
-      const onSignal = () => {
-        this.shutdownRequested = true;
-        resolve();
-      };
-      process.on('SIGINT', onSignal);
-      process.on('SIGTERM', onSignal);
-    });
-
-    console.log('Shutting down...');
-
-    // Drain active calls with 10-second timeout
-    if (this.activeCalls.size > 0) {
-      console.log(`Draining ${this.activeCalls.size} active call(s)...`);
-      await Promise.race([
-        Promise.allSettled([...this.activeCalls.values()].map((c) => c.promise)),
-        new Promise<void>((resolve) => setTimeout(() => {
-          console.warn('Shutdown timeout reached (10s), forcing exit');
-          resolve();
-        }, 10000)),
-      ]);
-    }
-
-    this.loadMonitor.stop();
-    if (this.inferenceExecutor) {
-      try { await this.inferenceExecutor.close(); } catch {}
-    }
-    this.httpServer?.close();
-    this.ep?.shutdown();
-    // Wait for the event loop to actually exit so Node can release the
-    // libuv handle and the process can terminate. The shutdown sentinel
-    // pushed by ep.shutdown() above wakes the loop immediately.
+    // On signal: hang up everything, run critical cleanup with short
+    // timeouts, then process.exit. The Rust endpoint owns a background
+    // thread that pins libuv, so natural exit isn't reliable — we force it.
+    const onSignal = async () => {
+      try {
+        await this.runCleanup();
+      } finally {
+        process.exit(0);
+      }
+    };
+    process.once('SIGINT', onSignal);
+    process.once('SIGTERM', onSignal);
     await eventLoopDone;
+  }
+
+  /**
+   * Hang up active calls, drain ancillary resources with short timeouts.
+   *
+   * Thin wrapper around {@link runServerCleanup} so the signal-handler path
+   * stays a one-liner and tests can drive the shared cleanup helper without
+   * loading the native `agent-transport` binding.
+   */
+  async runCleanup(): Promise<void> {
+    this.shutdownRequested = true;
+    await runServerCleanup({
+      activeSessionIds: () => this.activeCalls.keys(),
+      hangup: (id) => this.ep?.hangup(id),
+      stopLoadMonitor: () => this.loadMonitor.stop(),
+      inferenceExecutor: this.inferenceExecutor ?? null,
+      closeHttpServer: () => {
+        if (this.httpServer) {
+          try { (this.httpServer as any).closeAllConnections?.(); } catch {}
+          this.httpServer.close();
+        }
+      },
+      shutdownEndpoint: () => this.ep?.shutdown(),
+    });
   }
 
   /**

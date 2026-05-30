@@ -23,6 +23,12 @@ Usage:
         ...
 
     server.run()
+
+Shutdown behavior (SIGINT/SIGTERM): the ``run()`` finally block hangs up
+active sessions, closes the Rust endpoint with a 2s timeout, then
+force-exits via ``os._exit(0)``. Flush recordings / observability uploads
+per-session (e.g., on ``on_client_disconnected``) since ``os._exit`` skips
+Python's normal finalization.
 """
 
 import asyncio
@@ -357,30 +363,77 @@ class SipServerTransport:
         if HAS_AIOHTTP and self._http_port:
             http_task = asyncio.create_task(self._run_http_server())
 
+        # Install SIGTERM handler so container stops hit the finally block.
+        # SIGINT is already turned into CancelledError by asyncio's default
+        # handler; SIGTERM without an explicit handler would kill abruptly.
+        import signal as _signal
+        stop = asyncio.Event()
+        for sig in (_signal.SIGINT, _signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+            except (NotImplementedError, ValueError):
+                pass  # Windows / non-main-thread / already handled
+        event_loop_task = asyncio.create_task(self._event_loop())
+        stop_task = asyncio.create_task(stop.wait())
+
         try:
-            await self._event_loop()
+            done, _pending = await asyncio.wait(
+                {event_loop_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # Surface any crash from the event loop task before we tear
+            # everything down — otherwise Python GC logs
+            # "Task exception was never retrieved" and we lose the signal.
+            if event_loop_task in done and not event_loop_task.cancelled():
+                exc = event_loop_task.exception()
+                if exc is not None:
+                    logger.error("SIP event loop crashed: {}", exc)
         except asyncio.CancelledError:
             pass
         except KeyboardInterrupt:
             pass
         finally:
-            if self._active_sessions:
-                logger.info("Draining {} active session(s)...", len(self._active_sessions))
+            # Hang up active calls first (parallel-ish, per session), then
+            # close the endpoint (which also cascade-hangs-up anything left
+            # and unregisters), then force-exit. Rust owns background threads
+            # that pin the process — os._exit is the only reliable way out.
+            import os as _os
+            import sys as _sys
+            try:
+                if self._ep is not None:
+                    for session_id in list(self._active_sessions.keys()):
+                        try:
+                            self._ep.hangup(session_id)
+                        except Exception:
+                            pass
                 for task in self._active_sessions.values():
                     task.cancel()
-                await asyncio.gather(*self._active_sessions.values(), return_exceptions=True)
-            if http_task:
-                http_task.cancel()
+                event_loop_task.cancel()
+                stop_task.cancel()
+                if http_task:
+                    http_task.cancel()
+                    try:
+                        await asyncio.wait_for(http_task, timeout=1.0)
+                    except Exception:
+                        pass
+                if self._ep is not None:
+                    try:
+                        await asyncio.wait_for(
+                            loop.run_in_executor(None, self._ep.shutdown),
+                            timeout=2.0,
+                        )
+                    except Exception:
+                        pass
+            finally:
+                logger.info("Server shut down")
+                # Flush stdio so the last log lines aren't lost —
+                # os._exit skips normal Python finalization.
                 try:
-                    await http_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            if self._ep:
-                try:
-                    await loop.run_in_executor(None, self._ep.shutdown)
+                    _sys.stdout.flush()
+                    _sys.stderr.flush()
                 except Exception:
                     pass
-            logger.info("Server shut down")
+                _os._exit(0)
 
     async def _event_loop(self) -> None:
         """Single event dispatcher — reads ALL events, routes to correct session.

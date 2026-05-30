@@ -49,3 +49,10 @@ recordings/
 # Python crate build artifacts
 crates/agent-transport-python/adapters/agent_transport/*.so
 crates/agent-transport-python/adapters/agent_transport/*.dylib*
+
+# Local npm pack output (for manual `file:` installs during testing)
+crates/agent-transport-node/agent-transport-*.tgz
+crates/agent-transport-node/npm/*/agent-transport-*.tgz
+
+# Claude Code worktrees (created by `/worktree` workflows)
+.claude/worktrees/

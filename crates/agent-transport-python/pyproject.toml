@@ -22,6 +22,10 @@ license = "MIT"
 livekit = ["aiohttp", "livekit-agents>=1.5.9,<2"]
 pipecat = ["pipecat-ai>=0.0.108"]
 all = ["agent-transport[livekit,pipecat]"]
+test = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [tool.maturin]
 features = []

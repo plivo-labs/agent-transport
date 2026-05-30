@@ -1,6 +1,10 @@
 /**
  * AudioStreamServer — Plivo audio streaming equivalent of AgentServer.
  *
+ * Shutdown behavior: same force-exit model as AgentServer — hangup active
+ * sessions, bounded cleanup, then `process.exit(0)`. Flush recordings /
+ * observability per-session, not at server shutdown.
+ *
  * No SIP credentials needed — Plivo connects to your WebSocket server.
  * Configure Plivo XML to return:
  *   <Response>
@@ -27,6 +31,7 @@ import { initializeLogger, InferenceRunner, runWithJobContext } from '@livekit/a
 import { AudioStreamJobContext } from './audio_stream_context.js';
 import { JobProcess } from './agent_server.js';
 import { closeSessionServices } from './_session_cleanup.js';
+import { runServerCleanup, withTimeout } from './_session_teardown.js';
 
 export interface AudioStreamServerOptions {
   listenAddr?: string;
@@ -236,33 +241,42 @@ export class AudioStreamServer {
     // shutdown — without this the infinite while loop pins libuv forever.
     const eventLoopDone = this.eventLoop();
 
-    // Wait for shutdown signal
-    await new Promise<void>((resolve) => {
-      const shutdown = async () => {
-        console.log('Shutting down...');
-        this.shutdownRequested = true;
-        // Drain active sessions with 10-second timeout
-        if (this.activeSessions.size > 0) {
-          console.log(`Draining ${this.activeSessions.size} active session(s)...`);
-          await Promise.race([
-            Promise.allSettled([...this.activeSessions.values()].map((s) => s.promise)),
-            new Promise<void>((r) => setTimeout(() => {
-              console.warn('Shutdown timeout reached (10s), forcing exit');
-              r();
-            }, 10000)),
-          ]);
+    // On signal: hang up everything, run critical cleanup with short
+    // timeouts, then process.exit. The Rust endpoint owns a background
+    // thread that pins libuv, so natural exit isn't reliable — we force it.
+    const onSignal = async () => {
+      try {
+        await this.runCleanup();
+      } finally {
+        process.exit(0);
+      }
+    };
+    process.once('SIGINT', onSignal);
+    process.once('SIGTERM', onSignal);
+    await eventLoopDone;
+  }
+
+  /**
+   * Hang up active sessions, drain ancillary resources with short timeouts.
+   *
+   * Thin wrapper around {@link runServerCleanup} so the signal-handler path
+   * stays a one-liner and tests can drive the shared cleanup helper without
+   * loading the native `agent-transport` binding.
+   */
+  async runCleanup(): Promise<void> {
+    this.shutdownRequested = true;
+    await runServerCleanup({
+      activeSessionIds: () => this.activeSessions.keys(),
+      hangup: (id) => this.ep?.hangup(id),
+      stopLoadMonitor: () => this.loadMonitor.stop(),
+      inferenceExecutor: this.inferenceExecutor ?? null,
+      closeHttpServer: () => {
+        if (this.httpServer) {
+          try { (this.httpServer as any).closeAllConnections?.(); } catch {}
+          this.httpServer.close();
         }
-        this.loadMonitor.stop();
-        if (this.httpServer) this.httpServer.close();
-        if (this.ep) this.ep.shutdown();
-        // Wait for the event loop to actually exit so Node releases its
-        // libuv handle. ep.shutdown() pushes a Shutdown sentinel that wakes
-        // the loop immediately.
-        await eventLoopDone;
-        resolve();
-      };
-      process.on('SIGINT', shutdown);
-      process.on('SIGTERM', shutdown);
+      },
+      shutdownEndpoint: () => this.ep?.shutdown(),
     });
   }
 

@@ -15,6 +15,21 @@ CLI commands (matching LiveKit):
     python agent.py start   — production mode (INFO logging)
     python agent.py dev     — development mode (DEBUG for adapters/pipeline)
     python agent.py debug   — full debug (including Rust SIP/RTP)
+
+Shutdown behavior (SIGINT/SIGTERM):
+    Active calls are hung up immediately; cleanup (inference executor,
+    HTTP server, Rust endpoint) is bounded by short timeouts. The process
+    then force-exits via ``os._exit(0)``. This is deliberate — natural exit
+    is unreliable because the Rust endpoint owns background threads that
+    can pin the process indefinitely.
+
+    Tradeoff: ``os._exit`` skips Python's normal finalization, so any
+    resources that rely on ``atexit`` handlers or per-session buffered I/O
+    must be flushed in the per-call teardown path (e.g., on the
+    ``"call_terminated"`` event), NOT at server shutdown. This includes:
+      - recording file writes (flush in session close handler)
+      - observability POSTs (await in session close handler)
+      - custom ``atexit`` hooks (won't run — migrate to per-session)
 """
 
 import asyncio
@@ -592,22 +607,56 @@ class AgentServer:
             loop.add_signal_handler(sig, stop.set)
 
         await stop.wait()
+        try:
+            await self._run_cleanup(runner, event_task, loop)
+        finally:
+            # Flush stdio so the last log lines aren't lost —
+            # os._exit skips normal Python finalization.
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
+            os._exit(0)
+
+    async def _run_cleanup(
+        self,
+        runner: "web.AppRunner",
+        event_task: asyncio.Task,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Hang up active calls, drain ancillary resources with short timeouts.
+
+        Split out of ``run()`` so the signal-handler path remains a thin
+        wrapper that adds ``os._exit(0)`` after this returns, while tests can
+        exercise the cleanup ordering directly.
+        """
         logger.info("Shutting down...")
+        if self._ep is not None:
+            for session_id in list(self._active_calls.keys()):
+                try:
+                    self._ep.hangup(session_id)
+                except Exception:
+                    pass
         event_task.cancel()
-
-        if self._active_calls:
-            logger.info("Draining %d active call(s)...", len(self._active_calls))
-            await asyncio.gather(*self._active_calls.values(), return_exceptions=True)
-
-        await runner.cleanup()
+        try:
+            await asyncio.wait_for(runner.cleanup(), timeout=2.0)
+        except Exception:
+            pass
         if self._inference_executor:
-            await self._inference_executor.aclose()
-        # Stop background threads cleanly before exiting.
+            try:
+                await asyncio.wait_for(self._inference_executor.aclose(), timeout=2.0)
+            except Exception:
+                pass
         self._load_monitor.stop()
-        # ep.shutdown() does block_on for unregister + per-call hangup. Wrap
-        # in run_in_executor so the asyncio loop isn't blocked for the
-        # ~200ms it takes to talk to the proxy.
-        await loop.run_in_executor(None, self._ep.shutdown)
+        if self._ep is not None:
+            try:
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, self._ep.shutdown),
+                    timeout=2.0,
+                )
+            except Exception:
+                pass
 
     def _configure_logging(self, mode: str) -> None:
         if mode == "debug":

@@ -24,6 +24,9 @@ CLI commands (matching LiveKit):
     python agent.py start   — production mode (INFO logging)
     python agent.py dev     — development mode (DEBUG for adapters/pipeline)
     python agent.py debug   — full debug (including Rust transport)
+
+Shutdown behavior: see ``server.py`` for the shutdown model. Same
+``os._exit(0)`` + per-session flush requirement applies here.
 """
 
 import asyncio
@@ -532,20 +535,56 @@ class AudioStreamServer:
             loop.add_signal_handler(sig, stop.set)
 
         await stop.wait()
+        try:
+            await self._run_cleanup(runner, event_task, loop)
+        finally:
+            # Flush stdio so the last log lines aren't lost —
+            # os._exit skips normal Python finalization.
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
+            os._exit(0)
+
+    async def _run_cleanup(
+        self,
+        runner: "web.AppRunner",
+        event_task: asyncio.Task,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Hang up active sessions, drain ancillary resources with short timeouts.
+
+        Split out of ``run()`` so the signal-handler path remains a thin
+        wrapper that adds ``os._exit(0)`` after this returns, while tests can
+        exercise the cleanup ordering directly.
+        """
         logger.info("Shutting down...")
+        if self._ep is not None:
+            for session_id in list(self._active_sessions.keys()):
+                try:
+                    self._ep.hangup(session_id)
+                except Exception:
+                    pass
         event_task.cancel()
-
-        if self._active_sessions:
-            logger.info("Draining %d active session(s)...", len(self._active_sessions))
-            await asyncio.gather(*self._active_sessions.values(), return_exceptions=True)
-
-        await runner.cleanup()
+        try:
+            await asyncio.wait_for(runner.cleanup(), timeout=2.0)
+        except Exception:
+            pass
         if self._inference_executor:
-            await self._inference_executor.aclose()
+            try:
+                await asyncio.wait_for(self._inference_executor.aclose(), timeout=2.0)
+            except Exception:
+                pass
         self._load_monitor.stop()
-        # ep.shutdown() does block_on for cancel + per-session hangup. Wrap
-        # in run_in_executor so the asyncio loop isn't blocked during teardown.
-        await loop.run_in_executor(None, self._ep.shutdown)
+        if self._ep is not None:
+            try:
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, self._ep.shutdown),
+                    timeout=2.0,
+                )
+            except Exception:
+                pass
 
     def _configure_logging(self, mode: str) -> None:
         if mode == "debug":
