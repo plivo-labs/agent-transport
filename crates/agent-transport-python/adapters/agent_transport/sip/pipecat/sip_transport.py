@@ -30,6 +30,7 @@ from typing import Any, Dict, Optional
 from loguru import logger
 
 from agent_transport._event_sink import _on_event_from_rust
+from agent_transport._executors import audio_io_executor
 from agent_transport._ffi_queue import GLOBAL_DICT
 
 try:
@@ -146,7 +147,7 @@ class SipInputTransport(BaseInputTransport):
             while self._started:
                 try:
                     result = await loop.run_in_executor(
-                        None, lambda: self._ep.recv_audio_bytes_blocking(self._cid, 20)
+                        audio_io_executor(), lambda: self._ep.recv_audio_bytes_blocking(self._cid, 20)
                     )
                 except Exception:
                     # Session ended (remote BYE removed the call from the
@@ -406,20 +407,25 @@ class SipOutputTransport(BaseOutputTransport):
             logger.warning("send_message via SIP INFO failed: {}", e)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        """Handle InterruptionFrame → clear Rust buffer BEFORE base class processing.
+        """Clear the local Rust buffer on interruption, then forward to base.
 
-        The base class cancels and restarts the MediaSender audio task. Clearing
-        the Rust buffer first ensures the new task doesn't race against stale
-        audio queued in Rust.
+        On SIP, ``clear_buffer`` is *local-only* — it clears the Rust audio
+        buffer and resets the resampler, with NO network signaling or
+        round-trip. (This is the key difference from the audio_stream
+        transport, where clear_buffer additionally sends ``clearAudio`` to
+        Plivo; cutting that mid-stream caused ~1.5s of silence on every
+        interrupt, so the audio_stream transport deliberately omits it and
+        relies on MediaSender task cancellation instead.)
 
-        ``clear_buffer`` is idempotent on terminated sessions (0.2.0
-        Terminated lifecycle short-circuits) so no defensive
-        ``try/except`` is needed — a raised exception now indicates a
-        real misuse (e.g. unknown session id).
+        Because the SIP clear is cheap and never touches the network, doing it
+        on barge-in is worth it: it immediately drops up to ~200ms of
+        already-buffered TTS instead of letting it play out after the caller
+        has interrupted, tightening barge-in latency. ``clear_buffer`` is
+        idempotent on terminated sessions (the 0.2.0 Terminated lifecycle
+        short-circuits), so no defensive try/except is needed.
         """
         if isinstance(frame, InterruptionFrame):
             self._ep.clear_buffer(self._cid)
-
         await super().process_frame(frame, direction)
 
     async def stop(self, frame: EndFrame):

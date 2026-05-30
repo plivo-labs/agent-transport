@@ -553,6 +553,9 @@ class TransportJobContextMixin:
         self._primary_agent_session = None
         self._shutdown_callbacks: list = []
         self._shutdown_callbacks_fired = False
+        # Strong refs to fire-and-forget async shutdown-callback tasks so the
+        # event loop doesn't GC them mid-run (asyncio holds only weak refs).
+        self._shutdown_tasks: set = set()
         self.session_directory = Path("/tmp/agent-sessions")
         self.session_directory.mkdir(parents=True, exist_ok=True)
         self.worker_id = "local"
@@ -766,14 +769,30 @@ class TransportJobContextMixin:
                 # shutdown() is synchronous per LiveKit's contract, so async
                 # user cleanup runs fire-and-forget on the running loop.
                 try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        task = loop.create_task(coro)
-                        task.add_done_callback(
-                            lambda t: t.exception() if not t.cancelled() else None
-                        )
-                except Exception:
-                    pass
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop is not None:
+                    self._spawn_retained(loop, coro)
+                else:
+                    coro.close()  # no loop to run it on — don't leak the coroutine
+
+    def _spawn_retained(self, loop: "asyncio.AbstractEventLoop", coro) -> None:
+        """Schedule ``coro`` fire-and-forget while holding a strong reference to
+        the task, so the event loop can't GC it before it finishes (asyncio keeps
+        only a weak ref to tasks). The task removes itself on completion and its
+        exception is retrieved so it's never flagged as unretrieved."""
+        if not hasattr(self, "_shutdown_tasks"):
+            self._shutdown_tasks = set()
+        task = loop.create_task(coro)
+        self._shutdown_tasks.add(task)
+
+        def _done(t: "asyncio.Task") -> None:
+            self._shutdown_tasks.discard(t)
+            if not t.cancelled():
+                t.exception()  # retrieve so it isn't reported as unretrieved
+
+        task.add_done_callback(_done)
 
     async def delete_room(self, room_name=""):
         """Drop the underlying SIP/audio_stream call.

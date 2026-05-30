@@ -42,6 +42,8 @@ from livekit import rtc
 from livekit.agents.voice.io import AudioInput
 from livekit.agents.voice.room_io._output import _ParticipantAudioOutput
 
+from agent_transport._executors import audio_io_executor
+
 from ._audio_source import TransportAudioSource
 from ._aio_utils import cancel_and_wait
 from ._channel import Chan
@@ -128,7 +130,7 @@ class TransportAudioInput(AudioInput):
             while not self._closed:
                 try:
                     result = await loop.run_in_executor(
-                        None,
+                        audio_io_executor(),
                         lambda: self._ep.recv_audio_bytes_blocking(self._sid, 20) if not self._closed else None,
                     )
                 except Exception as e:

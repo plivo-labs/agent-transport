@@ -30,6 +30,8 @@ from typing import Any, Dict, Optional
 
 from loguru import logger
 
+from agent_transport._executors import audio_io_executor
+
 try:
     from pipecat.audio.dtmf.types import KeypadEntry
     from pipecat.frames.frames import (
@@ -139,7 +141,7 @@ class AudioStreamInputTransport(BaseInputTransport):
             while self._started:
                 try:
                     result = await loop.run_in_executor(
-                        None, lambda: self._ep.recv_audio_bytes_blocking(self._sid, 20)
+                        audio_io_executor(), lambda: self._ep.recv_audio_bytes_blocking(self._sid, 20)
                     )
                 except Exception:
                     # Session ended (remote close removed the session from
@@ -389,21 +391,27 @@ class AudioStreamOutputTransport(BaseOutputTransport):
             logger.warning("send_message failed: {}", e)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        """Handle InterruptionFrame → clearAudio before base class processing.
+        """Forward to base class.
 
-        Sends clearAudio to Plivo (clears server-side buffer) and
-        clears the local AudioBuffer (cancels pending captures with
-        ``cancelled=true``). The base class then cancels and restarts
-        the MediaSender audio task.
+        Pipecat's BaseOutputTransport handles ``InterruptionFrame`` by
+        cancelling the MediaSender audio task — new frames stop being
+        pushed naturally and any audio already queued in our Rust
+        buffer (≤200ms threshold) plays out cleanly.
 
-        ``clear_buffer`` is idempotent on terminated sessions (0.2.0
-        Terminated lifecycle short-circuits) so no defensive
-        ``try/except`` is needed — a raised exception now indicates a
-        real misuse (e.g. unknown session id).
+        We deliberately do NOT call ``clear_buffer`` here. Calling it
+        sends a ``clearAudio`` command to Plivo unconditionally, which
+        cuts the caller's audio mid-stream every time pipecat fires an
+        InterruptionFrame — even when our local buffer is already
+        empty. With the typical pipecat-pipeline interrupt cadence,
+        that produced ~1.5s of silence on every interrupt while
+        waiting for new TTS to start.
+
+        LiveKit's ``_ParticipantAudioOutput`` solves the same problem
+        by using an ``_interrupted_event`` flag inside
+        ``_forward_audio`` to skip pending frames without dropping the
+        buffer; we get equivalent behaviour from pipecat's MediaSender
+        task cancellation.
         """
-        if isinstance(frame, InterruptionFrame):
-            self._ep.clear_buffer(self._sid)
-
         await super().process_frame(frame, direction)
 
     async def stop(self, frame: EndFrame):
@@ -550,6 +558,10 @@ class AudioStreamTransport(BaseTransport):
         Two-level clear:
         1. Local AudioBuffer cleared (fires pending completion callbacks)
         2. clearAudio sent to Plivo (clears server-side playback buffer)
+
+        Called explicitly by user code that needs a hard reset (e.g. a
+        skip / restart). NOT called on every ``InterruptionFrame`` —
+        see ``process_frame`` docstring for why.
         """
         self._ep.clear_buffer(self._sid)
 
