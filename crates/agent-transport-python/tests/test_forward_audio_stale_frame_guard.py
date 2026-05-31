@@ -1,38 +1,38 @@
 """Regression test for the `_forward_audio` stale-frame guard.
 
-Mirrors upstream `_ParticipantAudioOutput._forward_audio`
-(livekit/agents/voice/room_io/_output.py), which gates frame forwarding
-on BOTH `_interrupted_event.is_set()` AND `_pushed_duration == 0`.
+Mirrors upstream ``_ParticipantAudioOutput._forward_audio``
+(``livekit/agents/voice/room_io/_output.py``), which gates frame
+forwarding on BOTH ``_interrupted_event.is_set()`` AND
+``_pushed_duration == 0``.
 
-The `_pushed_duration == 0` branch protects against a specific race:
+The ``_pushed_duration == 0`` branch protects against a specific race:
 
-1. Speech handle 1 runs to completion: `_pushed_duration` accumulates
-   while frames are captured, then `_wait_for_playout` completes,
-   resets `_pushed_duration = 0`, and clears `_interrupted_event`.
-2. A stale frame for speech handle 1 was still sitting in `_audio_buf`
-   (the Chan) at the time the reset happened — e.g., because the
-   `_forward_audio` task was momentarily blocked or hadn't yet
-   consumed it. Could also come from preemptive generation queueing
-   into the bstream before the next `capture_frame` call.
-3. Without the `_pushed_duration == 0` check, `_forward_audio` would
-   wake up, see `_interrupted_event` cleared, see no interruption in
-   progress, and **replay the stale frame** as if it belonged to the
-   next turn.
-4. With the check, `_forward_audio` skips it because the field is
-   still zero (next turn hasn't started capturing yet).
+1. Speech handle 1 runs to completion: ``_pushed_duration`` accumulates
+   while frames are captured, then ``_wait_for_playout`` resets it
+   and clears ``_interrupted_event``.
+2. A stale frame for speech handle 1 was still sitting in ``_audio_buf``
+   when the reset happened.
+3. Without the ``_pushed_duration == 0`` check, ``_forward_audio`` would
+   wake up, see ``_interrupted_event`` cleared, and **replay the stale
+   frame** as if it belonged to the next turn.
+4. With the check, ``_forward_audio`` skips it because
+   ``_pushed_duration`` is still zero (next turn hasn't started yet).
 
-Previously `audio_stream_io.py` only checked `_interrupted_event.is_set()`
-and missed this case. This test pins both the SIP and audio_stream
-variants to upstream's behavior so neither regresses.
+Post-Tier-B (Pattern A inheritance), :class:`TransportAudioOutput`
+inherits ``_forward_audio`` directly from
+``_ParticipantAudioOutput`` — so the guard is automatically applied. This
+test pins both the runtime behavior and the source-level guard
+expression to detect upstream drift (next LiveKit upgrade) that would
+silently regress the safety net.
 """
 
 import asyncio
-import pytest
+import inspect
 
+import pytest
 from livekit import rtc
 
-from agent_transport.sip.livekit.audio_stream_io import AudioStreamOutput
-from agent_transport.sip.livekit.sip_io import SipAudioOutput
+from agent_transport.sip.livekit._audio_io import TransportAudioOutput
 
 
 class _RecordingAudioSource:
@@ -66,54 +66,44 @@ def _make_frame(samples: int = 160) -> rtc.AudioFrame:
     )
 
 
-def _bypass_init(cls):
-    """Create an *AudioOutput instance by bypassing __init__ so we don't need
-    a real endpoint / napi binding. Monkey-patch `on_playback_started` /
-    `on_playback_finished` to no-ops since the base class expects private
-    fields we didn't initialize.
+def _bypass_init() -> TransportAudioOutput:
+    """Construct a TransportAudioOutput without invoking
+    ``_ParticipantAudioOutput.__init__`` (which would allocate an FFI
+    handle for its orphan ``rtc.AudioSource``). Wire only the fields
+    ``_forward_audio`` touches.
     """
-    from agent_transport.sip.livekit._channel import Chan
+    from livekit.agents.utils.aio import Chan as _LkChan
 
-    t = cls.__new__(cls)
+    t = TransportAudioOutput.__new__(TransportAudioOutput)
     t._audio_source = _RecordingAudioSource()
-    t._audio_buf = Chan()
+    # LiveKit's _forward_audio uses ``async for frame in self._audio_buf``
+    # — must be ``utils.aio.Chan`` (LiveKit's), not our internal Chan.
+    t._audio_buf = _LkChan()
     t._playback_enabled = asyncio.Event()
     t._playback_enabled.set()
     t._interrupted_event = asyncio.Event()
     t._first_frame_event = asyncio.Event()
     t._flush_task = None
     t._pushed_duration = 0.0
-    # Base AudioOutput uses name-mangled private fields we haven't set up;
-    # stub out the callbacks so `on_playback_started` doesn't blow up when
-    # _forward_audio fires it on the first forwarded frame.
     t.on_playback_started = lambda *a, **kw: None
     t.on_playback_finished = lambda *a, **kw: None
     return t
 
 
-def _bypass_init_audio_stream():
-    return _bypass_init(AudioStreamOutput)
-
-
-def _bypass_init_sip():
-    return _bypass_init(SipAudioOutput)
-
-
 # ─── Tests ──────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
-async def test_audio_stream_skips_frame_when_pushed_duration_is_zero():
-    """AudioStreamOutput._forward_audio must skip frames while
-    `_pushed_duration == 0` — they belong to a speech handle that has
-    already been finalized (pushed_duration reset).
+async def test_skips_frame_when_pushed_duration_is_zero():
+    """``_forward_audio`` must skip frames while ``_pushed_duration == 0``
+    — they belong to a speech handle that has already been finalized
+    (its ``_wait_for_playout`` reset the field).
     """
-    t = _bypass_init_audio_stream()
-    # Pre-stage a stale frame with _pushed_duration = 0
+    t = _bypass_init()
     t._audio_buf.send_nowait(_make_frame())
 
     task = asyncio.create_task(t._forward_audio())
 
-    # Give the forward task a tick to consume the frame
     for _ in range(10):
         await asyncio.sleep(0.005)
         if t._audio_buf.empty():
@@ -123,8 +113,8 @@ async def test_audio_stream_skips_frame_when_pushed_duration_is_zero():
         "Stale frame should be skipped while _pushed_duration == 0"
     )
 
-    # Now simulate the next speech turn starting: pushed_duration non-zero
-    t._pushed_duration = 0.02  # one 20ms frame of new speech
+    # Next speech turn begins: _pushed_duration becomes non-zero.
+    t._pushed_duration = 0.02
     t._audio_buf.send_nowait(_make_frame())
     for _ in range(10):
         await asyncio.sleep(0.005)
@@ -135,49 +125,17 @@ async def test_audio_stream_skips_frame_when_pushed_duration_is_zero():
         "Frame should be forwarded once _pushed_duration is non-zero"
     )
 
-    # Cleanup
     t._audio_buf.close()
     await asyncio.wait_for(task, timeout=1.0)
 
 
 @pytest.mark.asyncio
-async def test_sip_skips_frame_when_pushed_duration_is_zero():
-    """Same guard on the SIP output transport — already implemented,
-    this is a guardrail against regression.
+async def test_skips_frame_while_interrupted():
+    """The other branch of the guard: frames are also skipped while
+    ``_interrupted_event`` is set. Keep working alongside the
+    pushed_duration guard.
     """
-    t = _bypass_init_sip()
-    t._audio_buf.send_nowait(_make_frame())
-
-    task = asyncio.create_task(t._forward_audio())
-
-    for _ in range(10):
-        await asyncio.sleep(0.005)
-        if t._audio_buf.empty():
-            break
-
-    assert t._audio_source.captured == [], (
-        "SipAudioOutput must skip frames while _pushed_duration == 0"
-    )
-
-    t._pushed_duration = 0.02
-    t._audio_buf.send_nowait(_make_frame())
-    for _ in range(10):
-        await asyncio.sleep(0.005)
-        if len(t._audio_source.captured) > 0:
-            break
-
-    assert len(t._audio_source.captured) == 1
-
-    t._audio_buf.close()
-    await asyncio.wait_for(task, timeout=1.0)
-
-
-@pytest.mark.asyncio
-async def test_audio_stream_skips_frame_while_interrupted():
-    """Existing behavior: frames are also skipped while `_interrupted_event`
-    is set. Keep this working alongside the new guard.
-    """
-    t = _bypass_init_audio_stream()
+    t = _bypass_init()
     t._pushed_duration = 0.02
     t._interrupted_event.set()
     t._audio_buf.send_nowait(_make_frame())
@@ -194,19 +152,15 @@ async def test_audio_stream_skips_frame_while_interrupted():
     await asyncio.wait_for(task, timeout=1.0)
 
 
-@pytest.mark.asyncio
-async def test_both_outputs_have_matching_forward_audio_guards():
-    """Guardrail: source-level check that both variants use the same
-    stale-frame guard. Failing this means the two implementations have
-    drifted out of sync again.
+def test_inherited_forward_audio_has_guard():
+    """Drift detector: source-level grep on the inherited ``_forward_audio``
+    confirms the guard expression is still present in LiveKit's base
+    class. Failing this is the canary that LiveKit's
+    ``_ParticipantAudioOutput`` has changed shape — review needed.
     """
-    import inspect
-    sip_src = inspect.getsource(SipAudioOutput._forward_audio)
-    as_src = inspect.getsource(AudioStreamOutput._forward_audio)
-    needle = "_interrupted_event.is_set() or self._pushed_duration == 0"
-    assert needle in sip_src, (
-        f"SipAudioOutput._forward_audio missing guard: {needle!r}"
-    )
-    assert needle in as_src, (
-        f"AudioStreamOutput._forward_audio missing guard: {needle!r}"
+    src = inspect.getsource(TransportAudioOutput._forward_audio)
+    needle = "self._interrupted_event.is_set() or self._pushed_duration == 0"
+    assert needle in src, (
+        "_ParticipantAudioOutput._forward_audio missing the stale-frame "
+        f"guard {needle!r} — LiveKit base class has drifted"
     )

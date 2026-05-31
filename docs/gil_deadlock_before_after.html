@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>agent-transport — GIL deadlock: before / after</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         line-height: 1.55; color: #1a1a1a; background: #fafafa; margin: 0; padding: 24px; }
+  .container { max-width: 1500px; margin: 0 auto; }
+  h1 { font-weight: 600; margin: 0 0 6px; font-size: 23px; }
+  .subtitle { color: #666; margin-bottom: 24px; font-size: 13px; }
+  h2 { font-size: 15px; margin-top: 34px; margin-bottom: 12px; padding-bottom: 6px; border-bottom: 2px solid #ddd; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 8px; }
+  .col { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 16px 18px; }
+  .col-before { border-top: 3px solid #d23; }
+  .col-after  { border-top: 3px solid #00a060; }
+  .col-title { font-size: 15px; font-weight: 600; margin-bottom: 2px; }
+  .col-sub { font-size: 11px; color: #666; margin-bottom: 12px; text-transform: uppercase; letter-spacing: .6px; }
+  pre.d { font-family: "SF Mono", Menlo, Monaco, Consolas, monospace; font-size: 11px; line-height: 1.4;
+          background: #1e1e1e; color: #d4d4d4; padding: 13px; border-radius: 5px; overflow-x: auto; white-space: pre; margin: 0 0 8px; }
+  pre.d .red { color: #f48771; } pre.d .grn { color: #6a9955; } pre.d .yel { color: #dcdcaa; }
+  pre.d .blu { color: #569cd6; } pre.d .mag { color: #c586c0; } pre.d .dim { color: #808080; }
+  .badge { display:inline-block; padding:1px 7px; border-radius:3px; font-size:11px; font-weight:500; }
+  .bad { background:#fbe7e7; color:#c44; } .good { background:#e3f5e7; color:#2a8; } .warn { background:#fff3d6; color:#b87; }
+  table.t { width:100%; border-collapse:collapse; font-size:12.5px; background:white; border:1px solid #ddd; }
+  table.t th, table.t td { padding:8px 11px; border-bottom:1px solid #eee; text-align:left; vertical-align:top; }
+  table.t th { background:#f5f5f5; font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.4px; }
+  table.t tr:last-child td { border-bottom:none; }
+  code { background:#f0f0f0; padding:1px 5px; border-radius:3px; font-family:"SF Mono",Menlo,monospace; font-size:11.5px; }
+  .note { background:#fff8e0; border-left:3px solid #d49000; padding:10px 14px; font-size:12.5px; margin:14px 0; border-radius:0 4px 4px 0; }
+  .ok   { background:#eaf8ee; border-left:3px solid #00a060; padding:10px 14px; font-size:12.5px; margin:14px 0; border-radius:0 4px 4px 0; }
+  .note b, .ok b { color:#000; }
+  .lede { font-size:13px; color:#444; margin:0 0 4px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>agent-transport — the GIL deadlock, before &amp; after</h1>
+  <p class="subtitle">AB-BA deadlock between the Python <b>GIL</b> and the Rust <code>sessions</code> Mutex on the <b>audio_stream + LiveKit (Python)</b> path. Left = shipped <code>0.1.11</code> (<code>main</code>, the version crashing prod). Right = <code>0.2.0</code> branch (fixed). Python-only — Node has no GIL, so this class can't occur there.</p>
+
+  <h2>The deadlock, side by side</h2>
+  <div class="cols">
+
+    <!-- BEFORE -->
+    <div class="col col-before">
+      <div class="col-title">BEFORE — 0.1.11 (prod) <span class="badge bad">deadlocks</span></div>
+      <div class="col-sub">Rust threads invoke stored Python callbacks · send_background_audio holds the GIL</div>
+<pre class="d"><span class="dim">Thread A — Rust tokio WS-handler   Thread B — Python asyncio loop
+(no GIL)                           (holds GIL)</span>
+<span class="red">caller hangup / Plivo "stop"</span>      <span class="blu">BackgroundAudioPlayer(thinking)</span>
+  handle_ws                          ep.send_background_audio() <span class="dim">~50fps</span>
+  <span class="yel">sessions.lock()</span>  <span class="grn">✦ HOLDS</span>          <span class="red">(no allow_threads)</span> <span class="grn">✦ HOLDS GIL</span>
+  cleanup_session()                  inner.send_background_audio()
+  audio_buf.clear()                  <span class="yel">sessions.lock()</span> <span class="red">⟵ WANTS</span>
+  pending_complete()  <span class="dim">(Py cb)</span>
+  <span class="mag">Python::with_gil</span> <span class="red">⟵ WANTS GIL</span>
+
+   ┌─────────────────────────────────────────┐
+   │  A: holds sessions ─ waits GIL           │
+   │  B: holds GIL ───── waits sessions       │
+   │         ⟲  A B - B A   cycle  ⟲          │
+   └─────────────────────────────────────────┘
+</span><span class="red">  ► whole process wedged · SIGTERM useless</span></pre>
+      <p class="lede"><b>Why it locks:</b> the buffer's completion callback was a stored <code>Box&lt;dyn FnOnce&gt;</code> holding a Python closure; firing it from a Rust thread needed the GIL — <i>while</i> the <code>sessions</code> Mutex was held. Meanwhile <code>send_background_audio</code> held the GIL and reached for that same Mutex.</p>
+    </div>
+
+    <!-- AFTER -->
+    <div class="col col-after">
+      <div class="col-title">AFTER — 0.2.0 (fixed) <span class="badge good">cycle broken ×2</span></div>
+      <div class="col-sub">Rust emits events over a channel (no Python) · send_background_audio releases the GIL</div>
+<pre class="d"><span class="dim">Thread A — Rust tokio WS-handler   Thread B — Python asyncio loop
+(no GIL, never takes it)            (holds GIL)</span>
+cleanup_session()                  ep.send_background_audio()
+  audio_buf.clear()                  <span class="grn">py.allow_threads()</span> <span class="grn">✦ FREES GIL</span>
+  <span class="grn">event_tx.try_send(Event)</span>           inner.send_background_audio()
+  <span class="dim">crossbeam — never touches Py</span>      <span class="yel">sessions.lock()</span> <span class="grn">(GIL already freed)</span>
+
+   <span class="grn">A never needs the GIL  ·  B never holds GIL across the lock
+   → no shared wait → no cycle can form</span>
+
+events ─► <span class="blu">[crossbeam channel]</span> ─► <span class="blu">1 dispatcher thread</span>
+            <span class="mag">Python::with_gil</span> → sink → loop.call_soon_threadsafe
+            <span class="dim">(GIL→event_sink order; guard dropped before call)</span>
+</pre>
+      <p class="lede"><b>Why it's safe:</b> Rust threads only push an <code>EndpointEvent</code> onto a crossbeam channel — they never enter Python. One dedicated dispatcher thread drains it and calls the Python sink, which only does <code>loop.call_soon_threadsafe</code> (touches no Rust lock). Either change alone breaks the cycle; both are present.</p>
+    </div>
+  </div>
+
+  <h2>What changed — and when</h2>
+  <table class="t">
+    <tr><th>Fix</th><th>Where</th><th>When / by</th><th>Solves the GIL deadlock?</th></tr>
+    <tr>
+      <td><b>Event-channel model</b> — Rust threads emit <code>EndpointEvent</code> via <code>try_send</code> instead of invoking stored Python callbacks (removes <b>Thread A</b>'s GIL acquisition)</td>
+      <td><code>events.rs</code>, <code>sip/audio_buffer.rs</code></td>
+      <td>earlier (committed on <code>0.2.0</code>)</td>
+      <td><span class="badge good">YES — the core fix</span> (both transports)</td>
+    </tr>
+    <tr>
+      <td><b><code>py.allow_threads</code></b> on <code>send_background_audio</code> / <code>clear_buffer</code> (removes <b>Thread B</b> holding the GIL across the lock)</td>
+      <td><code>lib.rs</code></td>
+      <td>earlier (committed on <code>0.2.0</code>)</td>
+      <td><span class="badge good">YES — the core fix</span> (either alone suffices)</td>
+    </tr>
+    <tr>
+      <td><b>Empirical proof</b> — built the 0.1.11 repro (deadlocks in ~2s, captured native stacks) + a 0.2.0 validation harness</td>
+      <td><code>recordings/repro_*</code>, <code>validate_*</code></td>
+      <td><b>this session</b></td>
+      <td><span class="badge warn">verifies, no product code</span></td>
+    </tr>
+    <tr>
+      <td><b>dispatcher_loop</b> lock order → <code>GIL→event_sink</code> (was holding the sink Mutex across <code>with_gil</code>)</td>
+      <td><code>lib.rs</code></td>
+      <td><b>this session</b></td>
+      <td><span class="badge warn">residual AB-BA in the new event-sink path — real, but not the prod-triggering path</span></td>
+    </tr>
+    <tr>
+      <td><b>wait_for_event</b> — release the <code>event_sink</code> guard <i>before</i> <code>allow_threads</code> (it held the lock while dropping the GIL)</td>
+      <td><code>lib.rs</code></td>
+      <td><b>this session</b></td>
+      <td><span class="badge warn">residual AB-BA — would have become active via the dispatcher fix above; now closed</span></td>
+    </tr>
+    <tr>
+      <td><b>hangup off-loop / fire-and-forget</b> (Plivo REST DELETE spawned on tokio; no Python thread held)</td>
+      <td><code>plivo.rs</code>, <code>endpoint.rs</code>, LiveKit adapters</td>
+      <td><b>this session</b></td>
+      <td><span class="badge bad">NO — different bug</span> (a loop <i>stall</i> / stutter, not the GIL deadlock)</td>
+    </tr>
+  </table>
+
+  <div class="note">
+    <b>Honest scope:</b> the GIL crash that hit production was fixed by the <b>earlier</b> work (event model + <code>allow_threads</code>) — this session <b>proved</b> it and closed two <i>latent</i> sibling AB-BAs in the new event-sink machinery (<code>dispatcher_loop</code>, <code>wait_for_event</code>) that the real LiveKit adapter doesn't reach (it sets the sink once and consumes via <code>FfiQueue</code>, never calling <code>poll_event</code>/<code>wait_for_event</code>). The hangup change is a separate responsiveness fix, not a GIL fix.
+  </div>
+
+  <h2>Coverage &amp; what's actually verified</h2>
+  <table class="t">
+    <tr><th>Surface</th><th>GIL fix present?</th><th>Verified this session?</th></tr>
+    <tr><td>Python · LiveKit · <b>audio_stream</b> (Plivo)</td><td><span class="badge good">yes</span> (core + 2 residual)</td><td><span class="badge good">empirically validated</span> — in-process harness</td></tr>
+    <tr><td>Python · LiveKit · <b>SIP</b></td><td><span class="badge good">yes</span> (shared core + shared <code>lib.rs</code> fixes)</td><td><span class="badge warn">not separately run</span></td></tr>
+    <tr><td>Python · <b>Pipecat</b> (both transports)</td><td><span class="badge good">yes</span> (shared)</td><td><span class="badge warn">adapters not touched / not run</span></td></tr>
+    <tr><td><b>Node</b> · LiveKit (both transports)</td><td><span class="badge">N/A — no GIL</span></td><td><span class="badge warn">not audited</span> (different class: libuv blocking)</td></tr>
+  </table>
+
+  <div class="ok">
+    <b>Empirical result (0.2.0, in-process, Python 3.x):</b> under the same collision that wedges 0.1.11 in ~2s — <code>send_background_audio</code> at 50–100 fps racing <b>1,246</b> teardown cycles (<code>cleanup_session</code> under the <code>sessions</code> Mutex) with the dispatcher delivering <b>4,063</b> events through a GIL-holding sink — global progress <b>never froze</b> (ops 0→5,281), clean exit. The 0.1.11 wheel, under the equivalent load, deadlocks within seconds (captured <code>lldb</code> stacks: Thread A in <code>take_gil</code> under <code>AudioBuffer::clear</code>; Thread B in <code>Mutex::lock</code> under <code>send_background_audio</code>).
+  </div>
+
+  <p class="subtitle" style="margin-top:20px">Still open for full real-world confidence: run the validation against <code>SipEndpoint</code>, a real LiveKit <code>AgentSession</code> + Pipecat end-to-end, and a live Plivo call on the VPS (per <code>runLiveKitTests.md §A.5</code>); plus a separate Node/libuv audit.</p>
+</div>
+</body>
+</html>

@@ -70,6 +70,29 @@ async def test_shutdown_fires_zero_arg_callback():
 
 
 @pytest.mark.asyncio
+async def test_shutdown_fires_sync_zero_arg_callback():
+    """Sync 0-arg callbacks must run without being awaited."""
+    ctx, _, ep = _make_ctx()
+    fired = []
+
+    def on_shutdown() -> None:
+        fired.append("called")
+
+    ctx.add_shutdown_callback(on_shutdown)
+    ctx.shutdown(reason="ignored-by-zero-arg-cb")
+
+    # The sync callback runs inline, but on 0.2.0 the hangup is dispatched
+    # OFF the loop (schedule_hangup -> control_executor thread pool), so one
+    # loop tick does not guarantee it has run. Poll until observed.
+    assert fired == ["called"]
+    for _ in range(200):
+        if ep.hangup_calls:
+            break
+        await asyncio.sleep(0.005)
+    assert ep.hangup_calls == ["call-42"]
+
+
+@pytest.mark.asyncio
 async def test_shutdown_tolerates_bad_callback():
     """A raising callback must not prevent other callbacks or the hangup."""
     ctx, _, ep = _make_ctx()
@@ -89,4 +112,22 @@ async def test_shutdown_tolerates_bad_callback():
     # Good callback ran even though the first raised.
     assert results == ["cleanup"]
     # Hangup still fired.
+    assert ep.hangup_calls == ["call-42"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_callbacks_fire_once():
+    """shutdown() and final cleanup must not dispatch callbacks twice."""
+    ctx, _, ep = _make_ctx()
+    received = []
+
+    async def on_shutdown(reason: str) -> None:
+        received.append(reason)
+
+    ctx.add_shutdown_callback(on_shutdown)
+    ctx.shutdown(reason="tool-requested")
+    await asyncio.sleep(0.05)
+    await ctx._run_shutdown_callbacks("call ended")
+
+    assert received == ["tool-requested"]
     assert ep.hangup_calls == ["call-42"]
