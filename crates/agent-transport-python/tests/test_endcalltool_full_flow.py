@@ -36,6 +36,23 @@ def _make_ctx():
     return _StubJobContext(room=room, agent_name="agent"), room, ep
 
 
+async def _poll(pred, timeout: float = 2.0):
+    """Wait until ``pred()`` is truthy.
+
+    ``shutdown()`` dispatches the hangup OFF the event loop (``schedule_hangup``
+    -> ``control_executor`` thread pool), so the hangup is NOT observable on the
+    next loop tick. A fixed ``asyncio.sleep`` races the executor thread and is
+    flaky on slow/contended CI — poll the observable state instead.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if pred():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError(f"condition not met within {timeout}s")
+
+
 @pytest.mark.asyncio
 async def test_shutdown_fires_one_arg_callback_with_reason():
     ctx, _, ep = _make_ctx()
@@ -46,11 +63,8 @@ async def test_shutdown_fires_one_arg_callback_with_reason():
 
     ctx.add_shutdown_callback(on_shutdown)
     ctx.shutdown(reason="user-requested")
-    # shutdown() schedules the async callback; yield to let it run.
-    await asyncio.sleep(0.05)
-
-    assert received == ["user-requested"]
-    assert ep.hangup_calls == ["call-42"]
+    # callback runs on the loop; hangup is dispatched off-loop — poll for both.
+    await _poll(lambda: received == ["user-requested"] and ep.hangup_calls == ["call-42"])
 
 
 @pytest.mark.asyncio
@@ -65,8 +79,9 @@ async def test_shutdown_fires_zero_arg_callback():
     ctx.add_shutdown_callback(on_shutdown)
     ctx.shutdown(reason="ignored-by-zero-arg-cb")
     await asyncio.wait_for(fired.wait(), timeout=1.0)
-
-    assert ep.hangup_calls == ["call-42"]
+    # callback fired, but the hangup is dispatched off-loop (control_executor) —
+    # the callback firing does NOT imply the hangup thread has run yet. Poll.
+    await _poll(lambda: ep.hangup_calls == ["call-42"])
 
 
 @pytest.mark.asyncio
@@ -107,12 +122,9 @@ async def test_shutdown_tolerates_bad_callback():
     ctx.add_shutdown_callback(bad)
     ctx.add_shutdown_callback(good)
     ctx.shutdown(reason="cleanup")
-    await asyncio.sleep(0.05)
-
-    # Good callback ran even though the first raised.
-    assert results == ["cleanup"]
-    # Hangup still fired.
-    assert ep.hangup_calls == ["call-42"]
+    # Good callback ran even though the first raised; hangup still fired
+    # (off-loop) — poll for both rather than racing a fixed sleep.
+    await _poll(lambda: results == ["cleanup"] and ep.hangup_calls == ["call-42"])
 
 
 @pytest.mark.asyncio
@@ -126,8 +138,10 @@ async def test_shutdown_callbacks_fire_once():
 
     ctx.add_shutdown_callback(on_shutdown)
     ctx.shutdown(reason="tool-requested")
-    await asyncio.sleep(0.05)
-    await ctx._run_shutdown_callbacks("call ended")
+    # Wait for the first dispatch (callback on-loop, hangup off-loop) to land.
+    await _poll(lambda: received == ["tool-requested"] and ep.hangup_calls == ["call-42"])
+    await ctx._run_shutdown_callbacks("call ended")  # second dispatch must be a no-op
+    await asyncio.sleep(0.05)  # give any erroneous re-dispatch a chance to (not) run
 
-    assert received == ["tool-requested"]
+    assert received == ["tool-requested"]  # fired exactly once
     assert ep.hangup_calls == ["call-42"]
