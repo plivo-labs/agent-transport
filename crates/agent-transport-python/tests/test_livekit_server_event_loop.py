@@ -1,175 +1,204 @@
-"""Regression tests for livekit server event loop handler exception isolation.
+"""Regression tests for the livekit server lifecycle loop.
 
-Both audio_stream_server.py and server.py had `while True:` dispatchers
-where exceptions inside event handlers (e.g., KeyError, AttributeError)
-propagated out and silently killed the event_task. The main thread would
-wait on stop.wait() indefinitely, completely unaware the server was dead.
+Post-Tier-A, both ``audio_stream_server.py`` and ``server.py`` consume
+``FfiEvent`` objects off the process-global ``FfiQueue`` (mirroring
+LiveKit's ``FfiClient.instance.queue`` pattern). The Rust dispatcher
+thread spawned by ``set_event_sink`` translates each ``EndpointEvent``
+into the corresponding ``FfiEvent`` and ``GLOBAL.put``s on the asyncio
+loop. ``_lifecycle_loop`` subscribes to ``GLOBAL`` with a filter
+narrowing to room/transport events.
 
-These tests exercise the _event_loop methods directly against a fake
-endpoint that injects events (including malformed ones) and verify the
-loop keeps dispatching.
+The tests below run ``_lifecycle_loop`` against a swapped-in ``FfiQueue``
+(via ``_ffi_queue.set_global``), inject FfiEvents directly, and verify
+the dispatcher keeps running even when one event's handler raises.
 """
 
 import asyncio
 import pytest
 
+from agent_transport import _ffi_queue as _ffi
+from agent_transport._event import (
+    FfiEvent,
+    ParticipantConnected,
+    ParticipantDisconnected,
+    ParticipantInfo,
+    RoomEvent,
+)
 
-# Import lazily inside fixtures to avoid loading the whole module if
-# optional deps are missing.
 
+class FakeEndpoint:
+    """Minimal endpoint stand-in for the lifecycle-loop tests.
 
-class FakeEventEndpoint:
-    """Fake endpoint with an injectable event queue for wait_for_event."""
+    Real ``_lifecycle_loop`` only calls ``ep.clear_buffer`` on
+    ``participant_disconnected``; everything else flows through GLOBAL.
+    """
 
     def __init__(self):
-        self._events = []
-        self._idx = 0
-        self.answer_calls = 0
         self.clear_buffer_calls = 0
-        self.shutdown_flag = False
-
-    def push_event(self, ev):
-        self._events.append(ev)
-
-    def wait_for_event(self, timeout_ms):
-        # Called via run_in_executor → blocking API
-        if self.shutdown_flag:
-            return None
-        if self._idx < len(self._events):
-            ev = self._events[self._idx]
-            self._idx += 1
-            return ev
-        # Simulate a timeout tick
-        import time
-        time.sleep(timeout_ms / 1000.0)
-        return None
-
-    def answer(self, session_id):
-        self.answer_calls += 1
 
     def clear_buffer(self, session_id):
         self.clear_buffer_calls += 1
 
-    def hangup(self, session_id): pass
-    def shutdown(self): self.shutdown_flag = True
+
+@pytest.fixture
+def isolated_global():
+    """Swap GLOBAL for a fresh FfiQueue so the lifecycle loop reads only
+    events the test pushed. Restored on teardown."""
+    saved = _ffi.get_global()
+    fresh = _ffi.FfiQueue()
+    _ffi.set_global(fresh)
+    # The audio_stream_server / server import GLOBAL at module load,
+    # so we need to re-bind their module-level reference too.
+    from agent_transport.sip.livekit import audio_stream_server, server
+    audio_stream_server.GLOBAL = fresh
+    server.GLOBAL = fresh
+    yield fresh
+    _ffi.set_global(saved)
+    audio_stream_server.GLOBAL = saved
+    server.GLOBAL = saved
 
 
-class _FakeSession:
-    def __init__(self, session_id, remote_uri="sip:caller@x"):
-        self.session_id = session_id
-        self.remote_uri = remote_uri
-        self.local_uri = "stream-id-1"
-        self.extra_headers = {}
+def _ev_participant_connected(session_id: str) -> FfiEvent:
+    return FfiEvent(
+        room_event=RoomEvent(
+            room_handle=session_id,
+            participant_connected=ParticipantConnected(
+                info=ParticipantInfo(
+                    identity=f"sip:caller-{session_id}@x",
+                    session_id=session_id,
+                    stream_id=f"stream-{session_id}",
+                ),
+            ),
+        )
+    )
+
+
+def _ev_participant_disconnected(session_id: str) -> FfiEvent:
+    return FfiEvent(
+        room_event=RoomEvent(
+            room_handle=session_id,
+            participant_disconnected=ParticipantDisconnected(
+                participant_identity=f"sip:caller-{session_id}@x",
+                disconnect_reason=1,
+                session_id=session_id,
+                reason="test",
+            ),
+        )
+    )
 
 
 @pytest.mark.asyncio
-async def test_audio_stream_server_event_loop_survives_handler_exception():
-    """Regression: handler exception must not kill the dispatcher.
+async def test_audio_stream_server_lifecycle_loop_survives_handler_exception(isolated_global):
+    """Handler exception must not kill the dispatcher.
 
-    We inject a sequence of events where one causes a handler exception
-    (the 'call_terminated' dispatch path touches ctx._room which raises),
-    and verify that a subsequent event is still processed.
+    Inject a sequence where one event's handler attribute-touches a
+    broken context and raises; the loop must keep dispatching.
     """
     from agent_transport.sip.livekit.audio_stream_server import AudioStreamServer
 
     srv = AudioStreamServer.__new__(AudioStreamServer)
-    srv._ep = FakeEventEndpoint()
+    srv._ep = FakeEndpoint()
     srv._session_contexts = {}
     srv._session_ended_events = {}
+    srv._active_sessions = {}
+    srv._background_tasks = set()
 
-    # Craft a context whose attribute access raises — to force an
-    # exception inside the call_terminated handler branch.
     class BrokenCtx:
         def __getattr__(self, name):
             raise RuntimeError("simulated ctx failure")
 
+    # We dispatch participant_connected for "session-A" (creates a
+    # background task that immediately fails because _start_session
+    # isn't wired — that failure is observed via background_tasks).
+    # Then participant_disconnected for "session-dead" whose context's
+    # event lookup raises — exception must be caught. Then
+    # participant_connected for "session-B" — must still be processed.
     srv._session_contexts["session-dead"] = BrokenCtx()
+    # Replace _start_session with a sentinel that records the call but
+    # doesn't actually start a session. We assert against this list to
+    # confirm the loop kept dispatching past the broken-ctx event.
+    started = []
 
-    # Push events (post-refactor event names):
-    #   1. call_answered (normal)
-    #   2. call_terminated (triggers BrokenCtx attribute access → exception)
-    #   3. call_answered (must still be processed after #2 raised)
-    srv._active_sessions = {}
-    srv._background_tasks = set()
-    srv._ep.push_event({
-        "type": "call_answered",
-        "session": _FakeSession("session-A"),
-    })
-    srv._ep.push_event({
-        "type": "call_terminated",
-        "session": _FakeSession("session-dead"),
-        "reason": "test",
-    })
-    srv._ep.push_event({
-        "type": "call_answered",
-        "session": _FakeSession("session-B"),
-    })
+    async def _stub_start(session_id, *a, **k):
+        srv._active_sessions[session_id] = asyncio.current_task()
+        started.append(session_id)
+    srv._start_session = _stub_start
 
-    loop_task = asyncio.create_task(srv._event_loop())
+    loop_task = asyncio.create_task(srv._lifecycle_loop())
+    # Give the subscribe a tick to register.
+    await asyncio.sleep(0.01)
 
-    # Poll until we've seen the events we care about
+    isolated_global.put(_ev_participant_connected("session-A"))
+    isolated_global.put(_ev_participant_disconnected("session-dead"))
+    isolated_global.put(_ev_participant_connected("session-B"))
+
+    # Wait until both participant_connected events get processed.
     for _ in range(50):
         await asyncio.sleep(0.02)
-        # Count incoming events via the fake endpoint idx
-        if srv._ep._idx >= 3:
+        if "session-A" in started and "session-B" in started:
             break
 
-    # Stop the loop
-    srv._ep.shutdown_flag = True
     loop_task.cancel()
     try:
-        await asyncio.wait_for(loop_task, timeout=2.0)
+        await asyncio.wait_for(loop_task, timeout=1.0)
     except (asyncio.CancelledError, asyncio.TimeoutError):
         pass
 
-    # All three events must have been pulled — exception on #2 did not
-    # prevent #3 from being processed.
-    assert srv._ep._idx == 3, f"processed only {srv._ep._idx}/3 events"
+    assert "session-A" in started
+    assert "session-B" in started, (
+        "lifecycle loop died after the broken participant_disconnected — "
+        "session-B was never processed"
+    )
 
 
 @pytest.mark.asyncio
-async def test_sip_server_event_loop_survives_handler_exception():
-    """Same regression test for the SIP (non-audio_stream) server."""
+async def test_sip_server_lifecycle_loop_survives_handler_exception(isolated_global):
+    """Same regression test for the SIP server. We trigger a broken
+    handler via ``participant_disconnected`` whose registered ctx
+    raises on attribute access, then verify subsequent events still get
+    dispatched.
+    """
     from agent_transport.sip.livekit.server import AgentServer
 
     srv = AgentServer.__new__(AgentServer)
-    srv._ep = FakeEventEndpoint()
+    srv._ep = FakeEndpoint()
     srv._call_contexts = {}
     srv._call_ended_events = {}
+    srv._active_calls = {}
+    srv._background_tasks = set()
+    srv._outbound_session_ids = set()
+    srv._server_listeners = {}
 
     class BrokenCtx:
         def __getattr__(self, name):
             raise RuntimeError("simulated ctx failure")
 
     srv._call_contexts["call-dead"] = BrokenCtx()
+    started = []
 
-    srv._ep.push_event({
-        "type": "call_terminated",
-        "session": _FakeSession("call-dead"),
-        "reason": "test",
-    })
-    srv._ep.push_event({
-        "type": "dtmf_received",
-        "session_id": "call-X",
-        "digit": "5",
-    })
-    srv._ep.push_event({
-        "type": "beep_timeout",
-        "session_id": "call-X",
-    })
+    async def _stub_start(session_id, *a, **k):
+        srv._active_calls[session_id] = asyncio.current_task()
+        started.append(session_id)
+    srv._start_call = _stub_start
 
-    loop_task = asyncio.create_task(srv._sip_event_loop())
+    loop_task = asyncio.create_task(srv._lifecycle_loop())
+    await asyncio.sleep(0.01)
+
+    isolated_global.put(_ev_participant_disconnected("call-dead"))
+    isolated_global.put(_ev_participant_connected("call-X"))
+    # And one more so we can verify the loop is still alive
+    isolated_global.put(_ev_participant_connected("call-Y"))
 
     for _ in range(50):
         await asyncio.sleep(0.02)
-        if srv._ep._idx >= 3:
+        if "call-X" in started and "call-Y" in started:
             break
 
-    srv._ep.shutdown_flag = True
     loop_task.cancel()
     try:
-        await asyncio.wait_for(loop_task, timeout=2.0)
+        await asyncio.wait_for(loop_task, timeout=1.0)
     except (asyncio.CancelledError, asyncio.TimeoutError):
         pass
 
-    assert srv._ep._idx == 3, f"processed only {srv._ep._idx}/3 events"
+    assert "call-X" in started
+    assert "call-Y" in started

@@ -10,7 +10,9 @@ All audio codec/resampling/pacing is handled in Rust. Python only bridges frames
 
 Frame handling:
 - OutputAudioRawFrame → send_audio_notify (Rust backpressure + 20ms send loop pacing)
-- InterruptionFrame → clear_buffer (sends clearAudio to Plivo)
+- InterruptionFrame → handled by BaseOutputTransport's MediaSender task
+  cancellation (we deliberately do NOT send clearAudio to Plivo; see
+  process_frame below for why)
 - OutputDTMFFrame → send_dtmf (sends sendDTMF to Plivo)
 - OutputTransportMessageFrame → send_raw_message (JSON pass-through over WS)
 - EndFrame/CancelFrame → hangup (REST API DELETE)
@@ -30,13 +32,13 @@ from typing import Any, Dict, Optional
 
 from loguru import logger
 
+from agent_transport._executors import audio_io_executor
+
 try:
     from pipecat.audio.dtmf.types import KeypadEntry
     from pipecat.frames.frames import (
         CancelFrame, EndFrame, Frame, InputAudioRawFrame,
-        InputDTMFFrame, InterruptionFrame, OutputAudioRawFrame,
-        OutputTransportMessageFrame, OutputTransportMessageUrgentFrame,
-        StartFrame, StopFrame,
+        InputDTMFFrame, OutputAudioRawFrame, StartFrame,
     )
     from pipecat.processors.frame_processor import FrameDirection
     from pipecat.transports.base_input import BaseInputTransport
@@ -139,7 +141,7 @@ class AudioStreamInputTransport(BaseInputTransport):
             while self._started:
                 try:
                     result = await loop.run_in_executor(
-                        None, lambda: self._ep.recv_audio_bytes_blocking(self._sid, 20)
+                        audio_io_executor(), lambda: self._ep.recv_audio_bytes_blocking(self._sid, 20)
                     )
                 except Exception:
                     # Session ended (remote close removed the session from
@@ -183,22 +185,40 @@ class AudioStreamInputTransport(BaseInputTransport):
                 logger.exception("AudioStreamInputTransport handler failed for event %r", event.get("type") if isinstance(event, dict) else event)
 
     async def _event_loop_from_endpoint(self):
-        """Poll events directly from endpoint (standalone, no server)."""
-        loop = asyncio.get_running_loop()
-        while self._started:
-            try:
-                event = await loop.run_in_executor(
-                    None, lambda: self._ep.wait_for_event(timeout_ms=100)
-                )
-            except Exception as e:
-                logger.debug("AudioStreamInputTransport endpoint event_loop error: {}", e)
-                break
-            if event is None:
-                continue
-            try:
-                await self._handle_event(event)
-            except Exception:
-                logger.exception("AudioStreamInputTransport handler failed for event %r", event.get("type") if isinstance(event, dict) else event)
+        """Subscribe to GLOBAL_DICT for events on our session id.
+
+        Used when this transport is constructed without a server (no
+        ``_event_queue`` provided) — standalone tests / dev setups.
+        """
+        from agent_transport._event_sink import _on_event_from_rust
+        from agent_transport._ffi_queue import GLOBAL_DICT
+        # Install the shared sink (idempotent across endpoint instances).
+        try:
+            self._ep.set_event_sink(_on_event_from_rust)
+        except Exception:
+            logger.debug("set_event_sink failed (already installed?)", exc_info=True)
+
+        sid = self._sid
+
+        def _is_ours(e: dict) -> bool:
+            return e.get("session_id") == sid
+
+        queue = GLOBAL_DICT.subscribe(filter_fn=_is_ours)
+        try:
+            while self._started:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    logger.debug("AudioStreamInputTransport endpoint event_loop error: {}", e)
+                    break
+                try:
+                    await self._handle_event(event)
+                except Exception:
+                    logger.exception("AudioStreamInputTransport handler failed for event %r", event.get("type") if isinstance(event, dict) else event)
+        finally:
+            GLOBAL_DICT.unsubscribe(queue)
 
     async def _handle_event(self, event):
         """Process a single event."""
@@ -216,6 +236,16 @@ class AudioStreamInputTransport(BaseInputTransport):
             )
         elif event_type == "beep_timeout":
             await self._transport._call_event_handler("on_beep_timeout")
+        elif event_type in (
+            "audio_capture_complete",
+            "audio_playout_complete",
+            "audio_buffer_drained",
+            "audio_capture_error",
+        ):
+            # LiveKit-faithful FfiQueue dispatch: every async_id event
+            # goes into the shared transport broker. OutputTransport
+            # subscribes per-frame inside write_audio_frame.
+            self._transport._events.put(event)
 
 
 # ─── Output Transport ───────────────────────────────────────────────────────
@@ -260,6 +290,15 @@ class AudioStreamOutputTransport(BaseOutputTransport):
         self._sid = session_id
         self._transport = transport
         self._started = False
+        # FfiQueue lives on self._transport (one per AudioStreamTransport
+        # instance, shared by Input + Output). InputTransport puts;
+        # OutputTransport subscribes per-frame.
+        from agent_transport._ffi_queue import (
+            ASYNC_ID_EVENT_TYPES as _ASYNC_ID_EVENT_TYPES,
+            DEFAULT_WAIT_TIMEOUT as _DEFAULT_WAIT_TIMEOUT,
+        )
+        self._async_id_event_types = _ASYNC_ID_EVENT_TYPES
+        self._wait_timeout = _DEFAULT_WAIT_TIMEOUT
 
     async def start(self, frame: StartFrame):
         if self._started:
@@ -278,43 +317,51 @@ class AudioStreamOutputTransport(BaseOutputTransport):
         await loop.run_in_executor(None, lambda: self._ep.send_dtmf(self._sid, digit))
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
-        """Send audio frame to audio stream with Rust backpressure.
+        """Send audio frame with LiveKit-faithful subscribe-before-request.
 
-        Audio pacing is handled entirely in Rust (20ms tokio::time::interval).
-        Python pushes frames as fast as Rust can accept them:
-        1. Push audio to Rust buffer via send_audio_notify with callback
-        2. If buffer below threshold, callback fires immediately → return
-        3. If above threshold, callback deferred until send loop drains
-        4. Callback resolves Future via call_soon_threadsafe → return
-        No asyncio.sleep — no jitter, no underruns.
+        Subscribe → call send_audio_async → wait_for(predicate) →
+        unsubscribe (finally). The subscribe happens BEFORE the FFI call
+        so an immediate-emit completion event lands in our Queue.
         """
-        capture_fut = self._loop.create_future()
+        sid = self._sid
 
-        def _on_complete():
-            def _resolve():
-                if not capture_fut.done():
-                    capture_fut.set_result(None)
-            try:
-                self._loop.call_soon_threadsafe(_resolve)
-            except RuntimeError:
-                if not capture_fut.done():
-                    try:
-                        capture_fut.set_result(None)
-                    except Exception:
-                        pass
-
-        try:
-            self._ep.send_audio_notify(
-                self._sid,
-                frame.audio,
-                frame.sample_rate,
-                frame.num_channels,
-                _on_complete,
+        def _is_ours(e: dict) -> bool:
+            return (
+                e.get("type") in self._async_id_event_types
+                and e.get("session_id") == sid
             )
-        except Exception:
-            return False
 
-        await capture_fut
+        queue = self._transport._events.subscribe(
+            loop=asyncio.get_running_loop(),
+            filter_fn=_is_ours,
+        )
+        try:
+            try:
+                async_id = self._ep.send_audio_async(
+                    self._sid,
+                    frame.audio,
+                    frame.sample_rate,
+                    frame.num_channels,
+                )
+            except Exception:
+                return False
+            try:
+                ev = await queue.wait_for(
+                    lambda e: e.get("async_id") == async_id,
+                    timeout=self._wait_timeout,
+                )
+            except asyncio.TimeoutError:
+                return False
+        finally:
+            self._transport._events.unsubscribe(queue)
+
+        if ev.get("type") == "audio_capture_error" or ev.get("cancelled"):
+            # Either a real error (audio_capture_error with non-empty
+            # reason) or a clear-induced silent discard (Rust emits
+            # AudioCaptureComplete with cancelled=true on clear_buffer).
+            # Both mean the frame did NOT reach the wire — surface that
+            # to pipecat's MediaSender via the `False` return.
+            return False
         return True
 
     def queued_frames(self) -> int:
@@ -344,34 +391,39 @@ class AudioStreamOutputTransport(BaseOutputTransport):
             logger.warning("send_message failed: {}", e)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        """Handle InterruptionFrame → clearAudio before base class processing.
+        """Forward to base class.
 
-        Sends clearAudio to Plivo (clears server-side buffer) and clears the
-        local AudioBuffer (fires pending completion callbacks). The base class
-        then cancels and restarts the MediaSender audio task.
+        Pipecat's BaseOutputTransport handles ``InterruptionFrame`` by
+        cancelling the MediaSender audio task — new frames stop being
+        pushed naturally and any audio already queued in our Rust
+        buffer (≤200ms threshold) plays out cleanly.
+
+        We deliberately do NOT call ``clear_buffer`` here. Calling it
+        sends a ``clearAudio`` command to Plivo unconditionally, which
+        cuts the caller's audio mid-stream every time pipecat fires an
+        InterruptionFrame — even when our local buffer is already
+        empty. With the typical pipecat-pipeline interrupt cadence,
+        that produced ~1.5s of silence on every interrupt while
+        waiting for new TTS to start.
+
+        LiveKit's ``_ParticipantAudioOutput`` solves the same problem
+        by using an ``_interrupted_event`` flag inside
+        ``_forward_audio`` to skip pending frames without dropping the
+        buffer; we get equivalent behaviour from pipecat's MediaSender
+        task cancellation.
         """
-        if isinstance(frame, InterruptionFrame):
-            try:
-                self._ep.clear_buffer(self._sid)
-            except Exception as e:
-                logger.debug("clear_buffer on interruption failed: {}", e)
-
         await super().process_frame(frame, direction)
 
     async def stop(self, frame: EndFrame):
+        # ``hangup`` is idempotent on terminated sessions. No
+        # try/except needed.
         loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(None, lambda: self._ep.hangup(self._sid))
-        except Exception as e:
-            logger.debug("hangup on stop failed: {}", e)
+        await loop.run_in_executor(None, lambda: self._ep.hangup(self._sid))
         await super().stop(frame)
 
     async def cancel(self, frame: CancelFrame):
         loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(None, lambda: self._ep.hangup(self._sid))
-        except Exception as e:
-            logger.debug("hangup on cancel failed: {}", e)
+        await loop.run_in_executor(None, lambda: self._ep.hangup(self._sid))
         await super().cancel(frame)
 
 
@@ -427,6 +479,11 @@ class AudioStreamTransport(BaseTransport):
         self._params = params
         self._session_data = session_data or {}
         self._event_queue = _event_queue  # per-session queue from server
+        # Shared FfiQueue for this transport — InputTransport's event
+        # loop puts async_id events into it; OutputTransport subscribes
+        # per-frame.
+        from agent_transport._ffi_queue import FfiQueue
+        self._events: FfiQueue = FfiQueue()
         self._input: Optional[AudioStreamInputTransport] = None
         self._output: Optional[AudioStreamOutputTransport] = None
 
@@ -501,6 +558,10 @@ class AudioStreamTransport(BaseTransport):
         Two-level clear:
         1. Local AudioBuffer cleared (fires pending completion callbacks)
         2. clearAudio sent to Plivo (clears server-side playback buffer)
+
+        Called explicitly by user code that needs a hard reset (e.g. a
+        skip / restart). NOT called on every ``InterruptionFrame`` —
+        see ``process_frame`` docstring for why.
         """
         self._ep.clear_buffer(self._sid)
 

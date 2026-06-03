@@ -86,9 +86,9 @@ class Assistant(Agent):
             # - send_dtmf_events: works via Room facade
             # - EndCallTool: beta tool that ends the call when the user says
             #   goodbye. Hooks into job_ctx.shutdown() + job_ctx.delete_room(),
-            #   both of which we implement on _StubJobContext. Uses
-            #   speech_handle.add_done_callback so the goodbye plays fully
-            #   before the session closes.
+            #   both of which the JobContext implements (via
+            #   TransportJobContextMixin). Uses speech_handle.add_done_callback
+            #   so the goodbye plays fully before the session closes.
             tools=[send_dtmf_events, EndCallTool()],
         )
 

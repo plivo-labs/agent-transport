@@ -4,6 +4,13 @@
  * Handles SIP registration, call routing, HTTP server (health/worker/metrics/call),
  * CLI (start/dev/debug), and call lifecycle management.
  *
+ * Shutdown behavior (SIGINT/SIGTERM): active calls are hung up, cleanup is
+ * bounded by short timeouts, then the process force-exits via
+ * `process.exit(0)`. The Rust endpoint owns background threads that can pin
+ * libuv, so natural exit isn't reliable. Flush recordings / observability
+ * POSTs per-session (e.g., from `ctx.session.on("close", ...)`) — NOT at
+ * server shutdown.
+ *
  * Usage:
  *   const server = new AgentServer({ sipUsername: '...', sipPassword: '...' });
  *
@@ -15,16 +22,20 @@
  *   server.run();
  */
 
-import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer, type Server, type IncomingMessage } from 'node:http';
 import { cpus } from 'node:os';
 import { hostname } from 'node:os';
 import { mkdirSync } from 'node:fs';
 import { SipEndpoint } from 'agent-transport';
-import { initializeLogger, InferenceRunner, runWithJobContext, log as agentLog, voice } from '@livekit/agents';
+import { initializeLogger, InferenceRunner, runWithJobContext, log as agentLog } from '@livekit/agents';
 import { JobContext } from './session_context.js';
+import { closeSessionServices } from './_session_cleanup.js';
+import { runServerCleanup, forceShutdownAgentSession, installUnhandledRejectionHandler, registerSignalCleanup } from './_session_teardown.js';
+import { brokerFor, isAudioEvent } from './_audio_events.js';
 
 export class JobProcess {
   userData: Record<string, unknown> = {};
+  executorType: unknown = null;
 }
 
 export interface AgentServerOptions {
@@ -99,7 +110,7 @@ export class AgentServer {
   private userdata: Record<string, unknown> = {};
   private proc = new JobProcess();
   private ep?: SipEndpoint;
-  private activeCalls = new Map<string, { promise: Promise<void>; resolveEnded: () => void; room?: any }>();
+  private activeCalls = new Map<string, { promise: Promise<void>; resolveEnded: () => void; room?: any; ctx?: any }>();
   private httpServer?: Server;
   private loadMonitor = new LoadMonitor();
   private inferenceExecutor: any = null;
@@ -206,11 +217,9 @@ export class AgentServer {
    */
   async run(): Promise<void> {
     // Handle unhandled rejections from LiveKit SDK TTS abort paths gracefully
-    // (StreamAdapter rejects with undefined when TTS is cancelled during interruption)
-    process.on('unhandledRejection', (reason) => {
-      if (reason === undefined || reason === null) return; // TTS abort — benign
-      console.error('Unhandled rejection:', reason);
-    });
+    // (StreamAdapter rejects with undefined when TTS is cancelled during
+    // interruption). Idempotent — safe if both servers run in one process.
+    installUnhandledRejectionHandler();
 
     // Strip tsx/ts-node loader hooks from execArgv before any child process forks
     // (pino-pretty worker, inference subprocess). These hooks corrupt IPC channels.
@@ -315,6 +324,11 @@ export class AgentServer {
 
     // Create SIP endpoint and register
     this.ep = new SipEndpoint({ sipServer: this.sipServer });
+    // This server's sipEventLoop is the single reader of the endpoint event
+    // channel — claim the audio-event broker so it dispatches to us (and
+    // suppresses its standalone self-pump, preserving the single-reader
+    // invariant). SipAudioOutput awaits async-id completions via this broker.
+    brokerFor(this.ep).claimFeeder();
     this.ep.register(this.sipUsername, this.sipPassword);
 
     // Wait for registration
@@ -334,40 +348,38 @@ export class AgentServer {
     // Node's event loop forever.
     const eventLoopDone = this.sipEventLoop();
 
-    // Wait for shutdown signal
-    await new Promise<void>((resolve) => {
-      const onSignal = () => {
-        this.shutdownRequested = true;
-        resolve();
-      };
-      process.on('SIGINT', onSignal);
-      process.on('SIGTERM', onSignal);
-    });
-
-    console.log('Shutting down...');
-
-    // Drain active calls with 10-second timeout
-    if (this.activeCalls.size > 0) {
-      console.log(`Draining ${this.activeCalls.size} active call(s)...`);
-      await Promise.race([
-        Promise.allSettled([...this.activeCalls.values()].map((c) => c.promise)),
-        new Promise<void>((resolve) => setTimeout(() => {
-          console.warn('Shutdown timeout reached (10s), forcing exit');
-          resolve();
-        }, 10000)),
-      ]);
-    }
-
-    this.loadMonitor.stop();
-    if (this.inferenceExecutor) {
-      try { await this.inferenceExecutor.close(); } catch {}
-    }
-    this.httpServer?.close();
-    this.ep?.shutdown();
-    // Wait for the event loop to actually exit so Node can release the
-    // libuv handle and the process can terminate. The shutdown sentinel
-    // pushed by ep.shutdown() above wakes the loop immediately.
+    // On signal: hang up everything, run critical cleanup with short
+    // timeouts, then process.exit. The Rust endpoint owns a background
+    // thread that pins libuv, so natural exit isn't reliable — we force it.
+    // Idempotent registration: the signal listeners install once per process
+    // and run every registered server's cleanup, so two servers (or a second
+    // run()) don't double-register listeners.
+    registerSignalCleanup(() => this.runCleanup());
     await eventLoopDone;
+  }
+
+  /**
+   * Hang up active calls, drain ancillary resources with short timeouts.
+   *
+   * Thin wrapper around {@link runServerCleanup} so the signal-handler path
+   * stays a one-liner and tests can drive the shared cleanup helper without
+   * loading the native `agent-transport` binding.
+   */
+  async runCleanup(): Promise<void> {
+    this.shutdownRequested = true;
+    await runServerCleanup({
+      activeSessionIds: () => this.activeCalls.keys(),
+      hangup: (id) => this.ep?.hangup(id),
+      stopLoadMonitor: () => this.loadMonitor.stop(),
+      inferenceExecutor: this.inferenceExecutor ?? null,
+      closeHttpServer: () => {
+        if (this.httpServer) {
+          try { (this.httpServer as any).closeAllConnections?.(); } catch {}
+          this.httpServer.close();
+        }
+      },
+      shutdownEndpoint: () => this.ep?.shutdown(),
+    });
   }
 
   /**
@@ -393,6 +405,15 @@ export class AgentServer {
       // waiting for the next 1 s waitForEvent timeout, then exit cleanly.
       if (ev.eventType === 'shutdown') {
         break;
+      }
+
+      // Route async-id audio completion events (audio_capture_complete /
+      // audio_playout_complete / audio_capture_error) to the broker, which
+      // resolves the pending SipAudioOutput captureFrame / waitForPlayout
+      // awaits. Must happen before call-lifecycle routing.
+      if (isAudioEvent(ev)) {
+        brokerFor(this.ep!).dispatch(ev);
+        continue;
       }
 
       if (ev.eventType === 'call_ringing' && ev.session) {
@@ -430,9 +451,15 @@ export class AgentServer {
         const reason = ev.reason ?? 'unknown';
         console.log(`Call ${sessionId} terminated (reason=${reason})`);
 
+        const active = this.activeCalls.get(sessionId);
+        // Synchronously begin tearing down the AgentSession so a buffered STT
+        // transcript delivered after disconnect can't trigger a wasted LLM +
+        // TTS turn on a dead call (issue #83). Must run before the Room facade
+        // emits participant_disconnected (which schedules the async close).
+        forceShutdownAgentSession(active?.ctx?.session);
+
         // Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
         // RoomIO._on_participant_disconnected will call _close_soon() → session closes
-        const active = this.activeCalls.get(sessionId);
         if (active?.room) {
           active.room.emitParticipantDisconnected();
         }
@@ -481,6 +508,8 @@ export class AgentServer {
       callEnded,
       resolveCallEnded: resolveEnded,
       proc: this.proc,
+      inferenceExecutor: this.inferenceExecutor,
+      enableRecording: false,
     });
 
     const runCall = async () => {
@@ -488,28 +517,9 @@ export class AgentServer {
       const callStart = performance.now();
 
       try {
-        // Wrap in runWithJobContext so getJobContext().room works inside handler
-        // (matches LiveKit WebRTC where entrypoint runs inside job context)
-        const sessionDir = `/tmp/agent-sessions`;
-        const stub = {
-          room: ctx.room,
-          job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: false, room: { sid: ctx.room.sid, name: ctx.room.name } },
-          _primaryAgentSession: undefined as any,
-          sessionDirectory: sessionDir,
-          proc: { executorType: null },
-          inferenceExecutor: this.inferenceExecutor,
-          initRecording: () => {},
-          connect: async () => {},
-          addShutdownCallback: () => {},
-          shutdown: () => {},
-          is_fake_job: () => false,
-          isFakeJob: () => false,
-          worker_id: 'local',
-          workerId: 'local',
-        };
-
+        const sessionDir = ctx.sessionDirectory;
         if (runWithJobContext) {
-          await runWithJobContext(stub as any, () => this.entrypointFn!(ctx));
+          await runWithJobContext(ctx as any, () => this.entrypointFn!(ctx));
         } else {
           await this.entrypointFn!(ctx);
         }
@@ -554,6 +564,13 @@ export class AgentServer {
         // Close session
         if (ctx.session) {
           try { await (ctx.session as any).close(); } catch {}
+          // AgentSession.close() does NOT cascade-close the user-supplied
+          // STT/TTS/LLM, so their vendor WebSockets would leak per call on
+          // our long-lived in-process server. Close them explicitly after
+          // the session has closed, before hangup. Never throws.
+          await closeSessionServices(ctx.session, {
+            logger: (msg, err) => console.warn(`[call ${sessionId}] ${msg}`, err ?? ''),
+          });
         }
 
         // Hangup
@@ -571,7 +588,7 @@ export class AgentServer {
     };
 
     const callPromise = runCall();
-    this.activeCalls.set(sessionId, { promise: callPromise, resolveEnded, room: ctx.room });
+    this.activeCalls.set(sessionId, { promise: callPromise, resolveEnded, room: ctx.room, ctx });
   }
 
   // ─── HTTP server ────────────────────────────────────────────────

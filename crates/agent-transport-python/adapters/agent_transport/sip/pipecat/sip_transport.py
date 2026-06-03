@@ -11,7 +11,8 @@ All audio codec/resampling/pacing is handled in Rust. Python only bridges frames
 
 Frame handling:
 - OutputAudioRawFrame → send_audio_notify (Rust backpressure + 20ms RTP pacing)
-- InterruptionFrame → clear_buffer
+- InterruptionFrame → clear_buffer (local RTP send-buffer drop; no network
+  message — cheap, tightens barge-in latency. See process_frame below)
 - OutputDTMFFrame → send_dtmf (RFC 2833 or SIP INFO)
 - OutputTransportMessageFrame → send_info (SIP INFO with JSON body)
 - EndFrame/CancelFrame → hangup
@@ -29,13 +30,16 @@ from typing import Any, Dict, Optional
 
 from loguru import logger
 
+from agent_transport._event_sink import _on_event_from_rust
+from agent_transport._executors import audio_io_executor
+from agent_transport._ffi_queue import GLOBAL_DICT
+
 try:
     from pipecat.audio.dtmf.types import KeypadEntry
     from pipecat.frames.frames import (
         CancelFrame, EndFrame, Frame, InputAudioRawFrame,
         InputDTMFFrame, InterruptionFrame, OutputAudioRawFrame,
-        OutputTransportMessageFrame, OutputTransportMessageUrgentFrame,
-        StartFrame, StopFrame,
+        StartFrame,
     )
     from pipecat.processors.frame_processor import FrameDirection
     from pipecat.transports.base_input import BaseInputTransport
@@ -143,7 +147,7 @@ class SipInputTransport(BaseInputTransport):
             while self._started:
                 try:
                     result = await loop.run_in_executor(
-                        None, lambda: self._ep.recv_audio_bytes_blocking(self._cid, 20)
+                        audio_io_executor(), lambda: self._ep.recv_audio_bytes_blocking(self._cid, 20)
                     )
                 except Exception:
                     # Session ended (remote BYE removed the call from the
@@ -187,22 +191,43 @@ class SipInputTransport(BaseInputTransport):
                 logger.exception("SipInputTransport handler failed for event %r", event.get("type") if isinstance(event, dict) else event)
 
     async def _event_loop_from_endpoint(self):
-        """Poll events directly from endpoint (standalone, no server)."""
-        loop = asyncio.get_running_loop()
-        while self._started:
-            try:
-                event = await loop.run_in_executor(
-                    None, lambda: self._ep.wait_for_event(timeout_ms=100)
-                )
-            except Exception as e:
-                logger.debug("SipInputTransport endpoint event_loop error: {}", e)
-                break
-            if event is None:
-                continue
-            try:
-                await self._handle_event(event)
-            except Exception:
-                logger.exception("SipInputTransport handler failed for event %r", event.get("type") if isinstance(event, dict) else event)
+        """Subscribe to GLOBAL_DICT for events on our session id.
+
+        Used when this transport is constructed without a server (no
+        ``_event_queue`` provided) — pipecat creates the SipTransport
+        directly and we own the endpoint's event flow.
+        """
+        # Install the shared sink (idempotent; safe if the server in
+        # another instance already installed it).
+        try:
+            self._ep.set_event_sink(_on_event_from_rust)
+        except Exception:
+            logger.debug("set_event_sink failed (already installed?)", exc_info=True)
+
+        cid = self._cid
+
+        def _is_ours(e: dict) -> bool:
+            # Endpoint-level events have no session_id; filter to events
+            # for our call. Lifecycle (registered/etc) is irrelevant
+            # to InputTransport.
+            return e.get("session_id") == cid
+
+        queue = GLOBAL_DICT.subscribe(filter_fn=_is_ours)
+        try:
+            while self._started:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    logger.debug("SipInputTransport endpoint event_loop error: {}", e)
+                    break
+                try:
+                    await self._handle_event(event)
+                except Exception:
+                    logger.exception("SipInputTransport handler failed for event %r", event.get("type") if isinstance(event, dict) else event)
+        finally:
+            GLOBAL_DICT.unsubscribe(queue)
 
     async def _handle_event(self, event):
         """Process a single event."""
@@ -220,6 +245,17 @@ class SipInputTransport(BaseInputTransport):
             )
         elif event_type == "beep_timeout":
             await self._transport._call_event_handler("on_beep_timeout")
+        elif event_type in (
+            "audio_capture_complete",
+            "audio_playout_complete",
+            "audio_buffer_drained",
+            "audio_capture_error",
+        ):
+            # LiveKit-faithful FfiQueue dispatch: every async_id event
+            # goes into the shared transport broker. OutputTransport
+            # subscribes per-frame inside write_audio_frame and filters
+            # to matching async_id.
+            self._transport._events.put(event)
 
 
 # ─── Output Transport ───────────────────────────────────────────────────────
@@ -264,6 +300,15 @@ class SipOutputTransport(BaseOutputTransport):
         self._cid = session_id
         self._transport = transport
         self._started = False
+        # FfiQueue lives on self._transport — InputTransport pumps,
+        # OutputTransport subscribes per-frame. Imported here to avoid
+        # circular imports during module-load time.
+        from agent_transport._ffi_queue import (
+            ASYNC_ID_EVENT_TYPES as _ASYNC_ID_EVENT_TYPES,
+            DEFAULT_WAIT_TIMEOUT as _DEFAULT_WAIT_TIMEOUT,
+        )
+        self._async_id_event_types = _ASYNC_ID_EVENT_TYPES
+        self._wait_timeout = _DEFAULT_WAIT_TIMEOUT
 
     async def start(self, frame: StartFrame):
         if self._started:
@@ -284,41 +329,58 @@ class SipOutputTransport(BaseOutputTransport):
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
         """Send audio frame to SIP call with Rust backpressure.
 
-        Audio pacing is handled entirely in Rust (20ms tokio::time::interval).
-        Python pushes frames as fast as Rust can accept them:
-        1. Push audio to Rust buffer via send_audio_notify with callback
-        2. If buffer below threshold, callback fires immediately → return
-        3. If above threshold, callback deferred until RTP loop drains
-        4. Callback resolves Future via call_soon_threadsafe → return
-        No asyncio.sleep — no jitter, no underruns.
+        LiveKit-faithful subscribe-before-request pattern:
+        1. Subscribe to transport.events with a filter narrowing to this
+           call's async_id-bearing events.
+        2. Call send_audio_async to push the frame and get the async_id.
+        3. Await the matching ``audio_capture_complete`` (or
+           ``audio_capture_error``) via Queue.wait_for(predicate).
+        4. Unsubscribe in finally.
+
+        The subscribe happens BEFORE the FFI call, so even if the Rust
+        side emits the completion event synchronously during the push
+        (immediate-emit path for below-threshold buffer), it lands in
+        our Queue and wait_for finds it.
         """
-        capture_fut = self._loop.create_future()
+        cid = self._cid
 
-        def _on_complete():
-            def _resolve():
-                if not capture_fut.done():
-                    capture_fut.set_result(None)
-            try:
-                self._loop.call_soon_threadsafe(_resolve)
-            except RuntimeError:
-                if not capture_fut.done():
-                    try:
-                        capture_fut.set_result(None)
-                    except Exception:
-                        pass
-
-        try:
-            self._ep.send_audio_notify(
-                self._cid,
-                frame.audio,
-                frame.sample_rate,
-                frame.num_channels,
-                _on_complete,
+        def _is_ours(e: dict) -> bool:
+            return (
+                e.get("type") in self._async_id_event_types
+                and e.get("session_id") == cid
             )
-        except Exception:
-            return False
 
-        await capture_fut
+        queue = self._transport._events.subscribe(
+            loop=asyncio.get_running_loop(),
+            filter_fn=_is_ours,
+        )
+        try:
+            try:
+                async_id = self._ep.send_audio_async(
+                    self._cid,
+                    frame.audio,
+                    frame.sample_rate,
+                    frame.num_channels,
+                )
+            except Exception:
+                return False
+            try:
+                ev = await queue.wait_for(
+                    lambda e: e.get("async_id") == async_id,
+                    timeout=self._wait_timeout,
+                )
+            except asyncio.TimeoutError:
+                return False
+        finally:
+            self._transport._events.unsubscribe(queue)
+
+        if ev.get("type") == "audio_capture_error" or ev.get("cancelled"):
+            # Either a real error (audio_capture_error with non-empty
+            # reason) or a clear-induced silent discard (Rust emits
+            # AudioCaptureComplete with cancelled=true on clear_buffer).
+            # Both mean the frame did NOT reach the wire — surface that
+            # to pipecat's MediaSender via the `False` return.
+            return False
         return True
 
     def queued_frames(self) -> int:
@@ -345,34 +407,37 @@ class SipOutputTransport(BaseOutputTransport):
             logger.warning("send_message via SIP INFO failed: {}", e)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        """Handle InterruptionFrame → clear Rust buffer BEFORE base class processing.
+        """Clear the local Rust buffer on interruption, then forward to base.
 
-        The base class cancels and restarts the MediaSender audio task. Clearing
-        the Rust buffer first ensures the new task doesn't race against stale
-        audio queued in Rust.
+        On SIP, ``clear_buffer`` is *local-only* — it clears the Rust audio
+        buffer and resets the resampler, with NO network signaling or
+        round-trip. (This is the key difference from the audio_stream
+        transport, where clear_buffer additionally sends ``clearAudio`` to
+        Plivo; cutting that mid-stream caused ~1.5s of silence on every
+        interrupt, so the audio_stream transport deliberately omits it and
+        relies on MediaSender task cancellation instead.)
+
+        Because the SIP clear is cheap and never touches the network, doing it
+        on barge-in is worth it: it immediately drops up to ~200ms of
+        already-buffered TTS instead of letting it play out after the caller
+        has interrupted, tightening barge-in latency. ``clear_buffer`` is
+        idempotent on terminated sessions (the 0.2.0 Terminated lifecycle
+        short-circuits), so no defensive try/except is needed.
         """
         if isinstance(frame, InterruptionFrame):
-            try:
-                self._ep.clear_buffer(self._cid)
-            except Exception as e:
-                logger.warning(f"clear_buffer on interruption failed: {e}")
-
+            self._ep.clear_buffer(self._cid)
         await super().process_frame(frame, direction)
 
     async def stop(self, frame: EndFrame):
+        # ``hangup`` is idempotent on terminated sessions; on Active it
+        # tears down the dialog + RTP. No try/except needed.
         loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(None, lambda: self._ep.hangup(self._cid))
-        except Exception as e:
-            logger.debug("hangup on stop failed: {}", e)
+        await loop.run_in_executor(None, lambda: self._ep.hangup(self._cid))
         await super().stop(frame)
 
     async def cancel(self, frame: CancelFrame):
         loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(None, lambda: self._ep.hangup(self._cid))
-        except Exception as e:
-            logger.debug("hangup on cancel failed: {}", e)
+        await loop.run_in_executor(None, lambda: self._ep.hangup(self._cid))
         await super().cancel(frame)
 
 
@@ -436,6 +501,11 @@ class SipTransport(BaseTransport):
         self._params = params
         self._session_data = session_data or {}
         self._event_queue = _event_queue
+        # Shared FfiQueue for this transport — InputTransport's event
+        # loop puts async_id events into it; OutputTransport subscribes
+        # per-frame. LiveKit-faithful subscribe-before-request pattern.
+        from agent_transport._ffi_queue import FfiQueue
+        self._events: FfiQueue = FfiQueue()
         self._input: Optional[SipInputTransport] = None
         self._output: Optional[SipOutputTransport] = None
 
