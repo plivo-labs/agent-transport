@@ -9,7 +9,7 @@
  *   });
  */
 
-import { writeSync } from 'node:fs';
+import { mkdirSync, writeSync } from 'node:fs';
 import type { AudioStreamEndpoint } from 'agent-transport';
 import { SipAudioInput } from './sip_audio_input.js';
 import { SipAudioOutput } from './sip_audio_output.js';
@@ -28,6 +28,9 @@ export interface AudioStreamJobContextOptions {
   callEnded: Promise<void>;
   resolveCallEnded: () => void;
   proc?: JobProcess;
+  inferenceExecutor?: unknown;
+  enableRecording?: boolean;
+  sessionDirectory?: string;
 }
 
 export class AudioStreamJobContext {
@@ -40,11 +43,20 @@ export class AudioStreamJobContext {
   readonly userdata: Record<string, unknown>;
   readonly room: TransportRoom;
   readonly proc: JobProcess;
+  readonly job: { id: string; agentName: string; enableRecording: boolean; room: TransportRoom };
+  readonly workerId = 'local';
+  readonly worker_id = 'local';
+  readonly sessionDirectory: string;
+  readonly inferenceExecutor: unknown;
+
+  /** @internal Primary AgentSession used by LiveKit job-context helpers. */
+  _primaryAgentSession: any = undefined;
 
   private _session: any = null;
   private _callEnded: Promise<void>;
   private _resolveCallEnded: () => void;
-  private _shutdownCallbacks: Array<() => void | Promise<void>> = [];
+  private _shutdownCallbacks: Array<(reason?: string) => void | Promise<void>> = [];
+  private _shutdownCallbacksFired = false;
 
   constructor(opts: AudioStreamJobContextOptions) {
     this.sessionId = opts.sessionId;
@@ -57,11 +69,20 @@ export class AudioStreamJobContext {
     this.userdata = opts.userdata;
     this._callEnded = opts.callEnded;
     this._resolveCallEnded = opts.resolveCallEnded;
+    this.inferenceExecutor = opts.inferenceExecutor;
+    this.sessionDirectory = opts.sessionDirectory ?? '/tmp/agent-sessions';
+    try { mkdirSync(this.sessionDirectory, { recursive: true }); } catch {}
 
     this.room = new TransportRoom(opts.endpoint as any, opts.sessionId, {
       agentName: opts.agentName ?? 'audio-stream-agent',
       callerIdentity: opts.plivoCallUuid,
     });
+    this.job = {
+      id: `job-${opts.sessionId}`,
+      agentName: opts.agentName ?? 'audio-stream-agent',
+      enableRecording: opts.enableRecording ?? false,
+      room: this.room,
+    };
   }
 
   get session(): any {
@@ -74,6 +95,7 @@ export class AudioStreamJobContext {
    */
   set session(session: any) {
     this._session = session;
+    this._primaryAgentSession = session;
 
     // Wire audio stream I/O (uses same SipAudioInput/Output — they work with AudioStreamEndpoint too)
     session.input.audio = new SipAudioInput(this.endpoint as any, this.sessionId);
@@ -98,16 +120,22 @@ export class AudioStreamJobContext {
 
     session.on('close', async () => {
       console.log(`Session ${this.sessionId} closed`);
-      for (const cb of this._shutdownCallbacks) {
-        try { await cb(); } catch {}
-      }
+      await this.runShutdownCallbacks('session closed');
       this._resolveCallEnded();
       try { (this.endpoint as any).hangup(this.sessionId); } catch {}
     });
   }
 
-  addShutdownCallback(callback: () => void | Promise<void>): void {
+  addShutdownCallback(callback: (reason?: string) => void | Promise<void>): void {
     this._shutdownCallbacks.push(callback);
+  }
+
+  private async runShutdownCallbacks(reason: string): Promise<void> {
+    if (this._shutdownCallbacksFired) return;
+    this._shutdownCallbacksFired = true;
+    for (const cb of this._shutdownCallbacks) {
+      try { await cb(reason); } catch {}
+    }
   }
 
   /**
@@ -126,16 +154,7 @@ export class AudioStreamJobContext {
    */
   shutdown(reason: string = ''): void {
     console.log(`Session ${this.sessionId} JobContext.shutdown(reason=${JSON.stringify(reason)})`);
-    for (const cb of this._shutdownCallbacks) {
-      try {
-        const r = cb();
-        if (r && typeof (r as any).then === 'function') {
-          (r as Promise<unknown>).catch(() => {});
-        }
-      } catch {
-        /* best-effort */
-      }
-    }
+    this.runShutdownCallbacks(reason).catch(() => {});
     try {
       (this.endpoint as any).hangup(this.sessionId);
     } catch {
@@ -167,5 +186,36 @@ export class AudioStreamJobContext {
   /** @internal */
   get callEnded(): Promise<void> {
     return this._callEnded;
+  }
+
+  isFakeJob(): boolean {
+    return false;
+  }
+
+  is_fake_job(): boolean {
+    return false;
+  }
+
+  async connect(): Promise<void> {
+    // The audio stream transport is already connected by the time the agent starts.
+  }
+
+  initRecording(): void {
+    // agent-transport owns mixed transport recording; LiveKit RecorderIO is disabled.
+  }
+
+  get agent(): any {
+    return this.room.localParticipant;
+  }
+
+  async waitForParticipant(identity?: string): Promise<any> {
+    const participants = Array.from(this.room.remoteParticipants.values());
+    return participants.find((p: any) => !identity || p.identity === identity) ?? participants[0];
+  }
+
+  addParticipantEntrypoint(callback: (job: AudioStreamJobContext, participant: any) => unknown): void {
+    this.waitForParticipant()
+      .then((participant) => callback(this, participant))
+      .catch(() => {});
   }
 }

@@ -1,19 +1,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
-
-/// Lock a Mutex and recover from poisoning instead of panicking. The
-/// PyO3 binding runs across multiple threads (Python event loop, tokio
-/// callback thread, dispatch thread), and a panic that poisons the
-/// callbacks map would otherwise propagate to every subsequent dispatch
-/// and bring down the event loop.
-fn lock_or_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(e) => e.into_inner(),
-    }
-}
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -28,12 +17,97 @@ use agent_transport_core::audio_stream::config::AudioStreamConfig as RustAudioSt
 use agent_transport_core::audio_stream::endpoint::AudioStreamEndpoint as RustAudioStreamEndpoint;
 use agent_transport_core::audio_stream::plivo::PlivoProtocol;
 
+mod event_sink;
+use event_sink::EventSink;
+mod core_endpoint;
+use core_endpoint::Core;
+
 fn py_err(e: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
+/// Dispatcher thread body — shared by ``SipEndpoint`` and
+/// ``AudioStreamEndpoint``. Drains the endpoint's event channel
+/// (a ``crossbeam_channel::Receiver``) and invokes the registered
+/// Python sink under the GIL, once per event.
+///
+/// Mirror of LiveKit's ``ffi_event_callback`` in
+/// ``livekit/rtc/_ffi_client.py:152-190``: a single constrained Python
+/// callable invoked from a thread that owns the FFI event source. The
+/// sink contract (see ``adapters/agent_transport/_event_sink.py``) is
+/// that the body does only ``loop.call_soon_threadsafe`` into an
+/// asyncio Queue — no Rust re-entry, no Rust mutex acquisition. So
+/// even though we hold the GIL during ``cb.call1``, no deadlock with
+/// any other Rust thread is possible.
+///
+/// On ``stop`` set, the loop exits after the next ``recv_timeout``
+/// returns. ``recv_timeout`` of 100ms bounds shutdown latency.
+fn dispatcher_loop(
+    rx: crossbeam_channel::Receiver<EndpointEvent>,
+    sink: Arc<EventSink>,
+    stop: Arc<AtomicBool>,
+) {
+    // Surface a stalled/slow dispatcher (or a sink that blocks) BEFORE the
+    // bounded event channel starts dropping events at its cap. Warn once per
+    // backlog episode (reset when it drains), so a wedged sink is visible in
+    // logs instead of silently growing memory or losing completions.
+    const HIGH_WATER: usize = 8192;
+    let mut warned_backlog = false;
+    while !stop.load(Ordering::Relaxed) {
+        let depth = rx.len();
+        if depth > HIGH_WATER && !warned_backlog {
+            eprintln!(
+                "agent_transport: event-channel backlog high ({} queued) — the \
+                 Python sink/dispatcher is not draining fast enough; events will \
+                 be dropped if it reaches the channel cap",
+                depth,
+            );
+            warned_backlog = true;
+        } else if warned_backlog && depth < HIGH_WATER / 2 {
+            warned_backlog = false;
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(event) => {
+                // Acquire the GIL FIRST, then briefly lock the sink only to
+                // clone the callback, dropping the guard BEFORE `call1`. The
+                // dispatcher's acquisition order is therefore GIL-before-lock,
+                // matching every #[pymethods] sink-mutator (set_event_sink /
+                // poll_event / wait_for_event), which PyO3 invokes with the GIL
+                // already held and which then take this same lock. Uniform
+                // ordering removes the AB-BA deadlock that the previous
+                // lock-then-with_gil form created (it held the MutexGuard alive
+                // across `Python::with_gil`, i.e. lock-before-GIL, the inverse
+                // of the mutators). The clone is dropped-guard'd so `call1` —
+                // which runs arbitrary Python — never executes under the lock.
+                Python::attach(|py| {
+                    // EventSink::snapshot locks via lock_py_attached (detaches
+                    // while waiting for the mutex), clones the callback, and drops
+                    // the guard — so call1 never runs under the lock and no thread
+                    // ever holds the GIL while blocked on the sink (AB-BA gone).
+                    if let Some(cb) = sink.snapshot(py) {
+                        let dict = match event_to_dict(py, &event) {
+                            Ok(d) => d,
+                            Err(_) => return,
+                        };
+                        // Swallow Python exceptions — a sink-side bug
+                        // must not kill the dispatcher.
+                        if let Err(e) = cb.call1(py, (dict,)) {
+                            e.print(py);
+                        }
+                    }
+                });
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
 /// Python-visible AudioFrame matching LiveKit's format.
-#[pyclass]
+// skip_from_py_object: this Clone pyclass is never extracted by value (only
+// passed as `&AudioFrame`), so opt out of the deprecated auto-FromPyObject
+// derive rather than carry an unused extraction path (pyo3 0.28).
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 struct AudioFrame {
     #[pyo3(get)]
@@ -121,7 +195,9 @@ impl AudioFrame {
 }
 
 /// Python-visible CallSession.
-#[pyclass]
+// skip_from_py_object: never extracted by value from Python (Rust produces it,
+// Python only reads its attributes), so opt out of the deprecated auto-derive.
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 struct CallSession {
     #[pyo3(get)]
@@ -151,36 +227,6 @@ impl From<RustCallSession> for CallSession {
             local_uri: s.local_uri,
             extra_headers: s.extra_headers,
         }
-    }
-}
-
-/// Returned by `ep.on("event_name")` — usable as a decorator.
-///
-/// ```python
-/// @ep.on("call_ringing")
-/// def on_ringing(session):
-///     # Observational: Rust auto-answers. Use for logging / metrics.
-///     print(f"Incoming call from {session.remote_uri}")
-///
-/// @ep.on("call_answered")
-/// def on_answered(session):
-///     # Call is now active and media is flowing — safe to start the agent.
-///     ...
-/// ```
-#[pyclass]
-struct EventDecorator {
-    callbacks: Arc<Mutex<HashMap<String, Vec<Py<PyAny>>>>>,
-    event_name: String,
-}
-
-#[pymethods]
-impl EventDecorator {
-    fn __call__(&self, py: Python, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
-        lock_or_recover(&self.callbacks)
-            .entry(self.event_name.clone())
-            .or_default()
-            .push(func.clone_ref(py));
-        Ok(func)
     }
 }
 
@@ -245,51 +291,61 @@ fn event_to_dict<'py>(py: Python<'py>, event: &EndpointEvent) -> PyResult<Bound<
         EndpointEvent::Shutdown => {
             dict.set_item("type", "shutdown")?;
         }
+        EndpointEvent::AudioCaptureComplete {
+            session_id,
+            async_id,
+            cancelled,
+        } => {
+            dict.set_item("type", "audio_capture_complete")?;
+            dict.set_item("session_id", session_id)?;
+            dict.set_item("async_id", async_id)?;
+            dict.set_item("cancelled", cancelled)?;
+        }
+        EndpointEvent::AudioPlayoutComplete {
+            session_id,
+            async_id,
+        } => {
+            dict.set_item("type", "audio_playout_complete")?;
+            dict.set_item("session_id", session_id)?;
+            dict.set_item("async_id", async_id)?;
+        }
+        EndpointEvent::AudioBufferDrained {
+            session_id,
+            async_id,
+        } => {
+            dict.set_item("type", "audio_buffer_drained")?;
+            dict.set_item("session_id", session_id)?;
+            dict.set_item("async_id", async_id)?;
+        }
+        EndpointEvent::AudioCaptureError {
+            session_id,
+            async_id,
+            error,
+        } => {
+            dict.set_item("type", "audio_capture_error")?;
+            dict.set_item("session_id", session_id)?;
+            dict.set_item("async_id", async_id)?;
+            dict.set_item("error", error)?;
+        }
     }
     Ok(dict)
-}
-
-/// Dispatch an event to registered Python callbacks.
-///
-/// IMPORTANT: We clone the handlers list and release the lock BEFORE invoking
-/// the callbacks. Holding the Mutex across `handler.call1()` would deadlock
-/// if the callback tries to register a new handler via `ep.on(...)` (which
-/// also locks this Mutex).
-fn dispatch_event(
-    py: Python,
-    callbacks: &Arc<Mutex<HashMap<String, Vec<Py<PyAny>>>>>,
-    event: &EndpointEvent,
-) {
-    let name = event.callback_name();
-    // Clone the handlers under the lock, then release before dispatching.
-    // Use lock_or_recover so a panicked dispatch can't poison the mutex
-    // and break every subsequent event delivery.
-    let handlers: Vec<Py<PyAny>> = {
-        let cbs = lock_or_recover(callbacks);
-        match cbs.get(name) {
-            Some(hs) => hs.iter().map(|h| h.clone_ref(py)).collect(),
-            None => return,
-        }
-    };
-
-    let dict = match event_to_dict(py, event) {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-
-    for handler in &handlers {
-        if let Err(e) = handler.call1(py, (&dict,)) {
-            e.print(py);
-        }
-    }
 }
 
 /// SIP endpoint — call control and audio I/O.
 #[pyclass]
 struct SipEndpoint {
-    inner: RustSipEndpoint,
-    callbacks: Arc<Mutex<HashMap<String, Vec<Py<PyAny>>>>>,
-    event_thread_running: Arc<AtomicBool>,
+    inner: Core<RustSipEndpoint>,
+    /// LiveKit-style constrained event sink. When a Python callable is
+    /// registered, the dispatcher thread drains ``inner.events()`` and
+    /// invokes the callable under the GIL. See ``set_event_sink`` for the
+    /// contract. ``Arc<Mutex<Option<Py<PyAny>>>>`` so the dispatcher
+    /// thread can hold a clone independently of the pyclass lifetime.
+    event_sink: Arc<EventSink>,
+    /// Signals the dispatcher thread to exit on endpoint drop/shutdown.
+    dispatcher_stop: Arc<AtomicBool>,
+    /// JoinHandle for the dispatcher thread (so we can wait on it during
+    /// shutdown). Wrapped in Mutex<Option<...>> for interior mutability.
+    dispatcher_handle: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
 }
 
 #[pymethods]
@@ -339,82 +395,35 @@ impl SipEndpoint {
             ..Default::default()
         };
 
-        let inner = RustSipEndpoint::new(config)
-            .map_err(py_err)?;
+        let inner = Core::new(RustSipEndpoint::new(config)
+            .map_err(py_err)?);
 
         Ok(Self {
             inner,
-            callbacks: Arc::new(Mutex::new(HashMap::new())),
-            event_thread_running: Arc::new(AtomicBool::new(false)),
+            event_sink: Arc::new(EventSink::new()),
+            dispatcher_stop: Arc::new(AtomicBool::new(false)),
+            dispatcher_handle: Arc::new(Mutex::new(None)),
         })
-    }
-
-    /// Register an event callback. Can be used as a decorator:
-    ///
-    /// ```python
-    /// @ep.on("call_ringing")
-    /// def on_ringing(event):
-    ///     # Pre-answer, observational. Rust auto-answers right after.
-    ///     print(event["session"].remote_uri)
-    ///
-    /// @ep.on("call_answered")
-    /// def on_answered(event):
-    ///     # Call is answered and media is active. Create your agent here.
-    ///     start_agent(event["session"])
-    /// ```
-    ///
-    /// Or with a direct callback:
-    ///
-    /// ```python
-    /// ep.on("dtmf_received", lambda event: print(event["digit"]))
-    /// ```
-    ///
-    /// Event names: registered, registration_failed, unregistered,
-    /// call_ringing, call_state, call_answered, call_terminated,
-    /// dtmf_received, beep_detected, beep_timeout, shutdown
-    #[pyo3(signature = (event_name, callback=None))]
-    fn on(
-        &self,
-        py: Python,
-        event_name: String,
-        callback: Option<Py<PyAny>>,
-    ) -> PyResult<PyObject> {
-        if let Some(cb) = callback {
-            // Direct registration: ep.on("event", callback)
-            lock_or_recover(&self.callbacks)
-                .entry(event_name)
-                .or_default()
-                .push(cb);
-            self.ensure_event_loop();
-            Ok(py.None())
-        } else {
-            // Decorator mode: @ep.on("event")
-            self.ensure_event_loop();
-            let decorator = EventDecorator {
-                callbacks: self.callbacks.clone(),
-                event_name,
-            };
-            Ok(decorator.into_pyobject(py)?.into_any().unbind())
-        }
     }
 
     /// Register with the SIP server. Releases GIL (blocks on SIP signaling).
     fn register(&self, py: Python, username: &str, password: &str) -> PyResult<()> {
-        let inner = &self.inner;
         let u = username.to_string();
         let p = password.to_string();
-        py.allow_threads(move || inner.register(&u, &p)).map_err(py_err)
+        self.inner.with(py, move |c| c.register(&u, &p)).map_err(py_err)
     }
 
     /// Unregister. Releases GIL.
     fn unregister(&self, py: Python) -> PyResult<()> {
-        let inner = &self.inner;
-        py.allow_threads(|| inner.unregister()).map_err(py_err)
+        self.inner.with(py, |c| c.unregister()).map_err(py_err)
     }
 
-    /// Check registration status.
-    fn is_registered(&self) -> bool {
-        self.inner.is_registered()
+    /// Check registration status. Releases the GIL — `inner.is_registered()`
+    /// takes the core `state` Mutex; holding the GIL across it would stall the
+    /// asyncio loop whenever that lock is contended (the A.1 GIL-stall class;
+    /// this method was missing from the 2_plan.md audit).
+    fn is_registered(&self, py: Python) -> bool {
+        self.inner.with(py, |c| c.is_registered())
     }
 
     /// Make an outbound call. Returns session_id. Releases GIL (blocks on SIP signaling).
@@ -422,146 +431,128 @@ impl SipEndpoint {
     /// If None, uses the registered contact URI.
     #[pyo3(signature = (dest_uri, from_uri=None, headers=None, session_id=None))]
     fn call(&self, py: Python, dest_uri: &str, from_uri: Option<&str>, headers: Option<HashMap<String, String>>, session_id: Option<String>) -> PyResult<String> {
-        let inner = &self.inner;
         let uri = dest_uri.to_string();
         let from = from_uri.map(|s| s.to_string());
-        py.allow_threads(move || inner.call_with_from(&uri, from.as_deref(), headers, session_id)).map_err(py_err)
+        self.inner.with(py, move |c| c.call_with_from(&uri, from.as_deref(), headers, session_id)).map_err(py_err)
     }
 
     /// Answer an incoming call. Releases GIL.
     #[pyo3(signature = (session_id, code=200))]
     fn answer(&self, py: Python, session_id: &str, code: u16) -> PyResult<()> {
-        let inner = &self.inner;
-        py.allow_threads(move || inner.answer(session_id, code)).map_err(py_err)
+        self.inner.with(py, move |c| c.answer(session_id, code)).map_err(py_err)
     }
 
     /// Reject an incoming call. Releases GIL.
     #[pyo3(signature = (session_id, code=486))]
     fn reject(&self, py: Python, session_id: &str, code: u16) -> PyResult<()> {
-        let inner = &self.inner;
-        py.allow_threads(move || inner.reject(session_id, code)).map_err(py_err)
+        self.inner.with(py, move |c| c.reject(session_id, code)).map_err(py_err)
     }
 
     /// Hang up an active call. Releases GIL.
     fn hangup(&self, py: Python, session_id: &str) -> PyResult<()> {
-        let inner = &self.inner;
-        py.allow_threads(move || inner.hangup(session_id)).map_err(py_err)
+        self.inner.with(py, move |c| c.hangup(session_id)).map_err(py_err)
     }
 
     /// Send DTMF digits. Releases GIL.
     #[pyo3(signature = (session_id, digits, method="rfc2833"))]
     fn send_dtmf(&self, py: Python, session_id: &str, digits: &str, method: &str) -> PyResult<()> {
-        let inner = &self.inner;
         let d = digits.to_string();
         let m = method.to_string();
-        py.allow_threads(move || inner.send_dtmf_with_method(session_id, &d, &m)).map_err(py_err)
+        self.inner.with(py, move |c| c.send_dtmf_with_method(session_id, &d, &m)).map_err(py_err)
     }
 
     /// Blind transfer via SIP REFER. Releases GIL.
     fn transfer(&self, py: Python, session_id: &str, dest_uri: &str) -> PyResult<()> {
-        let inner = &self.inner;
         let uri = dest_uri.to_string();
-        py.allow_threads(move || inner.transfer(session_id, &uri)).map_err(py_err)
+        self.inner.with(py, move |c| c.transfer(session_id, &uri)).map_err(py_err)
     }
 
     /// Attended transfer (connect two calls). Releases GIL.
     fn transfer_attended(&self, py: Python, session_id: &str, target_session_id: &str) -> PyResult<()> {
-        let inner = &self.inner;
-        { let c = session_id.to_string(); let t = target_session_id.to_string(); py.allow_threads(move || inner.transfer_attended(&c, &t)).map_err(py_err) }
+        { let s = session_id.to_string(); let t = target_session_id.to_string(); self.inner.with(py, move |c| c.transfer_attended(&s, &t)).map_err(py_err) }
     }
 
     /// Send a SIP INFO message. Releases GIL.
     #[pyo3(signature = (session_id, content_type="application/json", body=""))]
     fn send_info(&self, py: Python, session_id: &str, content_type: &str, body: &str) -> PyResult<()> {
-        let inner = &self.inner;
         let ct = content_type.to_string();
         let b = body.to_string();
-        py.allow_threads(move || inner.send_info(session_id, &ct, &b)).map_err(py_err)
+        self.inner.with(py, move |c| c.send_info(session_id, &ct, &b)).map_err(py_err)
     }
 
-    /// Mute outgoing audio.
-    fn mute(&self, session_id: &str) -> PyResult<()> {
-        self.inner
-            .mute(session_id)
-            .map_err(py_err)
+    /// Mute outgoing audio. Releases GIL during mutex ops.
+    fn mute(&self, py: Python, session_id: &str) -> PyResult<()> {
+        self.inner.with(py, move |c| c.mute(session_id)).map_err(py_err)
     }
 
-    /// Unmute outgoing audio.
-    fn unmute(&self, session_id: &str) -> PyResult<()> {
-        self.inner
-            .unmute(session_id)
-            .map_err(py_err)
+    /// Unmute outgoing audio. Releases GIL during mutex ops.
+    fn unmute(&self, py: Python, session_id: &str) -> PyResult<()> {
+        self.inner.with(py, move |c| c.unmute(session_id)).map_err(py_err)
     }
 
     /// SIP hold — send Re-INVITE with a=sendonly. Releases GIL.
     fn hold(&self, py: Python, session_id: &str) -> PyResult<()> {
-        let inner = &self.inner;
-        py.allow_threads(move || inner.hold(session_id)).map_err(py_err)
+        self.inner.with(py, move |c| c.hold(session_id)).map_err(py_err)
     }
 
     /// SIP unhold — send Re-INVITE with a=sendrecv. Releases GIL.
     fn unhold(&self, py: Python, session_id: &str) -> PyResult<()> {
-        let inner = &self.inner;
-        py.allow_threads(move || inner.unhold(session_id)).map_err(py_err)
+        self.inner.with(py, move |c| c.unhold(session_id)).map_err(py_err)
     }
 
     /// Send an audio frame (simple, no backpressure callback). Releases GIL during mutex ops.
     fn send_audio(&self, py: Python, session_id: &str, frame: &AudioFrame) -> PyResult<()> {
         let f = frame.to_rust();
-        let inner = &self.inner;
-        py.allow_threads(move || inner.send_audio(session_id, &f)).map_err(py_err)
+        self.inner.with(py, move |c| c.send_audio(session_id, &f)).map_err(py_err)
     }
 
-    /// Send raw PCM bytes with async completion notification. Releases GIL during mutex ops.
+    /// Push audio frame and return the async_id to await on the endpoint's
+    /// event channel.
     ///
-    /// Pushes audio into the shared buffer. If buffer is below threshold,
-    /// `notify_fn` is called immediately (sync). If above threshold, `notify_fn`
-    /// is called later by the RTP send loop when buffer drains (from another thread).
+    /// **Always returns the async_id** — Python MUST always await
+    /// `AudioCaptureComplete { async_id }` (or `AudioCaptureError` on
+    /// cancel/flush/drop) via the endpoint's event broker. Mirrors
+    /// LiveKit's `capture_audio_frame` invariant
+    /// (`livekit/rtc/audio_source.py:142-149`): every request produces
+    /// exactly one matching completion event.
     ///
-    /// Python should pass `lambda: loop.call_soon_threadsafe(future.set_result, None)`
-    /// as `notify_fn`. This matches WebRTC's deferred on_complete callback pattern.
-    fn send_audio_notify(&self, py: Python, session_id: &str, audio: &[u8], sample_rate: u32, num_channels: u32, notify_fn: Py<PyAny>) -> PyResult<()> {
-        // Copy audio data while GIL is held (audio borrows from Python memory)
+    /// Callers MUST `subscribe(filter_fn=...)` to the event broker
+    /// BEFORE calling this method — the immediate-emit path can fire
+    /// before this returns, and an unsubscribed event would be lost.
+    fn send_audio_async(&self, py: Python, session_id: &str, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<u64> {
         let frame = RustAudioFrame::from_bytes(audio, sample_rate, num_channels);
-        let callback: Box<dyn FnOnce() + Send> = Box::new(move || {
-            Python::with_gil(|py| {
-                if let Err(e) = notify_fn.call0(py) {
-                    e.print(py);
-                }
-            });
-        });
-        // Release GIL during mutex lock + push — prevents blocking event loop
-        let inner = &self.inner;
-        py.allow_threads(move || inner.send_audio_with_callback(session_id, &frame, callback))
+        self.inner.with(py, move |c| c.send_audio_async(session_id, &frame))
             .map_err(py_err)
     }
 
     /// Send raw PCM bytes (simple, no backpressure callback). Releases GIL during mutex ops.
     fn send_audio_bytes(&self, py: Python, session_id: &str, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
         let frame = RustAudioFrame::from_bytes(audio, sample_rate, num_channels);
-        let inner = &self.inner;
-        py.allow_threads(move || inner.send_audio(session_id, &frame)).map_err(py_err)
+        self.inner.with(py, move |c| c.send_audio(session_id, &frame)).map_err(py_err)
     }
 
     /// Send background audio to be mixed with agent voice in the RTP send loop.
-    fn send_background_audio(&self, session_id: &str, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
+    /// Releases GIL during mutex acquisition — critical for high-frequency
+    /// background-audio paths (e.g., LiveKit `BackgroundAudioPlayer` running
+    /// at ~50 fps).
+    fn send_background_audio(&self, py: Python, session_id: &str, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
         let frame = RustAudioFrame::from_bytes(audio, sample_rate, num_channels);
-        self.inner.send_background_audio(session_id, &frame).map_err(py_err)
+        self.inner.with(py, move |c| c.send_background_audio(session_id, &frame))
+            .map_err(py_err)
     }
 
     /// Receive an audio frame (non-blocking, returns None if no frame ready).
-    fn recv_audio(&self, session_id: &str) -> PyResult<Option<AudioFrame>> {
-        self.inner
-            .recv_audio(session_id)
+    /// Releases GIL during mutex ops.
+    fn recv_audio(&self, py: Python, session_id: &str) -> PyResult<Option<AudioFrame>> {
+        self.inner.with(py, move |c| c.recv_audio(session_id))
             .map(|opt| opt.map(AudioFrame::from_rust))
             .map_err(py_err)
     }
 
     /// Receive audio as raw PCM bytes (little-endian int16). No Python list conversion.
-    /// Returns (bytes, sample_rate, num_channels) or None.
-    fn recv_audio_bytes(&self, session_id: &str) -> PyResult<Option<(Vec<u8>, u32, u32)>> {
-        self.inner
-            .recv_audio(session_id)
+    /// Returns (bytes, sample_rate, num_channels) or None. Releases GIL during mutex ops.
+    fn recv_audio_bytes(&self, py: Python, session_id: &str) -> PyResult<Option<(Vec<u8>, u32, u32)>> {
+        self.inner.with(py, move |c| c.recv_audio(session_id))
             .map(|opt| opt.map(|f| (f.as_bytes(), f.sample_rate, f.num_channels)))
             .map_err(py_err)
     }
@@ -571,9 +562,8 @@ impl SipEndpoint {
     /// Use this instead of polling recv_audio() in a loop.
     #[pyo3(signature = (session_id, timeout_ms=20))]
     fn recv_audio_blocking(&self, py: Python, session_id: &str, timeout_ms: u64) -> PyResult<Option<AudioFrame>> {
-        let inner = &self.inner;
-        py.allow_threads(|| {
-            inner.recv_audio_blocking(session_id, timeout_ms)
+        self.inner.with(py, |c| {
+            c.recv_audio_blocking(session_id, timeout_ms)
                 .map(|opt| opt.map(AudioFrame::from_rust))
         }).map_err(py_err)
     }
@@ -583,49 +573,48 @@ impl SipEndpoint {
     /// This is the fastest path for Pipecat/LiveKit adapters.
     #[pyo3(signature = (session_id, timeout_ms=20))]
     fn recv_audio_bytes_blocking(&self, py: Python, session_id: &str, timeout_ms: u64) -> PyResult<Option<(Vec<u8>, u32, u32)>> {
-        let inner = &self.inner;
-        py.allow_threads(|| {
-            inner.recv_audio_blocking(session_id, timeout_ms)
+        self.inner.with(py, |c| {
+            c.recv_audio_blocking(session_id, timeout_ms)
                 .map(|opt| opt.map(|f| (f.as_bytes(), f.sample_rate, f.num_channels)))
         }).map_err(py_err)
     }
 
     /// Number of audio frames queued for sending (outgoing buffer depth).
     /// Multiply by 0.02 to get queued duration in seconds (each frame = 20ms).
-    fn queued_frames(&self, session_id: &str) -> PyResult<usize> {
-        self.inner.queued_frames(session_id).map_err(py_err)
+    /// Releases GIL during mutex ops.
+    fn queued_frames(&self, py: Python, session_id: &str) -> PyResult<usize> {
+        self.inner.with(py, move |c| c.queued_frames(session_id)).map_err(py_err)
     }
 
     /// Get queued audio duration in milliseconds (real buffer state).
-    /// Matches WebRTC's audioSource.queuedDuration.
-    fn queued_duration_ms(&self, session_id: &str) -> PyResult<f64> {
-        self.inner.queued_duration_ms(session_id).map_err(py_err)
+    /// Matches WebRTC's audioSource.queuedDuration. Releases GIL during mutex ops.
+    fn queued_duration_ms(&self, py: Python, session_id: &str) -> PyResult<f64> {
+        self.inner.with(py, move |c| c.queued_duration_ms(session_id)).map_err(py_err)
     }
 
-    /// Set a callback for playout completion (fires when buffer drains to empty).
-    /// Matches WebRTC's audioSource.waitForPlayout() — truly async, pause-aware.
-    #[pyo3(signature = (session_id, notify_fn))]
-    fn wait_for_playout_notify(&self, _py: Python, session_id: &str, notify_fn: Py<PyAny>) -> PyResult<()> {
-        let callback: Box<dyn FnOnce() + Send> = Box::new(move || {
-            Python::with_gil(|py| {
-                if let Err(e) = notify_fn.call0(py) {
-                    e.print(py);
-                }
-            });
-        });
-        self.inner.wait_for_playout_notify(session_id, callback).map_err(py_err)
+    /// Register an async_id to be notified when the audio buffer drains to empty.
+    ///
+    /// **Always returns the async_id** — Python MUST always await
+    /// `AudioPlayoutComplete { async_id }` (or `AudioCaptureError` on
+    /// cancel/flush/drop) via the endpoint's event broker. The
+    /// completion event always fires (immediately if buffer already
+    /// empty, deferred if not). Multiple concurrent waiters supported.
+    /// Pause-aware (RTP loop doesn't drain while paused).
+    fn wait_for_playout_async(&self, py: Python, session_id: &str) -> PyResult<u64> {
+        self.inner.with(py, move |c| c.wait_for_playout_async(session_id))
+            .map_err(py_err)
     }
 
     /// Input audio sample rate in Hz.
     #[getter]
-    fn input_sample_rate(&self) -> u32 {
-        self.inner.input_sample_rate()
+    fn input_sample_rate(&self, py: Python) -> u32 {
+        self.inner.with(py, |c| c.input_sample_rate())
     }
 
     /// Output audio sample rate in Hz.
     #[getter]
-    fn output_sample_rate(&self) -> u32 {
-        self.inner.output_sample_rate()
+    fn output_sample_rate(&self, py: Python) -> u32 {
+        self.inner.with(py, |c| c.output_sample_rate())
     }
 
     /// Number of audio channels (always 1 = mono).
@@ -635,86 +624,115 @@ impl SipEndpoint {
     }
 
     /// Start recording a call to a WAV file (stereo by default: L=user, R=agent).
+    /// Releases GIL during mutex ops.
     #[pyo3(signature = (session_id, path, stereo=true))]
-    fn start_recording(&self, session_id: &str, path: &str, stereo: bool) -> PyResult<()> {
-        self.inner
-            .start_recording(session_id, path, stereo)
-            .map_err(py_err)
+    fn start_recording(&self, py: Python, session_id: &str, path: &str, stereo: bool) -> PyResult<()> {
+        self.inner.with(py, move |c| c.start_recording(session_id, path, stereo)).map_err(py_err)
     }
 
-    /// Stop recording a call.
-    fn stop_recording(&self, session_id: &str) -> PyResult<()> {
-        self.inner
-            .stop_recording(session_id)
-            .map_err(py_err)
+    /// Stop recording a call. Releases GIL during mutex ops.
+    fn stop_recording(&self, py: Python, session_id: &str) -> PyResult<()> {
+        self.inner.with(py, move |c| c.stop_recording(session_id)).map_err(py_err)
     }
 
-    /// Start async beep detection on a call.
+    /// Start async beep detection on a call. Releases GIL during mutex ops.
     #[pyo3(signature = (session_id, timeout_ms=30000, min_duration_ms=80, max_duration_ms=5000))]
     fn detect_beep(
         &self,
+        py: Python,
         session_id: String,
         timeout_ms: u32,
         min_duration_ms: u32,
         max_duration_ms: u32,
     ) -> PyResult<()> {
+        let sample_rate = self.inner.with(py, |c| c.input_sample_rate());
         let config = RustBeepConfig {
-            sample_rate: self.inner.input_sample_rate(),
+            sample_rate,
             timeout_ms,
             min_duration_ms,
             max_duration_ms,
             ..Default::default()
         };
-        self.inner
-            .detect_beep(&session_id, config)
-            .map_err(py_err)
+        self.inner.with(py, move |c| c.detect_beep(&session_id, config)).map_err(py_err)
     }
 
-    /// Cancel beep detection on a call.
-    fn cancel_beep_detection(&self, session_id: &str) -> PyResult<()> {
-        self.inner
-            .cancel_beep_detection(session_id)
-            .map_err(py_err)
+    /// Cancel beep detection on a call. Releases GIL during mutex ops.
+    fn cancel_beep_detection(&self, py: Python, session_id: &str) -> PyResult<()> {
+        self.inner.with(py, move |c| c.cancel_beep_detection(session_id)).map_err(py_err)
     }
 
-    /// Mark the current playback segment as complete.
-    fn flush(&self, session_id: &str) -> PyResult<()> {
-        self.inner
-            .flush(session_id)
-            .map_err(py_err)
+    /// Mark the current playback segment as complete. Releases GIL during mutex ops.
+    fn flush(&self, py: Python, session_id: &str) -> PyResult<()> {
+        self.inner.with(py, move |c| c.flush(session_id)).map_err(py_err)
     }
 
     /// Clear all queued outgoing audio immediately (barge-in / interruption).
-    fn clear_buffer(&self, session_id: &str) -> PyResult<()> {
-        self.inner
-            .clear_buffer(session_id)
-            .map_err(py_err)
+    /// Releases GIL during mutex ops.
+    fn clear_buffer(&self, py: Python, session_id: &str) -> PyResult<()> {
+        self.inner.with(py, move |c| c.clear_buffer(session_id)).map_err(py_err)
     }
 
     /// Block until all queued audio finishes playing. Releases GIL.
     #[pyo3(signature = (session_id, timeout_ms=5000))]
     fn wait_for_playout(&self, py: Python, session_id: &str, timeout_ms: u64) -> PyResult<bool> {
-        let inner = &self.inner;
-        py.allow_threads(|| inner.wait_for_playout(session_id, timeout_ms)).map_err(py_err)
+        self.inner.with(py, |c| c.wait_for_playout(session_id, timeout_ms)).map_err(py_err)
     }
 
-    /// Pause audio playback.
-    fn pause(&self, session_id: &str) -> PyResult<()> {
-        self.inner
-            .pause(session_id)
-            .map_err(py_err)
+    /// Pause audio playback. Releases GIL during mutex ops.
+    fn pause(&self, py: Python, session_id: &str) -> PyResult<()> {
+        self.inner.with(py, move |c| c.pause(session_id)).map_err(py_err)
     }
 
-    /// Resume audio playback.
-    fn resume(&self, session_id: &str) -> PyResult<()> {
-        self.inner
-            .resume(session_id)
-            .map_err(py_err)
+    /// Resume audio playback. Releases GIL during mutex ops.
+    fn resume(&self, py: Python, session_id: &str) -> PyResult<()> {
+        self.inner.with(py, move |c| c.resume(session_id)).map_err(py_err)
+    }
+
+    /// Register a Python event sink. When set, the endpoint spawns a
+    /// dispatcher thread that drains ``inner.events()`` and invokes the
+    /// sink (with the GIL held) once per event. The sink body MUST be
+    /// non-blocking, non-locking, and MUST NOT re-enter Rust.
+    ///
+    /// Mirrors LiveKit's ``ffi_event_callback`` registered via
+    /// ``livekit_ffi_initialize`` — same architectural shape: a single
+    /// constrained Python callable invoked from a thread that owns the
+    /// crossbeam receiver, doing only ``call_soon_threadsafe`` into an
+    /// asyncio Queue. Replaces the executor-based ``wait_for_event``
+    /// pump, eliminating the 2-3 extra asyncio loop ticks per event.
+    ///
+    /// Idempotent: a second call replaces the sink without re-spawning
+    /// the thread. ``None`` clears the sink (events fall through to
+    /// ``wait_for_event``/``poll_event`` as before).
+    #[pyo3(signature = (callback=None))]
+    fn set_event_sink(&self, py: Python, callback: Option<Py<PyAny>>) -> PyResult<()> {
+        self.event_sink.set(py, callback);
+        // Spawn dispatcher if not already running. Spawning the FIRST time
+        // a sink is set keeps the cost off the new() path for users who
+        // don't use the sink.
+        let mut handle_slot = self
+            .dispatcher_handle
+            .lock()
+            .map_err(|_| py_err("dispatcher handle lock poisoned"))?;
+        if handle_slot.is_none() {
+            let rx = self.inner.with(py, |c| c.events());
+            let sink = self.event_sink.clone();
+            let stop = self.dispatcher_stop.clone();
+            *handle_slot = Some(thread::spawn(move || dispatcher_loop(rx, sink, stop)));
+        }
+        Ok(())
     }
 
     /// Poll for the next event (non-blocking). Returns a dict or None.
-    fn poll_event(&self, py: Python) -> PyResult<Option<PyObject>> {
-        match self.inner.events().try_recv() {
+    ///
+    /// **Deprecated when a sink is registered** — the dispatcher thread
+    /// owns the receiver exclusively, so this returns ``None`` to avoid
+    /// the dual-consumer race that hit prod pre-Phase-B. Kept functional
+    /// when no sink is set (CLI examples still rely on it).
+    fn poll_event(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
+        if self.event_sink.is_set(py) {
+            return Ok(None);
+        }
+        match self.inner.with(py, |c| c.events().try_recv()) {
             Ok(event) => {
                 let dict = event_to_dict(py, &event)?;
                 Ok(Some(dict.into()))
@@ -725,14 +743,29 @@ impl SipEndpoint {
 
     /// Block until an event is received. Returns a dict.
     /// Timeout in milliseconds (0 = wait forever).
+    ///
+    /// **Deprecated when a sink is registered** — see ``poll_event``.
     #[pyo3(signature = (timeout_ms=0))]
-    fn wait_for_event(&self, py: Python, timeout_ms: u64) -> PyResult<Option<PyObject>> {
-        let rx = self.inner.events();
+    fn wait_for_event(&self, py: Python, timeout_ms: u64) -> PyResult<Option<Py<PyAny>>> {
+        // Check sink presence and RELEASE the event_sink guard BEFORE
+        // allow_threads. Holding the guard across allow_threads (which drops the
+        // GIL) gives this method an event_sink->GIL ordering that deadlocks the
+        // dispatcher_loop / set_event_sink / poll_event (all GIL->event_sink) via
+        // AB-BA: the dispatcher holds the GIL and waits on event_sink while this
+        // holds event_sink and waits to re-acquire the GIL. The `.lock()`
+        // temporary is dropped at the end of this statement, before allow_threads.
+        // Sleep briefly to avoid busy-looping callers that still poll after
+        // registering a sink.
+        let sink_active = self.event_sink.is_set(py);
+        if sink_active {
+            py.detach(|| thread::sleep(Duration::from_millis(timeout_ms.max(10).min(1000))));
+            return Ok(None);
+        }
+        let rx = self.inner.with(py, |c| c.events());
         let result = if timeout_ms == 0 {
-            // Allow other Python threads to run while we block
-            py.allow_threads(|| rx.recv().ok())
+            py.detach(|| rx.recv().ok())
         } else {
-            py.allow_threads(|| rx.recv_timeout(Duration::from_millis(timeout_ms)).ok())
+            py.detach(|| rx.recv_timeout(Duration::from_millis(timeout_ms)).ok())
         };
         match result {
             Some(event) => {
@@ -743,45 +776,33 @@ impl SipEndpoint {
         }
     }
 
-    /// Shut down the endpoint. Stops the event loop and tears down SIP stack. Releases GIL.
+    /// Shut down the endpoint. Stops dispatcher thread + tears down SIP stack.
+    /// Releases GIL.
     fn shutdown(&self, py: Python) -> PyResult<()> {
-        self.event_thread_running.store(false, Ordering::Relaxed);
-        let inner = &self.inner;
-        py.allow_threads(|| inner.shutdown()).map_err(py_err)
-    }
-}
-
-impl SipEndpoint {
-    /// Start the background event dispatch thread if not already running.
-    fn ensure_event_loop(&self) {
-        if self.event_thread_running.swap(true, Ordering::Relaxed) {
-            return; // already running
-        }
-
-        let rx = self.inner.events();
-        let callbacks = self.callbacks.clone();
-        let running = self.event_thread_running.clone();
-
-        std::thread::spawn(move || {
-            while running.load(Ordering::Relaxed) {
-                match rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(event) => {
-                        Python::with_gil(|py| {
-                            dispatch_event(py, &callbacks, &event);
-                        });
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                }
+        // Stop dispatcher first so the inner shutdown() path doesn't race
+        // with the dispatcher trying to invoke a sink that may already
+        // have been GC'd.
+        self.dispatcher_stop.store(true, Ordering::Relaxed);
+        if let Ok(mut slot) = self.dispatcher_handle.lock() {
+            if let Some(handle) = slot.take() {
+                // Best-effort join — don't hold the GIL while waiting.
+                py.detach(|| {
+                    let _ = handle.join();
+                });
             }
-        });
+        }
+        self.inner.with(py, |c| c.shutdown()).map_err(py_err)
     }
 }
 
 /// Plivo WebSocket audio streaming endpoint.
 #[pyclass]
 struct AudioStreamEndpoint {
-    inner: RustAudioStreamEndpoint,
+    inner: Core<RustAudioStreamEndpoint>,
+    /// See ``SipEndpoint.event_sink`` — same architectural shape.
+    event_sink: Arc<EventSink>,
+    dispatcher_stop: Arc<AtomicBool>,
+    dispatcher_handle: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
 }
 
 #[pymethods]
@@ -793,187 +814,245 @@ impl AudioStreamEndpoint {
             listen_addr: listen_addr.into(), input_sample_rate, output_sample_rate, auto_hangup,
         };
         let protocol = std::sync::Arc::new(PlivoProtocol::new(plivo_auth_id.into(), plivo_auth_token.into()));
-        let inner = RustAudioStreamEndpoint::new(config, protocol).map_err(py_err)?;
-        Ok(Self { inner })
+        let inner = Core::new(RustAudioStreamEndpoint::new(config, protocol).map_err(py_err)?);
+        Ok(Self {
+            inner,
+            event_sink: Arc::new(EventSink::new()),
+            dispatcher_stop: Arc::new(AtomicBool::new(false)),
+            dispatcher_handle: Arc::new(Mutex::new(None)),
+        })
     }
 
-    fn send_audio(&self, session_id: &str, frame: &AudioFrame) -> PyResult<()> {
-        self.inner.send_audio(session_id, &frame.to_rust()).map_err(py_err)
+    /// See ``SipEndpoint.set_event_sink``.
+    #[pyo3(signature = (callback=None))]
+    fn set_event_sink(&self, py: Python, callback: Option<Py<PyAny>>) -> PyResult<()> {
+        self.event_sink.set(py, callback);
+        let mut handle_slot = self
+            .dispatcher_handle
+            .lock()
+            .map_err(|_| py_err("dispatcher handle lock poisoned"))?;
+        if handle_slot.is_none() {
+            let rx = self.inner.with(py, |c| c.events());
+            let sink = self.event_sink.clone();
+            let stop = self.dispatcher_stop.clone();
+            *handle_slot = Some(thread::spawn(move || dispatcher_loop(rx, sink, stop)));
+        }
+        Ok(())
     }
 
-    fn send_audio_bytes(&self, session_id: &str, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
+    /// Send an audio frame. Releases GIL during mutex ops.
+    fn send_audio(&self, py: Python, session_id: &str, frame: &AudioFrame) -> PyResult<()> {
+        let f = frame.to_rust();
+        self.inner.with(py, move |c| c.send_audio(session_id, &f)).map_err(py_err)
+    }
+
+    /// Send raw PCM bytes. Releases GIL during mutex ops.
+    fn send_audio_bytes(&self, py: Python, session_id: &str, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
         let frame = RustAudioFrame::from_bytes(audio, sample_rate, num_channels);
-        self.inner.send_audio(session_id, &frame).map_err(py_err)
+        self.inner.with(py, move |c| c.send_audio(session_id, &frame)).map_err(py_err)
     }
 
-    /// Pushes audio into the shared buffer with backpressure callback.
-    /// If buffer is below threshold, `notify_fn` fires immediately.
-    /// If above threshold, `notify_fn` fires when buffer drains.
-    /// Matches SipEndpoint.send_audio_notify — used by SipAudioSource.
-    fn send_audio_notify(&self, py: Python, session_id: &str, audio: &[u8], sample_rate: u32, num_channels: u32, notify_fn: Py<PyAny>) -> PyResult<()> {
+    /// Push audio frame and return the async_id to await on the endpoint's
+    /// event channel.
+    ///
+    /// **Always returns the async_id** — Python MUST always await
+    /// `AudioCaptureComplete { async_id }` (or `AudioCaptureError` on
+    /// cancel/flush/drop) via the endpoint's event broker. Mirrors
+    /// LiveKit's `capture_audio_frame` invariant
+    /// (`livekit/rtc/audio_source.py:142-149`): every request produces
+    /// exactly one matching completion event.
+    ///
+    /// Callers MUST `subscribe(filter_fn=...)` to the event broker
+    /// BEFORE calling this method — the immediate-emit path can fire
+    /// before this returns, and an unsubscribed event would be lost.
+    fn send_audio_async(&self, py: Python, session_id: &str, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<u64> {
         let frame = RustAudioFrame::from_bytes(audio, sample_rate, num_channels);
-        let callback: Box<dyn FnOnce() + Send> = Box::new(move || {
-            Python::with_gil(|py| {
-                if let Err(e) = notify_fn.call0(py) {
-                    e.print(py);
-                }
-            });
-        });
-        let inner = &self.inner;
-        py.allow_threads(move || inner.send_audio_with_callback(session_id, &frame, callback))
+        self.inner.with(py, move |c| c.send_audio_async(session_id, &frame))
             .map_err(py_err)
     }
 
     /// Send background audio to be mixed with agent voice in the send loop.
     /// Used internally by publish_track (background audio, hold music).
-    fn send_background_audio(&self, session_id: &str, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
+    ///
+    /// Releases GIL during mutex acquisition — critical for the
+    /// `BackgroundAudioPlayer(thinking_sound=...)` path which calls this
+    /// at ~50 fps from the main asyncio thread. Pre-0.2.0 this method
+    /// held the GIL while acquiring the sessions Mutex, which (combined
+    /// with the AudioBuffer Drop firing Python callbacks under that same
+    /// Mutex) was the proximate cause of the prod deadlock.
+    fn send_background_audio(&self, py: Python, session_id: &str, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
         let frame = RustAudioFrame::from_bytes(audio, sample_rate, num_channels);
-        self.inner.send_background_audio(session_id, &frame).map_err(py_err)
+        self.inner.with(py, move |c| c.send_background_audio(session_id, &frame))
+            .map_err(py_err)
     }
 
-    fn recv_audio(&self, session_id: &str) -> PyResult<Option<AudioFrame>> {
-        self.inner.recv_audio(session_id).map(|opt| opt.map(AudioFrame::from_rust)).map_err(py_err)
+    /// Non-blocking receive. Releases GIL during mutex ops.
+    fn recv_audio(&self, py: Python, session_id: &str) -> PyResult<Option<AudioFrame>> {
+        self.inner.with(py, move |c| c.recv_audio(session_id))
+            .map(|opt| opt.map(AudioFrame::from_rust))
+            .map_err(py_err)
     }
 
-    fn recv_audio_bytes(&self, session_id: &str) -> PyResult<Option<(Vec<u8>, u32, u32)>> {
-        self.inner.recv_audio(session_id).map(|opt| opt.map(|f| (f.as_bytes(), f.sample_rate, f.num_channels))).map_err(py_err)
+    /// Non-blocking receive returning raw bytes. Releases GIL during mutex ops.
+    fn recv_audio_bytes(&self, py: Python, session_id: &str) -> PyResult<Option<(Vec<u8>, u32, u32)>> {
+        self.inner.with(py, move |c| c.recv_audio(session_id))
+            .map(|opt| opt.map(|f| (f.as_bytes(), f.sample_rate, f.num_channels)))
+            .map_err(py_err)
     }
 
     #[pyo3(signature = (session_id, timeout_ms=20))]
     fn recv_audio_blocking(&self, py: Python, session_id: &str, timeout_ms: u64) -> PyResult<Option<AudioFrame>> {
-        let inner = &self.inner;
-        py.allow_threads(|| inner.recv_audio_blocking(session_id, timeout_ms).map(|opt| opt.map(AudioFrame::from_rust))).map_err(py_err)
+        self.inner.with(py, |c| c.recv_audio_blocking(session_id, timeout_ms).map(|opt| opt.map(AudioFrame::from_rust))).map_err(py_err)
     }
 
     #[pyo3(signature = (session_id, timeout_ms=20))]
     fn recv_audio_bytes_blocking(&self, py: Python, session_id: &str, timeout_ms: u64) -> PyResult<Option<(Vec<u8>, u32, u32)>> {
-        let inner = &self.inner;
-        py.allow_threads(|| inner.recv_audio_blocking(session_id, timeout_ms).map(|opt| opt.map(|f| (f.as_bytes(), f.sample_rate, f.num_channels)))).map_err(py_err)
+        self.inner.with(py, |c| c.recv_audio_blocking(session_id, timeout_ms).map(|opt| opt.map(|f| (f.as_bytes(), f.sample_rate, f.num_channels)))).map_err(py_err)
     }
 
-    fn mute(&self, session_id: &str) -> PyResult<()> {
-        self.inner.mute(session_id).map_err(py_err)
+    /// Mute. Releases the GIL — `inner.mute()` takes the sessions Mutex; the
+    /// SIP twin (SipEndpoint.mute) was converted but this audio_stream one was
+    /// left holding the GIL across that lock (the A.1 GIL-stall class).
+    fn mute(&self, py: Python, session_id: &str) -> PyResult<()> {
+        self.inner.with(py, move |c| c.mute(session_id)).map_err(py_err)
     }
 
-    fn unmute(&self, session_id: &str) -> PyResult<()> {
-        self.inner.unmute(session_id).map_err(py_err)
+    fn unmute(&self, py: Python, session_id: &str) -> PyResult<()> {
+        self.inner.with(py, move |c| c.unmute(session_id)).map_err(py_err)
     }
 
-    fn pause(&self, session_id: &str) -> PyResult<()> {
-        self.inner.pause(session_id).map_err(py_err)
+    fn pause(&self, py: Python, session_id: &str) -> PyResult<()> {
+        self.inner.with(py, move |c| c.pause(session_id)).map_err(py_err)
     }
 
-    fn resume(&self, session_id: &str) -> PyResult<()> {
-        self.inner.resume(session_id).map_err(py_err)
+    fn resume(&self, py: Python, session_id: &str) -> PyResult<()> {
+        self.inner.with(py, move |c| c.resume(session_id)).map_err(py_err)
     }
 
-    fn clear_buffer(&self, session_id: &str) -> PyResult<()> {
-        self.inner.clear_buffer(session_id).map_err(py_err)
+    fn clear_buffer(&self, py: Python, session_id: &str) -> PyResult<()> {
+        self.inner.with(py, move |c| c.clear_buffer(session_id)).map_err(py_err)
     }
 
     /// Send checkpoint — Plivo responds with playedStream when audio finishes.
+    /// Releases GIL during mutex ops.
     #[pyo3(signature = (session_id, name=None))]
-    fn checkpoint(&self, session_id: &str, name: Option<&str>) -> PyResult<String> {
-        self.inner.checkpoint(session_id, name).map_err(py_err)
+    fn checkpoint(&self, py: Python, session_id: &str, name: Option<&str>) -> PyResult<String> {
+        self.inner.with(py, move |c| c.checkpoint(session_id, name)).map_err(py_err)
     }
 
-    /// Flush: send checkpoint and mark segment complete.
-    fn flush(&self, session_id: &str) -> PyResult<()> {
-        self.inner.flush(session_id).map_err(py_err)
+    /// Flush: send checkpoint and mark segment complete. Releases GIL during mutex ops.
+    fn flush(&self, py: Python, session_id: &str) -> PyResult<()> {
+        self.inner.with(py, move |c| c.flush(session_id)).map_err(py_err)
     }
 
     /// Wait for last checkpoint to be confirmed (playedStream event from Plivo).
     #[pyo3(signature = (session_id, timeout_ms=5000))]
     fn wait_for_playout(&self, py: Python, session_id: &str, timeout_ms: u64) -> PyResult<bool> {
-        let inner = &self.inner;
-        py.allow_threads(|| inner.wait_for_playout(session_id, timeout_ms)).map_err(py_err)
+        self.inner.with(py, |c| c.wait_for_playout(session_id, timeout_ms)).map_err(py_err)
     }
 
-    fn queued_frames(&self, session_id: &str) -> PyResult<usize> {
-        self.inner.queued_frames(session_id).map_err(py_err)
+    /// Number of audio frames queued for sending. Releases GIL during mutex ops.
+    fn queued_frames(&self, py: Python, session_id: &str) -> PyResult<usize> {
+        self.inner.with(py, move |c| c.queued_frames(session_id)).map_err(py_err)
     }
 
-    fn queued_duration_ms(&self, session_id: &str) -> PyResult<f64> {
-        self.inner.queued_duration_ms(session_id).map_err(py_err)
+    /// Queued audio duration in ms. Releases GIL during mutex ops.
+    fn queued_duration_ms(&self, py: Python, session_id: &str) -> PyResult<f64> {
+        self.inner.with(py, move |c| c.queued_duration_ms(session_id)).map_err(py_err)
     }
 
-    #[pyo3(signature = (session_id, notify_fn))]
-    fn wait_for_playout_notify(&self, _py: Python, session_id: &str, notify_fn: Py<PyAny>) -> PyResult<()> {
-        let callback: Box<dyn FnOnce() + Send> = Box::new(move || {
-            Python::with_gil(|py| {
-                if let Err(e) = notify_fn.call0(py) { e.print(py); }
-            });
-        });
-        self.inner.wait_for_playout_notify(session_id, callback).map_err(py_err)
+    /// Register an async_id for "buffer drained to empty" notification.
+    ///
+    /// **Always returns the async_id** — Python MUST always await
+    /// `AudioPlayoutComplete { async_id }` (or `AudioCaptureError` on
+    /// cancel/flush/drop) via the endpoint's event broker. The
+    /// completion event always fires (immediately if buffer already
+    /// empty, deferred if not). Multiple concurrent waiters supported.
+    /// Pause-aware.
+    fn wait_for_playout_async(&self, py: Python, session_id: &str) -> PyResult<u64> {
+        self.inner.with(py, move |c| c.wait_for_playout_async(session_id))
+            .map_err(py_err)
     }
 
-    /// Send DTMF digits via Plivo audio streaming.
-    fn send_dtmf(&self, session_id: &str, digits: &str) -> PyResult<()> {
-        self.inner.send_dtmf(session_id, digits).map_err(py_err)
+    /// Send DTMF digits via Plivo audio streaming. Releases GIL during mutex ops.
+    fn send_dtmf(&self, py: Python, session_id: &str, digits: &str) -> PyResult<()> {
+        self.inner.with(py, move |c| c.send_dtmf(session_id, digits)).map_err(py_err)
     }
 
     /// Start async beep detection on incoming audio for an audio stream session.
+    /// Releases GIL during mutex ops.
     #[pyo3(signature = (session_id, timeout_ms=30000, min_duration_ms=80, max_duration_ms=5000))]
     fn detect_beep(
         &self,
+        py: Python,
         session_id: String,
         timeout_ms: u32,
         min_duration_ms: u32,
         max_duration_ms: u32,
     ) -> PyResult<()> {
+        let sample_rate = self.inner.with(py, |c| c.input_sample_rate());
         let config = RustBeepConfig {
-            sample_rate: self.inner.input_sample_rate(),
+            sample_rate,
             timeout_ms,
             min_duration_ms,
             max_duration_ms,
             ..Default::default()
         };
-        self.inner
-            .detect_beep(&session_id, config)
-            .map_err(py_err)
+        self.inner.with(py, move |c| c.detect_beep(&session_id, config)).map_err(py_err)
     }
 
-    /// Cancel beep detection on an audio stream session.
-    fn cancel_beep_detection(&self, session_id: &str) -> PyResult<()> {
-        self.inner
-            .cancel_beep_detection(session_id)
-            .map_err(py_err)
+    /// Cancel beep detection on an audio stream session. Releases GIL during mutex ops.
+    fn cancel_beep_detection(&self, py: Python, session_id: &str) -> PyResult<()> {
+        self.inner.with(py, move |c| c.cancel_beep_detection(session_id)).map_err(py_err)
     }
 
     /// Hang up via Plivo REST API. Releases GIL (blocks on HTTP request).
     #[pyo3(signature = (session_id, auth_id=None, auth_token=None))]
     fn hangup(&self, py: Python, session_id: &str, auth_id: Option<&str>, auth_token: Option<&str>) -> PyResult<()> {
-        let inner = &self.inner;
-        py.allow_threads(move || inner.hangup_with_auth(session_id, auth_id, auth_token)).map_err(py_err)
+        self.inner.with(py, move |c| c.hangup_with_auth(session_id, auth_id, auth_token)).map_err(py_err)
     }
 
-    /// Send a raw text message over the WebSocket.
-    fn send_raw_message(&self, session_id: &str, message: &str) -> PyResult<()> {
-        self.inner.send_raw_message(session_id, message).map_err(py_err)
+    /// Send a raw text message over the WebSocket. Releases GIL during mutex ops.
+    fn send_raw_message(&self, py: Python, session_id: &str, message: &str) -> PyResult<()> {
+        self.inner.with(py, move |c| c.send_raw_message(session_id, message)).map_err(py_err)
     }
 
     /// Start recording (OGG/Opus stereo). Wired through LiveKit's record=True.
-    fn start_recording(&self, session_id: &str, path: &str, stereo: bool) -> PyResult<()> {
-        self.inner.start_recording(session_id, path, stereo).map_err(py_err)
+    /// Releases GIL during mutex ops.
+    fn start_recording(&self, py: Python, session_id: &str, path: &str, stereo: bool) -> PyResult<()> {
+        self.inner.with(py, move |c| c.start_recording(session_id, path, stereo)).map_err(py_err)
     }
 
-    /// Stop recording.
-    fn stop_recording(&self, session_id: &str) -> PyResult<()> {
-        self.inner.stop_recording(session_id).map_err(py_err)
+    /// Stop recording. Releases GIL during mutex ops.
+    fn stop_recording(&self, py: Python, session_id: &str) -> PyResult<()> {
+        self.inner.with(py, move |c| c.stop_recording(session_id)).map_err(py_err)
     }
 
-    fn poll_event(&self, py: Python) -> PyResult<Option<PyObject>> {
-        match self.inner.events().try_recv() {
+    /// **Deprecated when a sink is registered** — see ``set_event_sink``.
+    fn poll_event(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
+        if self.event_sink.is_set(py) {
+            return Ok(None);
+        }
+        match self.inner.with(py, |c| c.events().try_recv()) {
             Ok(event) => { let dict = event_to_dict(py, &event)?; Ok(Some(dict.into())) }
             Err(_) => Ok(None),
         }
     }
 
+    /// **Deprecated when a sink is registered** — see ``set_event_sink``.
     #[pyo3(signature = (timeout_ms=0))]
-    fn wait_for_event(&self, py: Python, timeout_ms: u64) -> PyResult<Option<PyObject>> {
-        let rx = self.inner.events();
-        let result = if timeout_ms == 0 { py.allow_threads(|| rx.recv().ok()) }
-        else { py.allow_threads(|| rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)).ok()) };
+    fn wait_for_event(&self, py: Python, timeout_ms: u64) -> PyResult<Option<Py<PyAny>>> {
+        // See SipEndpoint.wait_for_event: release the event_sink guard BEFORE
+        // allow_threads to keep this method GIL->event_sink. Holding it across
+        // allow_threads would deadlock the dispatcher_loop via AB-BA.
+        let sink_active = self.event_sink.is_set(py);
+        if sink_active {
+            py.detach(|| thread::sleep(Duration::from_millis(timeout_ms.max(10).min(1000))));
+            return Ok(None);
+        }
+        let rx = self.inner.with(py, |c| c.events());
+        let result = if timeout_ms == 0 { py.detach(|| rx.recv().ok()) }
+        else { py.detach(|| rx.recv_timeout(Duration::from_millis(timeout_ms)).ok()) };
         match result {
             Some(event) => { let dict = event_to_dict(py, &event)?; Ok(Some(dict.into())) }
             None => Ok(None),
@@ -981,14 +1060,20 @@ impl AudioStreamEndpoint {
     }
 
     #[getter]
-    fn input_sample_rate(&self) -> u32 { self.inner.input_sample_rate() }
+    fn input_sample_rate(&self, py: Python) -> u32 { self.inner.with(py, |c| c.input_sample_rate()) }
 
     #[getter]
-    fn output_sample_rate(&self) -> u32 { self.inner.output_sample_rate() }
+    fn output_sample_rate(&self, py: Python) -> u32 { self.inner.with(py, |c| c.output_sample_rate()) }
 
     fn shutdown(&self, py: Python) -> PyResult<()> {
-        let inner = &self.inner;
-        py.allow_threads(|| inner.shutdown()).map_err(py_err)
+        // Stop dispatcher first so it doesn't race with inner.shutdown().
+        self.dispatcher_stop.store(true, Ordering::Relaxed);
+        if let Ok(mut slot) = self.dispatcher_handle.lock() {
+            if let Some(handle) = slot.take() {
+                py.detach(|| { let _ = handle.join(); });
+            }
+        }
+        self.inner.with(py, |c| c.shutdown()).map_err(py_err)
     }
 }
 

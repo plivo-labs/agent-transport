@@ -24,9 +24,9 @@ from agent_transport.sip.livekit.audio_stream_server import (
     AudioStreamServer,
     JobContext,
 )
-from agent_transport.sip.livekit.audio_stream_io import (
-    AudioStreamInput,
-    AudioStreamOutput,
+from agent_transport.sip.livekit._audio_io import (
+    TransportAudioInput,
+    TransportAudioOutput,
 )
 from agent_transport.sip.livekit.server import JobProcess
 from agent_transport.sip.livekit._room_facade import TransportRoom
@@ -35,7 +35,7 @@ __all__ = [
     "AudioStreamServer",
     "JobContext",
     "JobProcess",
-    "AudioStreamInput",
-    "AudioStreamOutput",
+    "TransportAudioInput",
+    "TransportAudioOutput",
     "TransportRoom",
 ]

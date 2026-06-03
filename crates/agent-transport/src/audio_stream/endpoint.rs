@@ -22,7 +22,7 @@ use beep_detector::{BeepDetector, BeepDetectorConfig, BeepDetectorResult};
 use crate::audio::AudioFrame;
 use crate::error::{EndpointError, Result};
 use crate::events::EndpointEvent;
-use crate::sip::audio_buffer::{AudioBuffer, CompletionCallback};
+use crate::sip::audio_buffer::AudioBuffer;
 use crate::sync::LockExt;
 use super::config::AudioStreamConfig;
 use super::protocol::{StreamEvent, StreamProtocol, WireEncoding};
@@ -37,6 +37,16 @@ struct StreamSession {
     incoming_rx: Receiver<AudioFrame>,
     audio_buf: Arc<AudioBuffer>,
     bg_audio_buf: Arc<AudioBuffer>,
+    /// Two-state lifecycle: `false` = Active (transport up), `true` = Terminated
+    /// (transport gone, but the session struct lingers in the HashMap until
+    /// Python calls `hangup(sid)`). After `terminated` is true, audio FFI
+    /// methods (`send_audio_async`, `wait_for_playout_async`,
+    /// `clear_buffer`, `pause`, `resume`) return success-early with
+    /// no-op semantics, mirroring LiveKit's `rtc.AudioSource` behaviour
+    /// after `_ffi_handle.disposed`. This lets the Python audio source
+    /// outlive the transport without surfacing `CallNotActive` from the
+    /// race window between WS close and Python `aclose()`.
+    terminated: Arc<AtomicBool>,
     /// Resampler for incoming agent audio (e.g. 24kHz TTS → 8kHz wire rate).
     /// Lazy-initialized on first mismatched frame, matching SIP endpoint pattern.
     input_resampler: Arc<Mutex<Option<crate::sip::resampler::Resampler>>>,
@@ -70,13 +80,21 @@ pub struct AudioStreamEndpoint {
     event_rx: Receiver<EndpointEvent>,
     cancel: CancellationToken,
     recording_mgr: Arc<crate::recorder::RecordingManager>,
+    /// Monotonic counter for allocating async_ids returned by
+    /// `send_audio_async` / `wait_for_playout_async`. Adapters use these
+    /// ids to await the matching `EndpointEvent` (AudioCaptureComplete,
+    /// AudioPlayoutComplete, AudioCaptureError) from the event channel.
+    async_id_counter: Arc<AtomicU64>,
 }
 
 impl AudioStreamEndpoint {
     pub fn new(config: AudioStreamConfig, protocol: Arc<dyn StreamProtocol>) -> Result<Self> {
         if config.input_sample_rate == 0 || config.output_sample_rate == 0 { return Err(EndpointError::Other("sample_rate must be > 0".into())); }
         let rt = Runtime::new().map_err(|e| EndpointError::Other(e.to_string()))?;
-        let (etx, erx) = crossbeam_channel::unbounded();
+        // Bounded so a stalled Python dispatcher can't grow this without limit
+        // (OOM). Emits use try_send → drop-on-full; the dispatcher warns at a
+        // high-water mark well before the cap. See events::EVENT_CHANNEL_CAP.
+        let (etx, erx) = crossbeam_channel::bounded(crate::events::EVENT_CHANNEL_CAP);
         let cancel = CancellationToken::new();
         let sessions = Arc::new(Mutex::new(HashMap::new()));
 
@@ -97,19 +115,48 @@ impl AudioStreamEndpoint {
         Ok(Self {
             config, protocol, runtime: rt, sessions, event_tx: etx, event_rx: erx,
             cancel, recording_mgr,
+            async_id_counter: Arc::new(AtomicU64::new(1)),
         })
     }
 
     // ─── Audio send/recv ─────────────────────────────────────────────────
 
-    pub fn send_audio_with_callback(&self, session_id: &str, frame: &AudioFrame, on_complete: CompletionCallback) -> Result<()> {
+    /// Push audio frame and return the `async_id` the caller must await
+    /// on `EndpointEvent::AudioCaptureComplete` (or `AudioCaptureError`).
+    ///
+    /// **Always returns `Ok(async_id)` on success** — the completion
+    /// event always fires (immediately if buffer ended at-or-below
+    /// threshold, deferred if above). Mirrors LiveKit's
+    /// `capture_audio_frame` invariant: every request produces exactly
+    /// one matching event (`livekit/rtc/audio_source.py:142-149`).
+    ///
+    /// Returns `Err` synchronously only for misuse (session not active,
+    /// buffer overflow). In the error case no event is emitted, so the
+    /// caller's `wait_for(predicate)` would not find a match — callers
+    /// MUST unsubscribe on the synchronous-error path before awaiting.
+    pub fn send_audio_async(&self, session_id: &str, frame: &AudioFrame) -> Result<u64> {
+        let async_id = self.async_id_counter.fetch_add(1, Ordering::Relaxed);
         let (audio_buf, resampler) = {
             let s = self.sessions.lock_or_recover();
             let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
+            // Terminated session: short-circuit with immediate completion.
+            // Matches LiveKit's `rtc.AudioSource.capture_frame:119` early-return
+            // on `_ffi_handle.disposed` — the equivalent pre-call guard for our
+            // sid-keyed handle model. Audio is discarded; the per-frame async_id
+            // contract is preserved so the Python audio source's wait_for(...)
+            // resolves without surfacing CallNotActive.
+            if sess.terminated.load(Ordering::Acquire) {
+                let _ = self.event_tx.try_send(EndpointEvent::AudioCaptureComplete {
+                    session_id: session_id.to_string(),
+                    async_id,
+                    cancelled: false,
+                });
+                return Ok(async_id);
+            }
             (sess.audio_buf.clone(), sess.input_resampler.clone())
         };
         let target_rate = self.config.output_sample_rate;
-        if frame.sample_rate != 0 && frame.sample_rate != target_rate {
+        let result = if frame.sample_rate != 0 && frame.sample_rate != target_rate {
             // Resample incoming audio (e.g. 24kHz TTS → 8kHz wire rate).
             // Recreate the resampler if the source sample rate has changed
             // (e.g. TTS switched from 24kHz to 16kHz) — otherwise speex filter
@@ -125,26 +172,42 @@ impl AudioStreamEndpoint {
             }
             if let Some(ref mut r) = *guard {
                 let resampled = r.process(&frame.data).to_vec();
-                audio_buf.push(&resampled, on_complete)
-                    .map_err(|e| EndpointError::Other(e.into()))
+                audio_buf.push(&resampled, async_id)
             } else {
-                audio_buf.push(&frame.data, on_complete)
-                    .map_err(|e| EndpointError::Other(e.into()))
+                audio_buf.push(&frame.data, async_id)
             }
         } else {
-            audio_buf.push(&frame.data, on_complete)
-                .map_err(|e| EndpointError::Other(e.into()))
-        }
+            audio_buf.push(&frame.data, async_id)
+        };
+        result.map_err(|e| EndpointError::Other(e.into()))?;
+        Ok(async_id)
     }
 
+    /// Convenience: push audio without awaiting the completion event.
+    /// Internally still produces an `AudioCaptureComplete` event — the
+    /// caller just doesn't consume it. Useful for adapters that don't
+    /// need backpressure semantics. Note that a subscriber subscribed
+    /// with no filter will still receive these events.
     pub fn send_audio(&self, session_id: &str, frame: &AudioFrame) -> Result<()> {
-        self.send_audio_with_callback(session_id, frame, Box::new(|| {}))
+        let _ = self.send_audio_async(session_id, frame)?;
+        Ok(())
     }
 
     pub fn send_background_audio(&self, session_id: &str, frame: &AudioFrame) -> Result<()> {
         let bg_buf = {
             let s = self.sessions.lock_or_recover();
             let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
+            // Terminated session: silently drop. Mirrors LiveKit's behaviour
+            // where a published track gets auto-unpublished on disconnect and
+            // the producer's loop stops receiving feedback. Without this short
+            // circuit, the `_forward_track_audio` task in TransportRoom keeps
+            // pumping frames into bg_audio_buf for the ~hundreds of ms between
+            // WS-close and Python `_on_session_ended` cancellation, and the
+            // buffer fills then drops at ~10ms cadence (visible as 100+
+            // "no-backpressure drop" log lines on every call teardown).
+            if sess.terminated.load(Ordering::Acquire) {
+                return Ok(());
+            }
             sess.bg_audio_buf.clone()
         };
         bg_buf.push_no_backpressure(&frame.data);
@@ -182,6 +245,10 @@ impl AudioStreamEndpoint {
     pub fn pause(&self, session_id: &str) -> Result<()> {
         let s = self.sessions.lock_or_recover();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
+        // Terminated session: no-op (no transport left to pause).
+        if sess.terminated.load(Ordering::Acquire) {
+            return Ok(());
+        }
         sess.paused.store(true, Ordering::Release);
         // Send clearAudio to immediately stop playback on Plivo's side.
         // Plivo doesn't support muteStream — clearAudio is the only way to stop playback.
@@ -195,6 +262,10 @@ impl AudioStreamEndpoint {
     pub fn resume(&self, session_id: &str) -> Result<()> {
         let s = self.sessions.lock_or_recover();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
+        // Terminated session: no-op.
+        if sess.terminated.load(Ordering::Acquire) {
+            return Ok(());
+        }
         sess.paused.store(false, Ordering::Release);
         // No unmute needed — send loop will resume sending audio from the Rust buffer.
         debug!("Resumed session {}", session_id);
@@ -208,6 +279,12 @@ impl AudioStreamEndpoint {
     pub fn clear_buffer(&self, session_id: &str) -> Result<()> {
         let s = self.sessions.lock_or_recover();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
+        // Terminated session: cleanup_session already cleared the buffer.
+        // This call is a no-op (matches the LiveKit behaviour where
+        // `clear_queue` on a disposed source is harmless).
+        if sess.terminated.load(Ordering::Acquire) {
+            return Ok(());
+        }
         sess.audio_buf.clear();
         // Reset resampler to prevent stale filter artifacts on next speech
         *sess.input_resampler.lock_or_recover() = None;
@@ -334,25 +411,25 @@ impl AudioStreamEndpoint {
     }
 
     pub fn hangup_with_auth(&self, session_id: &str, auth_id: Option<&str>, auth_token: Option<&str>) -> Result<()> {
-        let call_id = {
-            let sess = self.sessions.lock_or_recover().remove(session_id);
-            match sess {
-                Some(s) => {
-                    // Send a WebSocket Close frame BEFORE cancelling tasks.
-                    // The writer task drains remaining messages on cancel, so
-                    // this frame is guaranteed to reach Plivo. Without it,
-                    // dropping ws_tx just RSTs the TCP connection and Plivo
-                    // may keep the call alive until its inactivity timeout.
-                    // This is the primary hangup signal — the REST API DELETE
-                    // below is a belt-and-suspenders backup (and is skipped
-                    // entirely when no auth credentials are available).
-                    info!("hangup: sending WS Close frame for session {}", session_id);
-                    let _ = s.ws_tx.send(Message::Close(None));
-                    cleanup_session(session_id, &s, &self.recording_mgr);
-                    s.call_id.clone()
-                }
-                None => return Ok(())
+        // First transition: if still Active, terminate + cleanup + emit
+        // CallTerminated. Idempotent — no-op if already terminated by the
+        // WS-close path.
+        terminate_and_cleanup(
+            session_id, &self.sessions, &self.recording_mgr, &self.event_tx,
+            "hangup".into(),
+        );
+        // Second transition: remove from HashMap. This is the "release the
+        // FFI handle" step — equivalent to LiveKit's `_ffi_handle.dispose()`.
+        let call_id = match self.sessions.lock_or_recover().remove(session_id) {
+            Some(s) => {
+                // Send a WebSocket Close frame so Plivo tears down the call
+                // cleanly. If the WS is already gone (transport-initiated
+                // termination), the send is a silent no-op.
+                info!("hangup: sending WS Close frame for session {}", session_id);
+                let _ = s.ws_tx.send(Message::Close(None));
+                s.call_id.clone()
             }
+            None => return Ok(())
         };
         self.protocol.hangup(&call_id, &self.runtime, auth_id, auth_token);
         Ok(())
@@ -391,14 +468,34 @@ impl AudioStreamEndpoint {
         Ok(sess.audio_buf.queued_duration_ms(self.config.output_sample_rate))
     }
 
-    pub fn wait_for_playout_notify(&self, session_id: &str, on_complete: crate::sip::audio_buffer::CompletionCallback) -> Result<()> {
+    /// Register an async_id for "buffer drained to empty" notification.
+    ///
+    /// - Returns `Ok(None)` if buffer is already empty — emits
+    ///   `AudioPlayoutComplete` immediately (caller awaits on the event
+    ///   channel; the await resolves on the next event-loop tick).
+    ///
+    /// **Always returns `Ok(async_id)`** — the completion event always
+    /// fires (immediately if buffer already empty, deferred if not).
+    /// Multiple concurrent waiters are supported — each gets its own
+    /// async_id and all resolve when the buffer next reaches empty.
+    pub fn wait_for_playout_async(&self, session_id: &str) -> Result<u64> {
+        let async_id = self.async_id_counter.fetch_add(1, Ordering::Relaxed);
         let audio_buf = {
             let s = self.sessions.lock_or_recover();
             let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
+            // Terminated session: short-circuit with immediate completion.
+            // See `send_audio_async` above for the architectural rationale.
+            if sess.terminated.load(Ordering::Acquire) {
+                let _ = self.event_tx.try_send(EndpointEvent::AudioPlayoutComplete {
+                    session_id: session_id.to_string(),
+                    async_id,
+                });
+                return Ok(async_id);
+            }
             sess.audio_buf.clone()
         };
-        audio_buf.set_playout_callback(on_complete);
-        Ok(())
+        audio_buf.add_pending_playout(async_id);
+        Ok(async_id)
     }
 
     pub fn input_sample_rate(&self) -> u32 { self.config.input_sample_rate }
@@ -410,7 +507,26 @@ impl AudioStreamEndpoint {
         self.cancel.cancel();
         if self.config.auto_hangup {
             let ids: Vec<String> = self.sessions.lock_or_recover().keys().cloned().collect();
+            let had_sessions = !ids.is_empty();
             for id in ids { let _ = self.hangup(&id); }
+            // hangup() now enqueues the Plivo REST DELETE (and the WS Close frame
+            // is sent via the per-session writer task) as DETACHED async work on
+            // `self.runtime`. On shutdown the runtime is about to be dropped,
+            // which would abort those tasks before they flush. Give them a brief,
+            // bounded window to complete so calls tear down cleanly on Plivo's
+            // side.
+            if had_sessions {
+                // Best-effort flush window, deliberately sub-second so shutdown
+                // stays fast. This is NOT the per-request hangup ceiling
+                // (connect 2s / total 5s in `plivo.rs`): a slow provider response
+                // is cut off when the runtime drops just below — an accepted
+                // teardown-only tradeoff that never affects live-call audio.
+                const HANGUP_DRAIN: std::time::Duration =
+                    std::time::Duration::from_millis(750);
+                let _ = self.runtime.block_on(async {
+                    tokio::time::sleep(HANGUP_DRAIN).await;
+                });
+            }
         }
         // Push a Shutdown sentinel so adapters blocked on wait_for_event
         // wake immediately rather than waiting for the next poll timeout.
@@ -559,11 +675,48 @@ async fn handle_ws(
 
                 match event {
                     StreamEvent::Start { call_id, stream_id, encoding: enc, headers } => {
+                        // Defensive: a second `start` on this WS connection reuses
+                        // `sid` (the HashMap key), so the insert() below would
+                        // overwrite — and orphan — the previous session's send-loop
+                        // task: its CancellationToken clone is dropped un-signalled,
+                        // leaving the old loop running forever, draining/encoding/
+                        // sending against the same ws_tx as the new loop and leaking
+                        // its AudioBuffers. Plivo sends one start per connection, so
+                        // this only guards reconnect/replay/protocol quirks — but the
+                        // failure mode is a permanent runaway task. Tear the old one
+                        // down first (cleanup_session: cancels the old loop + clears
+                        // buffers + stops recording; NO CallTerminated emit, since the
+                        // same sid lives on with the new session).
+                        {
+                            let sessions_g = sessions.lock_or_recover();
+                            if let Some(old) = sessions_g.get(&sid) {
+                                warn!("duplicate `start` on session {} — tearing down previous", sid);
+                                cleanup_session(&sid, old, &recording_mgr);
+                            }
+                        }
                         encoding = enc;
                         upsampler = None; // Reset for new encoding
 
-                        let audio_buf = Arc::new(AudioBuffer::with_queue_size(200, output_sample_rate));
-                        let bg_audio_buf = Arc::new(AudioBuffer::with_queue_size(200, output_sample_rate));
+                        // CRITICAL: tag AudioBuffer with `sid` (the
+                        // ws-prefixed session id used everywhere else),
+                        // NOT `call_id` (Plivo UUID). The Python audio
+                        // source filters incoming events by
+                        // ``session_id == self._id`` where ``self._id``
+                        // comes from ``CallSession::new(sid, ...)``
+                        // below. A mismatch would silently drop every
+                        // ``AudioCaptureComplete`` / ``AudioPlayoutComplete``
+                        // event and hang ``capture_frame`` at the 30 s
+                        // ``DEFAULT_WAIT_TIMEOUT``.
+                        let audio_buf = Arc::new(AudioBuffer::with_queue_size(
+                            200, output_sample_rate, sid.clone(), etx.clone(),
+                        ));
+                        // bg_audio_buf is for background audio (push_no_backpressure
+                        // only — no async_id semantics). The event_tx is wired through
+                        // for symmetry / future use; Drop emissions are harmless if no
+                        // pending ids exist.
+                        let bg_audio_buf = Arc::new(AudioBuffer::with_queue_size(
+                            200, output_sample_rate, format!("{}-bg", sid), etx.clone(),
+                        ));
                         let muted = Arc::new(AtomicBool::new(false));
                         let paused = Arc::new(AtomicBool::new(false));
                         let cp_notify = Arc::new((Mutex::new(None), Condvar::new()));
@@ -717,6 +870,7 @@ async fn handle_ws(
                             call_id: call_id.clone(), stream_id: stream_id.clone(),
                             ws_tx: ws_tx.clone(), incoming_tx: itx.clone(), incoming_rx: irx.clone(),
                             audio_buf, bg_audio_buf,
+                            terminated: Arc::new(AtomicBool::new(false)),
                             input_resampler: Arc::new(Mutex::new(None)),
                             extra_headers: headers.clone(), encoding,
                             muted, paused,
@@ -765,13 +919,16 @@ async fn handle_ws(
                         };
 
                         if let Some(ref rec_ref) = media_recorder {
-                            if let Ok(guard) = rec_ref.lock() {
-                                if let Some(ref rec) = *guard { rec.write_user_samples(&pcm); }
-                            }
+                            // lock_or_recover (not raw .lock()): a poisoned mutex
+                            // must not silently stop recording mid-call — recover
+                            // and keep writing, consistent with every other site.
+                            let guard = rec_ref.lock_or_recover();
+                            if let Some(ref rec) = *guard { rec.write_user_samples(&pcm); }
                         }
 
                         if let Some(ref bd_ref) = media_beep_det {
-                            if let Ok(mut g) = bd_ref.lock() {
+                            {
+                                let mut g = bd_ref.lock_or_recover();
                                 if let Some(ref mut det) = *g {
                                     match det.process_frame(&pcm) {
                                         BeepDetectorResult::Detected(e) => {
@@ -831,11 +988,14 @@ async fn handle_ws(
 
                     StreamEvent::StreamError { reason } => {
                         warn!("Stream error on session {}: {}", sid, reason);
-                        if let Some(sess) = sessions.lock_or_recover().remove(&sid) {
-                            cleanup_session(&sid, &sess, &recording_mgr);
-                            let session = crate::sip::call::CallSession::new(sid.clone(), crate::sip::call::CallDirection::Inbound);
-                            let _ = etx.try_send(EndpointEvent::CallTerminated { session, reason: format!("stream error: {}", reason) });
-                        }
+                        // Mark terminated and run cleanup, but DO NOT remove
+                        // from the sessions map — let Python's `hangup(sid)`
+                        // (called from `_run_session.finally` after the audio
+                        // source's `aclose()`) be the canonical release point.
+                        // This is the LiveKit-faithful model: session lifetime
+                        // = audio source lifetime, not transport lifetime.
+                        terminate_and_cleanup(&sid, &sessions, &recording_mgr, &etx,
+                            format!("stream error: {}", reason));
                         break;
                     }
 
@@ -855,11 +1015,8 @@ async fn handle_ws(
 
                     StreamEvent::Stop => {
                         info!("Session {} stopped", sid);
-                        if let Some(sess) = sessions.lock_or_recover().remove(&sid) {
-                            cleanup_session(&sid, &sess, &recording_mgr);
-                            let session = crate::sip::call::CallSession::new(sid.clone(), crate::sip::call::CallDirection::Inbound);
-                            let _ = etx.try_send(EndpointEvent::CallTerminated { session, reason: "stream stopped".into() });
-                        }
+                        terminate_and_cleanup(&sid, &sessions, &recording_mgr, &etx,
+                            "stream stopped".into());
                         break;
                     }
                 }
@@ -867,12 +1024,10 @@ async fn handle_ws(
         }
     }
 
-    // Cleanup on WS disconnect
-    if let Some(sess) = sessions.lock_or_recover().remove(&sid) {
-        cleanup_session(&sid, &sess, &recording_mgr);
-        let session = crate::sip::call::CallSession::new(sid.clone(), crate::sip::call::CallDirection::Inbound);
-        let _ = etx.try_send(EndpointEvent::CallTerminated { session, reason: "ws disconnected".into() });
-        info!("Session {} cleaned up (WS disconnected)", sid);
+    // WS disconnect: same two-state transition as StreamError / Stop.
+    // See StreamSession::terminated comment + StreamError arm above.
+    if terminate_and_cleanup(&sid, &sessions, &recording_mgr, &etx, "ws disconnected".into()) {
+        info!("Session {} terminated (WS disconnected); awaiting Python hangup() for HashMap removal", sid);
     }
 }
 
@@ -884,6 +1039,44 @@ async fn handle_ws(
 /// from the provider (if it arrives after teardown) is ignored instead of
 /// resolving a stale waiter. Finally, wake any blocked `wait_for_playout`
 /// waiters with a sentinel so Python/Node executor threads return immediately.
+/// Mark the session terminated, run resource cleanup, emit ``CallTerminated``.
+/// Idempotent — returns true if this call actually performed the
+/// transition (i.e. ``terminated`` flipped from false to true).
+///
+/// Does NOT remove the session from the HashMap; that's reserved for
+/// ``hangup(sid)`` (which Python calls after `_run_session.finally`
+/// runs `session.aclose()`). This split lets the Python audio source
+/// outlive the WS transport — its FFI methods early-return on
+/// ``terminated`` instead of raising ``CallNotActive``.
+fn terminate_and_cleanup(
+    sid: &str,
+    sessions: &Arc<Mutex<HashMap<String, StreamSession>>>,
+    recording_mgr: &Arc<crate::recorder::RecordingManager>,
+    etx: &Sender<EndpointEvent>,
+    reason: String,
+) -> bool {
+    // Hold the sessions guard across cleanup_session. cleanup_session only
+    // touches per-session state (no recursive sessions lookups) so this
+    // can't deadlock — and the brief hold keeps the terminated flip atomic
+    // with the cleanup run.
+    let do_emit = {
+        let sessions_g = sessions.lock_or_recover();
+        let Some(sess) = sessions_g.get(sid) else { return false; };
+        if sess.terminated.swap(true, Ordering::AcqRel) {
+            // Someone already terminated. Don't double-emit.
+            false
+        } else {
+            cleanup_session(sid, sess, recording_mgr);
+            true
+        }
+    };
+    if do_emit {
+        let session = crate::sip::call::CallSession::new(sid.to_string(), crate::sip::call::CallDirection::Inbound);
+        let _ = etx.try_send(EndpointEvent::CallTerminated { session, reason });
+    }
+    do_emit
+}
+
 fn cleanup_session(session_id: &str, sess: &StreamSession, recording_mgr: &Arc<crate::recorder::RecordingManager>) {
     // Clear pending_flush / awaiting_checkpoint so the send loop's drain
     // path is a no-op on teardown and late provider confirms are dropped.
@@ -898,4 +1091,185 @@ fn cleanup_session(session_id: &str, sess: &StreamSession, recording_mgr: &Arc<c
     let (lock, cvar) = &*sess.checkpoint_notify;
     *lock.lock_or_recover() = Some("_closed".into());
     cvar.notify_all();
+}
+
+#[cfg(test)]
+mod terminated_state_tests {
+    //! Verifies the `terminated`-state short-circuit on FFI methods.
+    //!
+    //! Architectural invariant under test (mirror of LiveKit's
+    //! `rtc.AudioSource.capture_frame` early-return on
+    //! `_ffi_handle.disposed`): once a session's `terminated` flag flips
+    //! true, audio FFI methods must NOT touch the now-defunct WS / RTP
+    //! transport — they short-circuit to a successful no-op so the Python
+    //! audio source can outlive the transport between WS-close and Python
+    //! `hangup(sid)`. Counterpart in `sip/endpoint.rs` is exercised via
+    //! the live VPS integration runs.
+    use super::*;
+    use crate::audio::AudioFrame;
+    use crate::audio_stream::plivo::PlivoProtocol;
+    use std::time::Duration;
+    use tokio::sync::mpsc as tokio_mpsc;
+    use tokio_tungstenite::tungstenite::Message;
+
+    fn make_endpoint() -> AudioStreamEndpoint {
+        let cfg = AudioStreamConfig {
+            listen_addr: "127.0.0.1:0".into(),
+            input_sample_rate: 8000,
+            output_sample_rate: 8000,
+            auto_hangup: false,
+        };
+        let proto = Arc::new(PlivoProtocol::new("test".into(), "test".into()));
+        AudioStreamEndpoint::new(cfg, proto).expect("endpoint::new")
+    }
+
+    /// Build a minimal `StreamSession` and insert it under `sid`. The
+    /// fields populated here are exactly those the terminated-state code
+    /// paths read; everything else uses harmless defaults.
+    fn insert_session(ep: &AudioStreamEndpoint, sid: &str, terminated: bool) {
+        let (ws_tx, _ws_rx) = tokio_mpsc::unbounded_channel::<Message>();
+        let (incoming_tx, incoming_rx) = crossbeam_channel::unbounded::<AudioFrame>();
+        let audio_buf = Arc::new(AudioBuffer::with_queue_size(
+            200, 8000, sid.to_string(), ep.event_tx.clone(),
+        ));
+        let bg_audio_buf = Arc::new(AudioBuffer::with_queue_size(
+            200, 8000, sid.to_string(), ep.event_tx.clone(),
+        ));
+        let sess = StreamSession {
+            call_id: format!("call-{}", sid),
+            stream_id: format!("stream-{}", sid),
+            ws_tx,
+            incoming_tx,
+            incoming_rx,
+            audio_buf,
+            bg_audio_buf,
+            terminated: Arc::new(AtomicBool::new(terminated)),
+            input_resampler: Arc::new(Mutex::new(None)),
+            extra_headers: HashMap::new(),
+            encoding: WireEncoding::MulawRate8k,
+            muted: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            checkpoint_counter: AtomicU64::new(0),
+            checkpoint_notify: Arc::new((Mutex::new(None), Condvar::new())),
+            send_loop_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_flush: Arc::new(Mutex::new(None)),
+            awaiting_checkpoint: Arc::new(Mutex::new(None)),
+            recorder: Arc::new(Mutex::new(None)),
+            beep_detector: Arc::new(Mutex::new(None)),
+            cancel: CancellationToken::new(),
+        };
+        ep.sessions.lock_or_recover().insert(sid.to_string(), sess);
+    }
+
+    fn drain_capture_complete(ep: &AudioStreamEndpoint, deadline: Duration) -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline {
+            match ep.event_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(EndpointEvent::AudioCaptureComplete { session_id, async_id, .. }) => {
+                    out.push((session_id, async_id));
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    fn drain_playout_complete(ep: &AudioStreamEndpoint, deadline: Duration) -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline {
+            match ep.event_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(EndpointEvent::AudioPlayoutComplete { session_id, async_id }) => {
+                    out.push((session_id, async_id));
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn send_audio_async_on_terminated_session_emits_capture_complete_without_buffer_push() {
+        let ep = make_endpoint();
+        insert_session(&ep, "sid-A", /*terminated=*/ true);
+
+        // Capture the buffer's queued duration before; should stay zero after.
+        let queued_before = ep.queued_duration_ms("sid-A").unwrap();
+        assert_eq!(queued_before, 0.0);
+
+        let frame = AudioFrame { data: vec![0i16; 2000], sample_rate: 8000, num_channels: 1, samples_per_channel: 2000 };
+        let async_id = ep.send_audio_async("sid-A", &frame).expect("send_audio_async ok");
+
+        // Buffer must NOT receive the data — the terminated short-circuit
+        // bypasses audio_buf.push entirely.
+        let queued_after = ep.queued_duration_ms("sid-A").unwrap();
+        assert_eq!(queued_after, 0.0, "terminated session must not buffer audio");
+
+        // AudioCaptureComplete must be emitted with the same async_id.
+        let events = drain_capture_complete(&ep, Duration::from_millis(200));
+        assert_eq!(events, vec![("sid-A".to_string(), async_id)],
+            "terminated send_audio_async must emit exactly one AudioCaptureComplete \
+             with the returned async_id (LiveKit's `wait_for(predicate)` contract)");
+    }
+
+    #[test]
+    fn wait_for_playout_async_on_terminated_session_emits_playout_complete_immediately() {
+        let ep = make_endpoint();
+        insert_session(&ep, "sid-B", /*terminated=*/ true);
+
+        let async_id = ep.wait_for_playout_async("sid-B").expect("wait_for_playout_async ok");
+        let events = drain_playout_complete(&ep, Duration::from_millis(200));
+        assert_eq!(events, vec![("sid-B".to_string(), async_id)],
+            "terminated wait_for_playout_async must emit AudioPlayoutComplete \
+             synchronously (no real buffer to drain)");
+    }
+
+    #[test]
+    fn clear_buffer_on_terminated_session_is_noop() {
+        let ep = make_endpoint();
+        insert_session(&ep, "sid-C", /*terminated=*/ true);
+        // Must succeed without touching ws_tx (which has no live reader)
+        // and without sending clearAudio over the dead WS.
+        ep.clear_buffer("sid-C").expect("clear_buffer must succeed on terminated session");
+    }
+
+    #[test]
+    fn pause_resume_on_terminated_session_are_noops() {
+        let ep = make_endpoint();
+        insert_session(&ep, "sid-D", /*terminated=*/ true);
+        ep.pause("sid-D").expect("pause must succeed on terminated session");
+        ep.resume("sid-D").expect("resume must succeed on terminated session");
+    }
+
+    #[test]
+    fn send_background_audio_on_terminated_session_drops_silently() {
+        // Regression for the "184 no-backpressure drop" log lines on every
+        // call teardown — without the short-circuit, the bg-audio buffer
+        // kept filling between WS-close and Python `_on_session_ended`.
+        let ep = make_endpoint();
+        insert_session(&ep, "sid-E", /*terminated=*/ true);
+        let frame = AudioFrame { data: vec![0i16; 160], sample_rate: 8000, num_channels: 1, samples_per_channel: 160 };
+        ep.send_background_audio("sid-E", &frame).expect("send_background_audio ok");
+        let sess = ep.sessions.lock_or_recover();
+        let session = sess.get("sid-E").unwrap();
+        assert_eq!(session.bg_audio_buf.queued_duration_ms(8000), 0.0,
+            "terminated send_background_audio must NOT push into bg_audio_buf");
+    }
+
+    #[test]
+    fn active_session_still_buffers_audio() {
+        // Sanity counter-test: an active session (terminated=false) must
+        // accept frames normally. Without this we couldn't tell if the
+        // terminated check was actually firing vs. a bug that drops all
+        // frames.
+        let ep = make_endpoint();
+        insert_session(&ep, "sid-F", /*terminated=*/ false);
+        let frame = AudioFrame { data: vec![0i16; 800], sample_rate: 8000, num_channels: 1, samples_per_channel: 800 };
+        ep.send_audio_async("sid-F", &frame).expect("send_audio_async ok");
+        let queued = ep.queued_duration_ms("sid-F").unwrap();
+        assert!(queued > 0.0, "active session must accumulate buffered audio; got {}", queued);
+    }
 }
