@@ -99,9 +99,9 @@ def _ensure_transport_tags(
     add("agent.session", metadata=session_metadata)
     # agent_id:<value> matches the obs server's applySessionTagMetadata
     # prefix extractor — landing the UUID into agent_transport_sessions
-    # .agent_id directly. agent.name preserved for human-readable display.
+    # .agent_id directly. agent_name preserved for human-readable display.
     add(f"agent_id:{agent_id}", metadata={"agent_id": agent_id})
-    add(f"agent.name:{agent_name}", metadata={"agent_name": agent_name})
+    add(f"agent_name:{agent_name}", metadata={"agent_name": agent_name})
     if account_id:
         add(f"account_id:{account_id}", metadata={"account_id": account_id})
     if transport:

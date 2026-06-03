@@ -17,7 +17,7 @@ def test_injects_tags_into_empty_dict():
         {"items": [{"role": "user", "content": "hi"}]},
         [
             "agent_id:agent-uuid-1",
-            "agent.name:support-agent",
+            "agent_name:support-agent",
             "account_id:acct-1",
         ],
     )
@@ -25,7 +25,7 @@ def test_injects_tags_into_empty_dict():
     assert result["items"] == [{"role": "user", "content": "hi"}]
     # Tagger tags are sorted (stable round-trip) and present verbatim.
     assert result["tags"] == sorted(
-        ["agent_id:agent-uuid-1", "agent.name:support-agent", "account_id:acct-1"]
+        ["agent_id:agent-uuid-1", "agent_name:support-agent", "account_id:acct-1"]
     )
 
 
@@ -67,7 +67,7 @@ def test_obs_server_extractor_format():
     tags = [
         "agent.session",
         "agent_id:da3d4071-34ce-41b2-8c9e-05eef23a43bb",
-        "agent.name:northstar-shopify-bot",
+        "agent_name:northstar-shopify-bot",
         "account_id:acct-1",
         "transport:audio_stream",
         "evaluations:enabled",
