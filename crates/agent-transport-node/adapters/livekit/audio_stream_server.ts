@@ -1,6 +1,10 @@
 /**
  * AudioStreamServer — Plivo audio streaming equivalent of AgentServer.
  *
+ * Shutdown behavior: same force-exit model as AgentServer — hangup active
+ * sessions, bounded cleanup, then `process.exit(0)`. Flush recordings /
+ * observability per-session, not at server shutdown.
+ *
  * No SIP credentials needed — Plivo connects to your WebSocket server.
  * Configure Plivo XML to return:
  *   <Response>
@@ -20,13 +24,16 @@
  *   server.run();
  */
 
-import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer, type Server, type IncomingMessage } from 'node:http';
 import { hostname, cpus } from 'node:os';
 import { AudioStreamEndpoint } from 'agent-transport';
 import { initializeLogger, InferenceRunner, runWithJobContext } from '@livekit/agents';
 import { AudioStreamJobContext } from './audio_stream_context.js';
 import { JobProcess } from './agent_server.js';
-import { uploadReport, getObservabilityUrl } from './observability.js';
+import { getObservabilityUrl } from './observability.js';
+import { finalizeSession } from './_session_finalize.js';
+import { runServerCleanup, forceShutdownAgentSession, installUnhandledRejectionHandler, registerSignalCleanup } from './_session_teardown.js';
+import { brokerFor, isAudioEvent } from './_audio_events.js';
 
 export interface AudioStreamServerOptions {
   listenAddr?: string;
@@ -145,11 +152,9 @@ export class AudioStreamServer {
   }
 
   async run(): Promise<void> {
-    // Handle unhandled rejections from LiveKit SDK TTS abort paths gracefully
-    process.on('unhandledRejection', (reason) => {
-      if (reason === undefined || reason === null) return;
-      console.error('Unhandled rejection:', reason);
-    });
+    // Handle unhandled rejections from LiveKit SDK TTS abort paths gracefully.
+    // Idempotent — safe if both servers run in one process.
+    installUnhandledRejectionHandler();
 
     // Strip tsx/ts-node loader hooks from execArgv before any child process forks
     const cleanArgv: string[] = [];
@@ -243,6 +248,10 @@ export class AudioStreamServer {
       inputSampleRate: this.sampleRate,
       outputSampleRate: this.sampleRate,
     });
+    // This server's eventLoop is the single reader of the endpoint event
+    // channel — claim the audio-event broker so SipAudioOutput async-id
+    // completions are dispatched to us (suppressing the broker self-pump).
+    brokerFor(this.ep).claimFeeder();
     console.log(`Audio stream WebSocket server on ws://${this.listenAddr}`);
 
     // Start HTTP server
@@ -258,33 +267,37 @@ export class AudioStreamServer {
     // shutdown — without this the infinite while loop pins libuv forever.
     const eventLoopDone = this.eventLoop();
 
-    // Wait for shutdown signal
-    await new Promise<void>((resolve) => {
-      const shutdown = async () => {
-        console.log('Shutting down...');
-        this.shutdownRequested = true;
-        // Drain active sessions with 10-second timeout
-        if (this.activeSessions.size > 0) {
-          console.log(`Draining ${this.activeSessions.size} active session(s)...`);
-          await Promise.race([
-            Promise.allSettled([...this.activeSessions.values()].map((s) => s.promise)),
-            new Promise<void>((r) => setTimeout(() => {
-              console.warn('Shutdown timeout reached (10s), forcing exit');
-              r();
-            }, 10000)),
-          ]);
+    // On signal: hang up everything, run critical cleanup with short
+    // timeouts, then process.exit. The Rust endpoint owns a background
+    // thread that pins libuv, so natural exit isn't reliable — we force it.
+    // Idempotent registration: signal listeners install once per process and
+    // run every registered server's cleanup, so two servers (or a second
+    // run()) don't double-register listeners.
+    registerSignalCleanup(() => this.runCleanup());
+    await eventLoopDone;
+  }
+
+  /**
+   * Hang up active sessions, drain ancillary resources with short timeouts.
+   *
+   * Thin wrapper around {@link runServerCleanup} so the signal-handler path
+   * stays a one-liner and tests can drive the shared cleanup helper without
+   * loading the native `agent-transport` binding.
+   */
+  async runCleanup(): Promise<void> {
+    this.shutdownRequested = true;
+    await runServerCleanup({
+      activeSessionIds: () => this.activeSessions.keys(),
+      hangup: (id) => this.ep?.hangup(id),
+      stopLoadMonitor: () => this.loadMonitor.stop(),
+      inferenceExecutor: this.inferenceExecutor ?? null,
+      closeHttpServer: () => {
+        if (this.httpServer) {
+          try { (this.httpServer as any).closeAllConnections?.(); } catch {}
+          this.httpServer.close();
         }
-        this.loadMonitor.stop();
-        if (this.httpServer) this.httpServer.close();
-        if (this.ep) this.ep.shutdown();
-        // Wait for the event loop to actually exit so Node releases its
-        // libuv handle. ep.shutdown() pushes a Shutdown sentinel that wakes
-        // the loop immediately.
-        await eventLoopDone;
-        resolve();
-      };
-      process.on('SIGINT', shutdown);
-      process.on('SIGTERM', shutdown);
+      },
+      shutdownEndpoint: () => this.ep?.shutdown(),
     });
   }
 
@@ -316,6 +329,13 @@ export class AudioStreamServer {
         break;
       }
 
+      // Route async-id audio completion events to the broker (resolves the
+      // pending SipAudioOutput captureFrame / waitForPlayout awaits).
+      if (isAudioEvent(ev)) {
+        brokerFor(this.ep!).dispatch(ev);
+        continue;
+      }
+
       if (ev.eventType === 'call_answered' && ev.session) {
         // Plivo WebSocket start → Rust fired CallAnswered → create agent.
         const session = ev.session;
@@ -340,27 +360,14 @@ export class AudioStreamServer {
         const reason = ev.reason ?? 'unknown';
         console.log(`Session ${sessionId} terminated (reason=${reason})`);
 
-        // Shut down the session gracefully BEFORE emitting
-        // participant_disconnected. LiveKit's default handler calls
-        // `_closeSoon({ drain: false })`, which force-interrupts any in-flight
-        // LLM/TTS response — the final assistant message (e.g. the reply
-        // after a tool call) would never land in chat_history. Calling
-        // `shutdown({ drain: true })` first sets the closing state so the
-        // subsequent `_closeSoon` becomes a no-op and the session drains
-        // normally, letting in-flight speech finalize into history.
         const active = this.activeSessions.get(sessionId);
-        if (active?.ctx?.session?.shutdown) {
-          try {
-            active.ctx.session.shutdown({ drain: true });
-          } catch (err) {
-            console.warn(
-              `Graceful session shutdown failed for ${sessionId}; falling back to default close`,
-              err,
-            );
-          }
-        }
+        // Synchronously begin tearing down the AgentSession so a buffered STT
+        // transcript delivered after disconnect can't trigger a wasted LLM +
+        // TTS turn on a dead session (issue #83). Must run before the Room
+        // facade emits participant_disconnected (which schedules the close).
+        forceShutdownAgentSession(active?.ctx?.session);
 
-        // Emit participant_disconnected on Room facade.
+        // Emit participant_disconnected on Room facade
         if (active?.room) {
           active.room.emitParticipantDisconnected();
         }
@@ -451,59 +458,19 @@ export class AudioStreamServer {
         const durationSec = (performance.now() - sessionStart) / 1000;
         this.sessionDurations.push(durationSec);
 
-        if (ctx.session) {
-          try {
-            const usage = (ctx.session as any).usage;
-            if (usage) {
-              console.log(`Session ${sessionId} usage:`, JSON.stringify(usage));
-            }
-          } catch {}
-
-          // Wait for natural session close (preserves in-flight responses in history)
-          try {
-            await new Promise<void>((resolve) => {
-              const timer = setTimeout(resolve, 5000);
-              ctx.session.on('close', () => { clearTimeout(timer); resolve(); });
-            });
-          } catch {
-            try { await (ctx.session as any).close(); } catch {}
-          }
-
-          // Stop recording and wait for file to be finalized
-          try { this.ep!.stopRecording(sessionId); } catch {}
-          const { existsSync } = await import('node:fs');
-          if (recPath) {
-            for (let i = 0; i < 20; i++) {
-              if (existsSync(recPath)) break;
-              await new Promise(r => setTimeout(r, 100));
-            }
-          }
-
-          // Upload session report (transcript, audio, metrics)
-          try {
-            await uploadReport({
-              agentId: this.agentId,
-              agentName: this.agentName,
-              session: ctx.session,
-              callId: sessionId,
-              accountId: ctx.accountId,
-              metadata: ctx.metadata,
-              direction: ctx.direction,
-              recordingPath: recPath,
-              recordingStartedAt,
-              transport: 'audio_stream',
-            });
-          } catch (e) {
-            console.warn(`Failed to upload session report for session ${sessionId}:`, e);
-          }
-
-          // Clean up local recording after upload attempt
-          if (getObservabilityUrl() && recPath) {
-            try { const { unlinkSync } = await import('node:fs'); unlinkSync(recPath); } catch (e) {
-              console.warn(`Failed to clean up recording ${recPath}:`, e);
-            }
-          }
-        }
+        await finalizeSession({
+          session: ctx.session,
+          endpoint: this.ep!,
+          sessionId,
+          transport: 'audio_stream',
+          agentId: this.agentId,
+          agentName: this.agentName,
+          accountId: ctx.accountId,
+          metadata: ctx.metadata,
+          direction: ctx.direction,
+          recordingPath: recPath,
+          recordingStartedAt,
+        });
 
         try { this.ep!.hangup(sessionId); } catch {}
 

@@ -303,7 +303,7 @@ impl RtpTransport {
         })
     }
 
-    pub fn start_recv_loop(self: &Arc<Self>, tx: Sender<AudioFrame>, etx: Sender<EndpointEvent>, cid: String, direction: crate::sip::call::CallDirection, bd: Arc<Mutex<Option<BeepDetector>>>, held: Arc<AtomicBool>, recorder: Arc<Mutex<Option<Arc<CallRecorder>>>>) -> tokio::task::JoinHandle<()> {
+    pub fn start_recv_loop(self: &Arc<Self>, tx: Sender<AudioFrame>, etx: Sender<EndpointEvent>, cid: String, terminated: Arc<AtomicBool>, session: crate::sip::call::CallSession, bd: Arc<Mutex<Option<BeepDetector>>>, held: Arc<AtomicBool>, recorder: Arc<Mutex<Option<Arc<CallRecorder>>>>) -> tokio::task::JoinHandle<()> {
         let t = Arc::clone(self);
         tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
@@ -446,7 +446,16 @@ impl RtpTransport {
                 // Skip media timeout check during SIP hold (remote is expected to stop sending)
                 if last_rtp.elapsed() > MEDIA_TIMEOUT && !held.load(Ordering::Acquire) {
                     warn!("Media timeout call {} ({}s)", cid, MEDIA_TIMEOUT.as_secs());
-                    let _ = etx.try_send(EndpointEvent::CallTerminated { session: crate::sip::call::CallSession::new(cid, direction), reason: "media timeout".into() });
+                    // Two-state termination, mirroring terminate_sip_call: flip
+                    // `terminated` once (dedupe against the dialog watcher's own
+                    // CallTerminated) and cancel the SHARED per-call token so the
+                    // send loop stops too — previously only this recv loop broke,
+                    // leaking the send-loop task. Emit the populated session
+                    // (remote_uri / call_uuid / extra_headers), not a blank one.
+                    if !terminated.swap(true, Ordering::AcqRel) {
+                        t.cancel.cancel();
+                        let _ = etx.try_send(EndpointEvent::CallTerminated { session: session.clone(), reason: "media timeout".into() });
+                    }
                     break;
                 }
             }

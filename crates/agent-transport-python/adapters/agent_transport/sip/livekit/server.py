@@ -15,10 +15,24 @@ CLI commands (matching LiveKit):
     python agent.py start   — production mode (INFO logging)
     python agent.py dev     — development mode (DEBUG for adapters/pipeline)
     python agent.py debug   — full debug (including Rust SIP/RTP)
+
+Shutdown behavior (SIGINT/SIGTERM):
+    Active calls are hung up immediately; cleanup (inference executor,
+    HTTP server, Rust endpoint) is bounded by short timeouts. The process
+    then force-exits via ``os._exit(0)``. This is deliberate — natural exit
+    is unreliable because the Rust endpoint owns background threads that
+    can pin the process indefinitely.
+
+    Tradeoff: ``os._exit`` skips Python's normal finalization, so any
+    resources that rely on ``atexit`` handlers or per-session buffered I/O
+    must be flushed in the per-call teardown path (e.g., on the
+    ``"call_terminated"`` event), NOT at server shutdown. This includes:
+      - recording file writes (flush in session close handler)
+      - observability POSTs (await in session close handler)
+      - custom ``atexit`` hooks (won't run — migrate to per-session)
 """
 
 import asyncio
-import json
 import logging
 import os
 import signal
@@ -33,14 +47,21 @@ import prometheus_client
 from aiohttp import web
 
 from agent_transport import SipEndpoint, init_logging
+from agent_transport._event import FfiEvent
+from agent_transport._event_sink import _on_event_from_rust
+from agent_transport._ffi_queue import GLOBAL
 from livekit.agents.inference_runner import _InferenceRunner
 from livekit.agents.utils.hw import get_cpu_monitor
 from livekit.agents.utils import MovingAverage
 from livekit.rtc.room import SipDTMF
-from .sip_io import SipAudioInput, SipAudioOutput
-from ._room_facade import TransportRoom, create_transport_context
+from ._audio_io import TransportAudioInput, TransportAudioOutput
+from ._room_facade import TransportJobContextMixin, TransportRoom, create_transport_context
 from ._aio_utils import call_setup as _call_setup
-from .judging import EvaluationConfig, run_configured_judges
+from ._aio_utils import control_executor as _control_executor
+from ._aio_utils import schedule_hangup
+from ._session_teardown import force_shutdown_agent_session
+from ._session_finalize import finalize_session
+from .judging import EvaluationConfig
 from .observability import _ensure_transport_tags, _get_observability_url
 
 logger = logging.getLogger("agent_transport.server")
@@ -50,6 +71,10 @@ class JobProcess:
     """Stub matching LiveKit's JobProcess — holds prewarm data."""
     def __init__(self):
         self.userdata: dict[str, Any] = {}
+
+    @property
+    def executor_type(self):
+        return None
 
 
 _inference_ctx_token = None
@@ -176,7 +201,7 @@ class _LoadMonitor:
 
 
 @dataclass
-class JobContext:
+class JobContext(TransportJobContextMixin):
     """Context passed to the @sip_session handler — equivalent of LiveKit's JobContext.
 
     Matches LiveKit's standard pattern exactly:
@@ -216,11 +241,14 @@ class JobContext:
     _session: Any = field(default=None, repr=False)
     _call_ended: asyncio.Event | None = field(default=None, repr=False)
     _room: Any = field(default=None, repr=False)
-    _job_stub: Any = field(default=None, repr=False)
     _job_ctx_token: Any = field(default=None, repr=False)
     _event_listeners: dict = field(default_factory=dict, repr=False)
     _proc: Any = field(default=None, repr=False)
     _shutdown_callbacks: list = field(default_factory=list, repr=False)
+    # 0.2.x post-Tier-A: pointer to the process-global FfiQueue. The
+    # constrained pyo3 dispatcher thread feeds it (one consumer of
+    # ``inner.events()``). Audio sources subscribe through it per-frame.
+    _events: Any = field(default=None, repr=False)
 
     @property
     def session(self):
@@ -228,7 +256,8 @@ class JobContext:
 
     @property
     def tagger(self):
-        return getattr(self._job_stub, "tagger", None)
+        # ``_tagger`` is set on ``self`` by ``_init_transport_job_context``.
+        return getattr(self, "_tagger", None)
 
     def set_metadata(self, metadata: dict[str, Any]) -> None:
         """Attach session metadata to native LiveKit observability tags."""
@@ -255,12 +284,18 @@ class JobContext:
         call session.start(agent=, room=ctx.room) directly.
         """
         self._session = session
-        if self._job_stub is not None:
-            self._job_stub._primary_agent_session = session
+        self._primary_agent_session = session
 
-        # Wire SIP audio I/O before session.start() is called
-        session.input.audio = SipAudioInput(self.endpoint, self.session_id)
-        session.output.audio = SipAudioOutput(self.endpoint, self.session_id)
+        # Wire SIP audio I/O. TransportAudioOutput is a Pattern-A subclass
+        # of LiveKit's _ParticipantAudioOutput — buffering / forwarding /
+        # interrupt / playout logic are inherited verbatim, with our
+        # TransportAudioSource in place of rtc.AudioSource. ``events``
+        # defaults to the process-global FfiQueue.
+        session.input.audio = TransportAudioInput(self.endpoint, self.session_id)
+        session.output.audio = TransportAudioOutput(
+            self.endpoint,
+            self.session_id,
+        )
 
         # Listen to session close event — handles agent-initiated shutdown
         @session.on("close")
@@ -268,10 +303,12 @@ class JobContext:
             logger.info("Call %s session closed (reason=%s)", self.session_id, getattr(ev, 'reason', 'unknown'))
             if self._call_ended is not None and not self._call_ended.is_set():
                 self._call_ended.set()
-            try:
-                self.endpoint.hangup(self.session_id)
-            except Exception:
-                pass
+            # hangup() is a Rust block_on (SIP BYE round-trip). This callback
+            # fires SYNCHRONOUSLY on the asyncio loop thread, so calling hangup
+            # inline stalls every other call on the loop. Schedule it off-loop
+            # on the dedicated call-control executor (isolated from the audio
+            # forwarders' default pool). ep.shutdown() teardown is the backstop.
+            schedule_hangup(self.endpoint.hangup, self.session_id)
 
         if logging.getLogger("agent_transport.sip").isEnabledFor(logging.DEBUG):
             @session.on("agent_state_changed")
@@ -309,7 +346,7 @@ class JobContext:
 
     def add_shutdown_callback(self, callback):
         """Register a callback to run when the session ends."""
-        self._shutdown_callbacks.append(callback)
+        super().add_shutdown_callback(callback)
 
 
 class AgentServer:
@@ -366,10 +403,18 @@ class AgentServer:
         self._proc = JobProcess()
         self._userdata: dict[str, Any] = {}
         self._ep: SipEndpoint | None = None
+        # Process-global FfiQueue (LiveKit-faithful mirror of
+        # ``FfiClient.instance.queue``). The pyo3 dispatcher thread
+        # spawned by ``set_event_sink`` does all the cross-thread
+        # ``call_soon_threadsafe`` plumbing.
+        self._events = GLOBAL
         # Session IDs are strings (returned by Rust CallSession.session_id).
         # The type hints used `int` before — purely cosmetic since Python dict
         # keys are duck-typed, but fix them so mypy/pyright don't scream.
-        self._active_calls: dict[str, asyncio.Task] = {}
+        # Value is None for a slot reserved synchronously by the
+        # participant_connected handler (dedup placeholder) and the real Task
+        # once _start_call has scheduled _run_call.
+        self._active_calls: dict[str, asyncio.Task | None] = {}
         self._call_ended_events: dict[str, asyncio.Event] = {}
         self._call_contexts: dict[str, JobContext] = {}
         # Strong-reference set for fire-and-forget asyncio tasks (outbound
@@ -575,14 +620,34 @@ class AgentServer:
 
         self._ep = SipEndpoint(sip_server=self._sip_server)
 
-        # Register with SIP provider
-        await loop.run_in_executor(
-            None, self._ep.register, self._sip_username, self._sip_password
+        # Wire the constrained pyo3 sink. Spawns a dispatcher thread inside
+        # Rust that drains ``inner.events()``, translates each event to a
+        # LiveKit-shape :class:`FfiEvent` and ``GLOBAL.put``s on the
+        # asyncio loop via ``call_soon_threadsafe``. After this call,
+        # ``wait_for_event``/``poll_event`` return None — all events flow
+        # through GLOBAL.
+        self._ep.set_event_sink(_on_event_from_rust)
+
+        # Subscribe BEFORE register so we never miss the ``endpoint_registered``
+        # transport_event (subscribe-before-request pattern).
+        reg_q = GLOBAL.subscribe(
+            loop=loop,
+            filter_fn=lambda e: (
+                e.WhichOneof("message") == "transport_event"
+                and e.transport_event.WhichOneof("event") == "endpoint_registered"
+            ),
         )
-        ev = await loop.run_in_executor(None, self._ep.wait_for_event, 10000)
-        if not ev or ev["type"] != "registered":
-            logger.error("SIP registration failed: %s", ev)
-            sys.exit(1)
+        try:
+            await loop.run_in_executor(
+                None, self._ep.register, self._sip_username, self._sip_password
+            )
+            try:
+                await asyncio.wait_for(reg_q.get(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.error("SIP registration timed out after 10s")
+                sys.exit(1)
+        finally:
+            GLOBAL.unsubscribe(reg_q)
 
         logger.info("Registered as %s@%s:%d", self._sip_username, self._sip_server, self._sip_port)
 
@@ -598,8 +663,8 @@ class AgentServer:
         await site.start()
         logger.info("HTTP server on http://%s:%d", self._host, self._port)
 
-        # Start SIP event loop
-        event_task = asyncio.create_task(self._sip_event_loop())
+        # Start lifecycle loop (subscribes to GLOBAL FfiQueue).
+        event_task = asyncio.create_task(self._lifecycle_loop())
 
         # Wait for shutdown signal
         stop = asyncio.Event()
@@ -607,22 +672,65 @@ class AgentServer:
             loop.add_signal_handler(sig, stop.set)
 
         await stop.wait()
+        try:
+            await self._run_cleanup(runner, event_task, loop)
+        finally:
+            # Flush stdio so the last log lines aren't lost —
+            # os._exit skips normal Python finalization.
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
+            os._exit(0)
+
+    async def _run_cleanup(
+        self,
+        runner: "web.AppRunner",
+        event_task: asyncio.Task,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Hang up active calls, drain ancillary resources with short timeouts.
+
+        Split out of ``run()`` so the signal-handler path remains a thin
+        wrapper that adds ``os._exit(0)`` after this returns, while tests can
+        exercise the cleanup ordering directly.
+        """
         logger.info("Shutting down...")
+        if self._ep is not None:
+            # Hang up every active call up-front, synchronously and in order, so
+            # callers drop promptly before the slower cleanup steps below. Per-call
+            # hangups during normal operation go off-loop (control_executor) to
+            # avoid stalling OTHER live calls on the blocking SIP BYE — but here
+            # there are no live calls left to protect: the whole server is tearing
+            # down and about to os._exit. A blocking in-order loop is therefore the
+            # right choice — it guarantees every BYE is attempted before the
+            # process exits. Each call is bounded by the Rust hangup timeout, and
+            # ep.shutdown() below repeats the hangup idempotently.
+            for session_id in list(self._active_calls.keys()):
+                try:
+                    self._ep.hangup(session_id)
+                except Exception:
+                    pass
         event_task.cancel()
-
-        if self._active_calls:
-            logger.info("Draining %d active call(s)...", len(self._active_calls))
-            await asyncio.gather(*self._active_calls.values(), return_exceptions=True)
-
-        await runner.cleanup()
+        try:
+            await asyncio.wait_for(runner.cleanup(), timeout=2.0)
+        except Exception:
+            pass
         if self._inference_executor:
-            await self._inference_executor.aclose()
-        # Stop background threads cleanly before exiting.
+            try:
+                await asyncio.wait_for(self._inference_executor.aclose(), timeout=2.0)
+            except Exception:
+                pass
         self._load_monitor.stop()
-        # ep.shutdown() does block_on for unregister + per-call hangup. Wrap
-        # in run_in_executor so the asyncio loop isn't blocked for the
-        # ~200ms it takes to talk to the proxy.
-        await loop.run_in_executor(None, self._ep.shutdown)
+        if self._ep is not None:
+            try:
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, self._ep.shutdown),
+                    timeout=2.0,
+                )
+            except Exception:
+                pass
 
     def _configure_logging(self, mode: str) -> None:
         if mode == "debug":
@@ -783,184 +891,191 @@ class AgentServer:
                 "to": raw_to, "from": raw_from,
             })
 
-    async def _sip_event_loop(self) -> None:
-        """Single event dispatcher — reads all SIP events and routes them.
+    async def _lifecycle_loop(self) -> None:
+        """Subscribe to GLOBAL FfiQueue for lifecycle events.
 
-        Avoids multiple consumers racing on wait_for_event.
+        The pyo3 dispatcher thread (started by ``set_event_sink``) drains
+        ``inner.events()`` on the Rust side, translates each event to a
+        :class:`FfiEvent`, and ``GLOBAL.put``s on the asyncio loop via
+        ``call_soon_threadsafe``. By the time we ``await q.get()`` the
+        event is already on the loop — no ``run_in_executor`` round-trip.
         """
         loop = asyncio.get_running_loop()
 
-        while True:
-            try:
-                ev = await loop.run_in_executor(None, self._ep.wait_for_event, 1000)
-            except Exception:
-                logger.exception("sip wait_for_event failed")
-                break
+        def _filter(e: FfiEvent) -> bool:
+            kind = e.WhichOneof("message")
+            if kind == "room_event":
+                return True
+            if kind == "transport_event":
+                sub = e.transport_event.WhichOneof("event")
+                return sub in (
+                    "beep_detected", "beep_timeout",
+                    "endpoint_shutdown", "call_ringing",
+                )
+            return False
 
-            if not ev:
-                continue
+        q = GLOBAL.subscribe(loop=loop, filter_fn=_filter)
+        try:
+            while True:
+                e = await q.get()
+                try:
+                    if self._dispatch_event(e):
+                        break
+                except Exception:
+                    logger.exception("Error handling sip FfiEvent %r", e.WhichOneof("message") if e else e)
+                finally:
+                    q.task_done()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            GLOBAL.unsubscribe(q)
 
-            try:
-                ev_type = ev["type"]
+    def _dispatch_event(self, e: FfiEvent) -> bool:
+        """Process a single FfiEvent. Returns True if the loop should exit."""
+        kind = e.WhichOneof("message")
 
-                if ev_type == "shutdown":
-                    # Sentinel pushed by ep.shutdown() so this loop wakes
-                    # immediately instead of waiting for the next 1s poll
-                    # timeout. Exit cleanly.
-                    logger.debug("sip event loop received shutdown sentinel")
-                    break
+        if kind == "transport_event":
+            sub = e.transport_event.WhichOneof("event")
+            if sub == "endpoint_shutdown":
+                logger.debug("sip lifecycle loop received endpoint_shutdown")
+                return True
 
-                if ev_type == "call_ringing":
-                    # Pre-answer hook. Rust has sent 180 Ringing and will
-                    # auto-answer immediately after this event. We don't
-                    # create the session yet — that happens on call_answered.
-                    # This is purely observational: fire server-level
-                    # "ringing" listeners for logging / screening.
-                    session = ev["session"]
-                    logger.info(
-                        "Incoming call %s ringing (from=%s, call_uuid=%s)",
-                        session.session_id, session.remote_uri, session.call_uuid,
-                    )
-                    self._emit_server_event("ringing", session)
+            if sub == "call_ringing":
+                cr = e.transport_event.call_ringing
+                logger.info(
+                    "Incoming call %s ringing (from=%s, call_uuid=%s)",
+                    cr.session_id, cr.remote_uri, cr.call_uuid,
+                )
+                # Fabricate a minimal session-shaped object so existing
+                # ``@server.on("ringing")`` callbacks (which read
+                # ``session.session_id``/``remote_uri``/``call_uuid``)
+                # keep working without signature changes.
+                class _RingingSession:
+                    __slots__ = ("session_id", "remote_uri", "call_uuid")
+                    def __init__(self_inner):
+                        self_inner.session_id = cr.session_id
+                        self_inner.remote_uri = cr.remote_uri
+                        self_inner.call_uuid = cr.call_uuid
+                self._emit_server_event("ringing", _RingingSession())
+                return False
 
-                elif ev_type == "call_answered":
-                    # Call is answered and media is active — safe to create
-                    # the agent session. Fires for both inbound and outbound.
-                    # Outbound sessions are reserved synchronously by the
-                    # HTTP outbound path (via _outbound_session_ids), so we
-                    # skip the event for them.
-                    session = ev["session"]
-                    session_id = session.session_id
-                    if session_id in self._outbound_session_ids:
-                        # Outbound path owns session creation. Clear the
-                        # marker so a hypothetical session_id reuse after
-                        # this call ends doesn't keep matching.
-                        self._outbound_session_ids.discard(session_id)
-                        continue
-                    if session_id in self._active_calls:
-                        # Defensive: session already being driven (e.g.,
-                        # duplicate event, retry). Ignore.
-                        continue
-                    t = asyncio.create_task(
-                        self._start_call(session_id, session.remote_uri, direction="inbound")
-                    )
-                    self._background_tasks.add(t)
-                    t.add_done_callback(self._background_tasks.discard)
+            if sub == "beep_detected":
+                be = e.transport_event.beep_detected
+                session_id = be.source_handle
+                logger.info(
+                    "Beep detected on call %s (freq=%.0fHz, dur=%dms)",
+                    session_id, be.frequency_hz, be.duration_ms,
+                )
+                ctx = self._call_contexts.get(session_id)
+                if ctx:
+                    ctx._emit("beep_detected", be.frequency_hz, be.duration_ms)
+                    if ctx._room:
+                        ctx._room.emit("beep_detected", {
+                            "frequency_hz": be.frequency_hz,
+                            "duration_ms": be.duration_ms,
+                        })
+                return False
 
-                elif ev_type == "call_terminated":
-                    session_id = ev["session"].session_id
-                    reason = ev.get("reason", "unknown")
-                    logger.info("Call %s terminated (reason=%s)", session_id, reason)
+            if sub == "beep_timeout":
+                session_id = e.transport_event.beep_timeout.source_handle
+                logger.debug("Beep timeout on call %s", session_id)
+                ctx = self._call_contexts.get(session_id)
+                if ctx:
+                    ctx._emit("beep_timeout")
+                    if ctx._room:
+                        ctx._room.emit("beep_timeout", {})
+                return False
+            return False
 
-                    # Clear audio buffer to abort pending playout — but skip when
-                    # recording so the RTP send loop can drain remaining audio
-                    # into the recorder before shutdown.
-                    if not self._recording:
-                        try:
-                            self._ep.clear_buffer(session_id)
-                        except Exception:
-                            pass
+        if kind == "room_event":
+            sub = e.room_event.WhichOneof("participant")
+            room_handle = e.room_event.room_handle
 
-                    # Shut down the session gracefully BEFORE emitting
-                    # participant_disconnected. LiveKit's default handler calls
-                    # `_close_soon(drain=False)`, which force-interrupts any
-                    # in-flight LLM/TTS response — the final assistant message
-                    # (e.g. the reply after a tool call) would never land in
-                    # chat_history. Calling `shutdown(drain=True)` first sets
-                    # `_closing_task` so the subsequent `_close_soon` becomes a
-                    # no-op and the session drains normally, letting in-flight
-                    # speech finalize into history.
-                    ctx = self._call_contexts.get(session_id)
-                    if ctx and ctx._session is not None:
-                        try:
-                            ctx._session.shutdown(drain=True)
-                        except Exception:
-                            logger.warning(
-                                "Graceful session shutdown failed; falling back "
-                                "to default close",
-                                exc_info=True,
-                            )
+            if sub == "participant_connected":
+                info = e.room_event.participant_connected.info
+                session_id = info.session_id or room_handle
+                remote_uri = info.identity
 
-                    # Emit participant_disconnected on Room facade (matches
-                    # LiveKit WebRTC). RoomIO._on_participant_disconnected calls
-                    # `_close_soon(drain=False)`, which is a no-op here because
-                    # `_closing_task` was already set above.
-                    if ctx and ctx._room:
-                        remote = ctx._room._remote
-                        remote.disconnect_reason = 1  # CLIENT_INITIATED
-                        ctx._room.emit("participant_disconnected", remote)
+                # Outbound path reserves session_ids synchronously via
+                # _outbound_session_ids — skip the participant_connected
+                # event for those (HTTP outbound owns session creation).
+                if session_id in self._outbound_session_ids:
+                    self._outbound_session_ids.discard(session_id)
+                    return False
+                if session_id in self._active_calls:
+                    return False  # duplicate / retry
 
-                    # Signal active call to end
-                    if session_id in self._call_ended_events:
-                        self._call_ended_events[session_id].set()
+                # Reserve the slot SYNCHRONOUSLY (before create_task) so a
+                # duplicate participant_connected delivered on the very next
+                # loop turn — before _start_call's own task has run and set
+                # the real task object at the end of _start_call — is deduped
+                # here. Mirrors the _outbound_session_ids reservation pattern.
+                # _start_call overwrites this None placeholder with the real
+                # task; the _run_call finally pops it.
+                self._active_calls[session_id] = None
+                t = asyncio.create_task(
+                    self._start_call(session_id, remote_uri, direction="inbound")
+                )
+                self._background_tasks.add(t)
+                t.add_done_callback(self._background_tasks.discard)
+                return False
 
-                elif ev_type == "dtmf_received":
-                    # Session ID is a string at every other call site; the old
-                    # `-1` default would produce a lookup miss and silently drop
-                    # a malformed DTMF event. Use None so the guard below logs
-                    # and skips explicitly.
-                    session_id = ev.get("session_id")
-                    digit = ev.get("digit", "")
+            if sub == "participant_disconnected":
+                pd = e.room_event.participant_disconnected
+                session_id = pd.session_id or room_handle
+                logger.info("Call %s terminated (reason=%s)", session_id, pd.reason)
+
+                # Clear audio buffer immediately to abort any pending playout
+                # (prevents 5s "speech not done in time" timeout).
+                try:
+                    self._ep.clear_buffer(session_id)
+                except Exception:
+                    pass
+
+                # Synchronously begin tearing down the AgentSession so a
+                # buffered STT transcript delivered after disconnect can't
+                # trigger a wasted LLM + TTS turn on a dead call (issue #83).
+                # Must run here, on the event-loop wake branch, before we set
+                # the call-ended event — flipping the scheduling guard later
+                # (in _run_call's finally) would be too late.
+                ctx = self._call_contexts.get(session_id)
+                if ctx is not None and getattr(ctx, "_session", None) is not None:
+                    force_shutdown_agent_session(ctx._session, self._background_tasks)
+
+                # Wake _run_call (which holds _JobContextVar in its own
+                # task context). The participant_disconnected emit MUST
+                # run from _run_call — not here — because LiveKit's
+                # ``RoomIO._on_participant_disconnected`` synchronously
+                # calls ``AgentSession._close_soon``, which does
+                # ``asyncio.create_task`` and captures the current
+                # context. Emitting from this loop (no JobContextVar) would
+                # break ``get_job_context()`` for the close task.
+                if session_id in self._call_ended_events:
+                    self._call_ended_events[session_id].set()
+                return False
+
+            if sub == "data_packet_received":
+                dp = e.room_event.data_packet_received.value
+                if dp and dp.sip_dtmf:
+                    session_id = room_handle
+                    digit = dp.sip_dtmf.digit
                     if not session_id:
-                        logger.warning("DTMF event missing session_id, dropping: %r", ev)
-                        continue
+                        logger.warning("DTMF event missing session_id, dropping")
+                        return False
                     logger.debug("DTMF '%s' on call %s", digit, session_id)
                     ctx = self._call_contexts.get(session_id)
                     if ctx:
                         ctx._emit("dtmf_received", digit)
                         if ctx._room:
-                            dtmf_ev = SipDTMF(code=ord(digit) if digit else 0, digit=digit,
-                                              participant=ctx._room._remote)
+                            dtmf_ev = SipDTMF(
+                                code=ord(digit) if digit else 0, digit=digit,
+                                participant=ctx._room._remote,
+                            )
                             ctx._room.emit("sip_dtmf_received", dtmf_ev)
+                return False
+            return False
 
-                elif ev_type == "beep_detected":
-                    session_id = ev.get("session_id")
-                    if not session_id:
-                        logger.warning("beep_detected event missing session_id, dropping: %r", ev)
-                        continue
-                    freq = ev.get("frequency_hz", 0.0)
-                    dur = ev.get("duration_ms", 0)
-                    logger.info("Beep detected on call %s (freq=%.0fHz, dur=%dms)", session_id, freq, dur)
-                    ctx = self._call_contexts.get(session_id)
-                    if ctx:
-                        ctx._emit("beep_detected", freq, dur)
-                        if ctx._room:
-                            ctx._room.emit("beep_detected", {"frequency_hz": freq, "duration_ms": dur})
-
-                elif ev_type == "beep_timeout":
-                    session_id = ev.get("session_id")
-                    if not session_id:
-                        logger.warning("beep_timeout event missing session_id, dropping: %r", ev)
-                        continue
-                    logger.debug("Beep timeout on call %s", session_id)
-                    ctx = self._call_contexts.get(session_id)
-                    if ctx:
-                        ctx._emit("beep_timeout")
-                        if ctx._room:
-                            ctx._room.emit("beep_timeout", {})
-            except Exception:
-                logger.exception("Error handling sip event %r", ev.get("type") if isinstance(ev, dict) else ev)
-
-    async def _upload_report(
-        self, session, session_id: str, obs_url: str,
-        recording_path: str | None = None, recording_started_at: float | None = None,
-        account_id: str | None = None,
-        direction: str | None = None,
-        metadata: dict[str, Any] | None = None,
-        tagger: Any = None,
-        job_context: Any = None,
-    ) -> None:
-        from .observability import upload_session_report
-        await upload_session_report(
-            session, session_id, obs_url, self._agent_name,
-            recording_path, recording_started_at, account_id,
-            agent_id=self._agent_id,
-            transport="sip",
-            direction=direction,
-            metadata=metadata,
-            tagger=tagger,
-            job_context=job_context,
-        )
+        return False
 
     async def _start_call(self, session_id: str, remote_uri: str, direction: str) -> None:
         call_ended = asyncio.Event()
@@ -972,13 +1087,6 @@ class AgentServer:
             agent_name=self._agent_name,
             caller_identity=remote_uri,
         )
-        job_stub, job_ctx_token = create_transport_context(
-            room,
-            agent_name=self._agent_name,
-            inference_executor=getattr(self, "_inference_executor", None),
-            enable_recording=self._recording,
-        )
-
         ctx = JobContext(
             session_id=session_id,
             remote_uri=remote_uri,
@@ -989,13 +1097,30 @@ class AgentServer:
             _agent_id=self._agent_id,
             _call_ended=call_ended,
             _room=room,
-            _job_stub=job_stub,
-            _job_ctx_token=job_ctx_token,
             _proc=self._proc,
+            _events=self._events,
         )
+        # Make the entrypoint's ctx the canonical job context so
+        # get_job_context() is ctx (unifies the dual JobContext, #92).
+        _, job_ctx_token = create_transport_context(
+            room,
+            agent_name=self._agent_name,
+            inference_executor=getattr(self, "_inference_executor", None),
+            context=ctx,
+        )
+        ctx._job_ctx_token = job_ctx_token
         self._call_contexts[session_id] = ctx
 
         async def _run_call():
+            # Re-set _JobContextVar in this task's own context so late
+            # ``session.close`` listeners find the context regardless of
+            # how the close emit is scheduled. The parent context's
+            # set() returns a token scoped to the parent; child tasks
+            # inherit the value but not always reliably under heavy
+            # async churn.
+            from livekit.agents.job import _JobContextVar
+            _JobContextVar.set(ctx)
+
             node = _nodename()
             SIP_CALLS_TOTAL.labels(nodename=node, direction=direction).inc()
             call_start = time.monotonic()
@@ -1025,94 +1150,43 @@ class AgentServer:
                 SIP_CALL_DURATION.labels(nodename=node).observe(time.monotonic() - call_start)
                 logger.info("Call %s cleanup: session=%s", session_id, "set" if ctx._session is not None else "None")
 
-                if ctx._session is not None:
-                    try:
-                        usage = ctx._session.usage
-                        if usage and usage.model_usage:
-                            logger.info("Call %s usage: %s", session_id, usage)
-                    except Exception:
-                        pass
-
-                    # Stop recording and wait for file to be finalized
-                    if rec_path:
-                        try:
-                            self._ep.stop_recording(session_id)
-                            # Rust recorder finalizes on a background thread;
-                            # poll until the file appears (up to 2s)
-                            for _ in range(20):
-                                if os.path.exists(rec_path):
-                                    break
-                                await asyncio.sleep(0.1)
-                        except Exception:
-                            pass
-
-                    # Wait for session close (triggered by participant_disconnected
-                    # → _close_soon) rather than calling aclose() which cancels
-                    # in-progress LLM/TTS and discards the response from history.
-                    # The session's close event was wired in the session setter to
-                    # set call_ended — by the time we're here, it may already be
-                    # closing. Give it a few seconds to finalize in-flight responses.
-                    try:
-                        close_event = asyncio.Event()
-                        ctx._session.on("close", lambda *_: close_event.set())
-                        try:
-                            await asyncio.wait_for(close_event.wait(), timeout=5.0)
-                        except asyncio.TimeoutError:
-                            # Force close if graceful close didn't happen
-                            await ctx._session.aclose()
-                    except Exception:
-                        try:
-                            await ctx._session.aclose()
-                        except Exception:
-                            pass
-
-                    # Upload session report after session close so history is complete
-                    obs_url = _get_observability_url()
-                    if obs_url:
-                        try:
-                            await run_configured_judges(
-                                session=ctx._session,
-                                job_context=ctx._job_stub,
-                                evaluation=ctx.evaluation,
-                                session_id=session_id,
-                                logger=logger,
-                            )
-                            await self._upload_report(
-                                ctx._session, session_id, obs_url, rec_path, rec_started_at,
-                                account_id=ctx.account_id,
-                                direction=ctx.direction,
-                                metadata=ctx.metadata,
-                                tagger=ctx.tagger,
-                                job_context=ctx._job_stub,
-                            )
-                        except Exception:
-                            logger.warning("Failed to upload session report for call %s", session_id, exc_info=True)
-
-                        # Clean up local recording after upload attempt
-                        if rec_path:
-                            try:
-                                os.remove(rec_path)
-                            except Exception:
-                                logger.warning("Failed to clean up recording %s", rec_path, exc_info=True)
-
-                for cb in ctx._shutdown_callbacks:
-                    try:
-                        result = cb()
-                        if asyncio.iscoroutine(result):
-                            await result
-                    except Exception:
-                        logger.exception("Shutdown callback failed")
+                await finalize_session(
+                    ctx,
+                    session_id=session_id,
+                    endpoint=self._ep,
+                    transport="sip",
+                    agent_name=self._agent_name,
+                    agent_id=self._agent_id,
+                    recording_path=rec_path,
+                    recording_started_at=rec_started_at,
+                    reason="call ended",
+                    logger=logger,
+                )
                 try:
-                    self._ep.hangup(session_id)
+                    # Off-loop on the dedicated call-control executor: hangup is
+                    # a blocking SIP BYE; awaiting it there keeps the loop free
+                    # for other calls' teardown without contending for the audio
+                    # forwarders' default pool.
+                    await asyncio.get_running_loop().run_in_executor(
+                        _control_executor(), self._ep.hangup, session_id
+                    )
                 except Exception:
                     pass
-                # Cleanup Room facade and JobContext
+                # Cleanup Room facade. We do NOT call
+                # ``_JobContextVar.reset(job_ctx_token)`` here: late
+                # ``session.close`` listeners (e.g.
+                # ``livekit.agents.beta.tools.end_call._on_session_close``)
+                # can fire AFTER ``session.aclose()`` returns and they
+                # need ``get_job_context()`` to work. The contextvar is
+                # scoped to this asyncio.Task and dies cleanly when the
+                # task exits.
                 room._on_session_ended()
-                from livekit.agents.job import _JobContextVar
-                try:
-                    _JobContextVar.reset(job_ctx_token)
-                except ValueError:
-                    pass
+                # No EventWaiter to close. Rust's AudioBuffer::Drop emits
+                # audio_capture_error for every pending async_id, which
+                # the FfiQueue dispatches and each in-flight
+                # capture_frame / wait_for_playout receives via its
+                # per-call subscribed Queue. The audio source's finally
+                # block does the unsubscribe.
                 self._active_calls.pop(session_id, None)
                 self._call_ended_events.pop(session_id, None)
                 self._call_contexts.pop(session_id, None)

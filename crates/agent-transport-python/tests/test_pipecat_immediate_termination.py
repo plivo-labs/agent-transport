@@ -221,19 +221,16 @@ async def test_sip_output_cancel_hangs_up():
 
 
 @pytest.mark.asyncio
-async def test_sip_output_cancel_tolerates_session_gone():
-    """If the SIP call was already torn down before cancel() reaches us,
-    hangup should be idempotent (Rust core already ensures this) and
-    cancel() must not raise.
+async def test_sip_output_cancel_calls_idempotent_hangup():
+    """``hangup`` is idempotent under the 0.2.0 Terminated lifecycle: on
+    a session already torn down, the Rust core short-circuits to
+    success — Python sees no exception. cancel() can therefore call
+    hangup unconditionally with no defensive try/except. This test
+    pins that we DO call hangup exactly once and we DO NOT wrap it in
+    a try/except that would swallow real errors (e.g. unknown session
+    id from a programming bug).
     """
-    class _RaisingEndpoint(_FakeEndpoint):
-        def hangup(self, session_id):
-            # Simulate a broken binding that raises — our cancel() must
-            # swallow it so the pipeline teardown continues.
-            self.hangup_calls += 1
-            raise RuntimeError(f"call not active: {session_id}")
-
-    ep = _RaisingEndpoint()
+    ep = _FakeEndpoint(session_gone=True)
     t = _make_sip_output(endpoint=ep)
 
     import unittest.mock
@@ -242,9 +239,12 @@ async def test_sip_output_cancel_tolerates_session_gone():
     with unittest.mock.patch.object(
         SipOutputTransport.__mro__[1], "cancel", new=_noop
     ):
-        # Should not raise — exception is logged at debug level
         await asyncio.wait_for(t.cancel(CancelFrame(reason="test")), timeout=1.0)
 
+    # ``hangup`` is called once, and (because Rust's hangup is idempotent
+    # on terminated sessions) the call completes without raising. The
+    # _FakeEndpoint mimics that idempotency by recording the call and
+    # returning normally even with session_gone=True.
     assert ep.hangup_calls == 1
 
 

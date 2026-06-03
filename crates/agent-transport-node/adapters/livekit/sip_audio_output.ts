@@ -2,19 +2,27 @@
  * SipAudioOutput — extends LiveKit's AudioOutput base class for SIP/AudioStream.
  *
  * Matches WebRTC's ParticipantAudioOutput exactly:
- * - captureFrame sends to Rust with backpressure (sendAudioNotify callback)
- * - waitForPlayout uses Rust callback (fires when buffer drains to empty)
+ * - captureFrame sends to Rust with backpressure via the 0.2.0 async-id flow:
+ *   `sendAudioAsync` returns an async-id, then we await the matching
+ *   `audio_capture_complete` event (mirrors LiveKit's `capture_audio_frame`
+ *   and the Python `_audio_source.py` reference).
+ * - waitForPlayout uses `waitForPlayoutAsync` + `audio_playout_complete`
+ *   (fires when buffer drains to empty).
  * - queuedDuration reads real Rust buffer state
- * - clearBuffer signals interruption
+ * - clearBuffer signals interruption (Rust emits `audio_capture_error` for
+ *   every pending async-id, surfaced as a rejection on the awaited event).
  * - pause/resume controls Rust RTP output directly
  *
- * No timer heuristics — all playout tracking comes from Rust.
+ * No timer heuristics — all playout tracking comes from Rust. Audio events
+ * are delivered via {@link AudioEventBroker}, which the server event loop
+ * feeds (single-reader) or which self-pumps for standalone use.
  */
 
 import { AudioFrame } from '@livekit/rtc-node';
 import { createRequire } from 'node:module';
 import { Future, Task } from '@livekit/agents';
 import type { SipEndpoint, AudioStreamEndpoint } from 'agent-transport';
+import { AudioEventBroker, brokerFor } from './_audio_events.js';
 
 // AudioOutput is not publicly exported from @livekit/agents — resolve internal path
 const _require = createRequire(import.meta.url);
@@ -25,6 +33,7 @@ const { AudioOutput: _AudioOutputBase } = _require(_ioPath);
 export class SipAudioOutput extends _AudioOutputBase {
   private endpoint: SipEndpoint | AudioStreamEndpoint;
   private sessionId: string;
+  private broker: AudioEventBroker;
 
   private flushTask: Task<void> | null = null;
   private interruptedFuture = new Future<void>();
@@ -42,6 +51,7 @@ export class SipAudioOutput extends _AudioOutputBase {
     super(_sampleRate, nextInChain, { pause: true });
     this.endpoint = endpoint;
     this.sessionId = sessionId;
+    this.broker = brokerFor(endpoint);
   }
 
   // -- captureFrame: matches WebRTC's ParticipantAudioOutput.captureFrame --
@@ -55,26 +65,32 @@ export class SipAudioOutput extends _AudioOutputBase {
     // super.captureFrame would have done.
     this.pushedDuration += frame.samplesPerChannel / frame.sampleRate;
 
-    // Push to Rust with backpressure — callback fires when buffer has space.
-    // Matches WebRTC's `await audioSource.captureFrame(frame)`.
+    // Push to Rust with backpressure via the 0.2.0 async-id flow. Mirrors
+    // `_audio_source.py.capture_frame`: issue `sendAudioAsync` to get the
+    // async-id, then await the matching `audio_capture_complete` event
+    // (delivered through the broker). Matches WebRTC's
+    // `await audioSource.captureFrame(frame)`.
+    //
+    // The broker buffers terminal events by async-id, so a completion that
+    // the Rust immediate-emit path fires before `sendAudioAsync` returns is
+    // not lost — closing the dispatch-before-wait race the napi note in
+    // lib.rs warns about, without a pre-call subscribe primitive.
     const frameData = Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
     const isFirstFrame = !this.firstFrameEmitted;
-    await new Promise<void>((resolve) => {
-      try {
-        this.endpoint.sendAudioNotify(
-          this.sessionId,
-          frameData,
-          frame.sampleRate,
-          frame.channels,
-          () => resolve(),
-        );
-      } catch {
-        // Buffer full or session gone — drop frame silently (matches WebRTC
-        // behavior where captureFrame returns false on buffer full without
-        // throwing).
-        resolve();
-      }
-    });
+    try {
+      const asyncId = this.endpoint.sendAudioAsync(
+        this.sessionId,
+        frameData,
+        frame.sampleRate,
+        frame.channels,
+      );
+      await this.broker.waitForCapture(asyncId);
+    } catch {
+      // Buffer full / session gone / cleared-while-in-flight — drop frame
+      // silently (matches WebRTC behavior where captureFrame returns false
+      // on buffer full without throwing, and matches `_audio_source.py`
+      // surfacing cleared/flushed as a benign drop in the adapter).
+    }
 
     // Emit playback-started AFTER the first frame has actually been
     // accepted by Rust (the napi callback fired). Upstream LiveKit fires
@@ -183,15 +199,21 @@ export class SipAudioOutput extends _AudioOutputBase {
 
   // -- Source helpers (using Rust APIs, matching WebRTC's audioSource) --
 
-  /** Wait for playout via Rust callback — no timer, no thread pool. */
-  private waitForSourcePlayout(): Promise<void> {
-    return new Promise<void>((resolve) => {
-      try {
-        (this.endpoint as any).waitForPlayoutNotify(this.sessionId, () => resolve());
-      } catch {
-        resolve(); // Session gone
-      }
-    });
+  /**
+   * Wait for playout via the 0.2.0 async-id flow — no timer, no thread pool.
+   * Mirrors `_audio_source.py.wait_for_playout`: `waitForPlayoutAsync`
+   * registers an async-id (the completion always fires — immediately if the
+   * buffer is already empty, deferred otherwise), then we await the matching
+   * `audio_playout_complete` event through the broker.
+   */
+  private async waitForSourcePlayout(): Promise<void> {
+    try {
+      const asyncId = this.endpoint.waitForPlayoutAsync(this.sessionId);
+      await this.broker.waitForPlayout(asyncId);
+    } catch {
+      // Session gone, or cleared/flushed while waiting (surfaced as an
+      // audio_capture_error rejection) — treat as "playout done".
+    }
   }
 
   /** Clear Rust buffer immediately. */

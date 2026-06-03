@@ -48,6 +48,7 @@ export class AudioStreamJobContext {
   readonly proc: JobProcess;
   readonly job: { id: string; agentName: string; enableRecording: boolean; room: TransportRoom };
   readonly workerId = 'local';
+  readonly worker_id = 'local';
   readonly sessionDirectory: string;
   readonly inferenceExecutor: unknown;
   metadata: Record<string, unknown> = {};
@@ -223,5 +224,20 @@ export class AudioStreamJobContext {
 
   initRecording(): void {
     // agent-transport owns mixed transport recording; LiveKit RecorderIO is disabled.
+  }
+
+  get agent(): any {
+    return this.room.localParticipant;
+  }
+
+  async waitForParticipant(identity?: string): Promise<any> {
+    const participants = Array.from(this.room.remoteParticipants.values());
+    return participants.find((p: any) => !identity || p.identity === identity) ?? participants[0];
+  }
+
+  addParticipantEntrypoint(callback: (job: AudioStreamJobContext, participant: any) => unknown): void {
+    this.waitForParticipant()
+      .then((participant) => callback(this, participant))
+      .catch(() => {});
   }
 }
