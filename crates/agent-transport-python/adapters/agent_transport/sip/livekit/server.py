@@ -445,18 +445,7 @@ class AgentServer(AgentServerBase):
             SIP_CALLS_TOTAL.labels(nodename=node, direction=direction).inc()
             call_start = time.monotonic()
 
-            # Start recording if enabled.
-            rec_path = None
-            rec_started_at = None
-            if self._recording:
-                try:
-                    os.makedirs(self._recording_dir, exist_ok=True)
-                    rec_path = os.path.join(self._recording_dir, f"recording_{session_id}.ogg")
-                    self._ep.start_recording(session_id, rec_path, self._recording_stereo)
-                    rec_started_at = time.time()
-                except Exception:
-                    rec_path = None
-                    logger.warning("Failed to start recording for call %s", session_id, exc_info=True)
+            rec_path, rec_started_at = self._start_session_recording(session_id)
 
             try:
                 await self._entrypoint_fnc(ctx)

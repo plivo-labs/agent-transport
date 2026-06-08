@@ -25,12 +25,11 @@
 import { createServer, type Server, type IncomingMessage } from 'node:http';
 import { cpus } from 'node:os';
 import { hostname } from 'node:os';
-import { mkdirSync } from 'node:fs';
 import { SipEndpoint } from 'agent-transport';
 import { initializeLogger, InferenceRunner, runWithJobContext, log as agentLog } from '@livekit/agents';
 import { JobContext } from './session_context.js';
 import { logObservabilityStatus } from './observability.js';
-import { finalizeSession } from './_session_finalize.js';
+import { finalizeSession, startSessionRecording } from './_session_finalize.js';
 import { runServerCleanup, forceShutdownAgentSession, installUnhandledRejectionHandler, registerSignalCleanup } from './_session_teardown.js';
 import { brokerFor, isAudioEvent } from './_audio_events.js';
 
@@ -549,14 +548,7 @@ export class AgentServer {
           });
         }
 
-        // Start Rust recording (stereo OGG/Opus at transport layer)
-        // Captures full mix: agent voice + background audio + user audio
-        try {
-          mkdirSync(sessionDir, { recursive: true });
-          recPath = `${sessionDir}/recording_${sessionId}.ogg`;
-          recordingStartedAt = Date.now();
-          this.ep!.startRecording(sessionId, recPath, true);
-        } catch {}
+        ({ recordingPath: recPath, recordingStartedAt } = startSessionRecording(this.ep!, sessionId, sessionDir));
 
         // Entrypoint returned — session.start() is non-blocking,
         // so wait for call to actually end (BYE or agent shutdown)

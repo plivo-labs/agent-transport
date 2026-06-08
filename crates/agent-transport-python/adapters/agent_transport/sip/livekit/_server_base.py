@@ -43,6 +43,7 @@ import os
 import signal
 import sys
 import threading
+import time
 
 import prometheus_client
 from aiohttp import web
@@ -651,6 +652,29 @@ class AgentServerBase:
                 "server constructor or set the AGENT_ID env var to enable observability.",
                 obs_url,
             )
+
+    def _start_session_recording(self, session_id: str) -> tuple[str | None, float | None]:
+        """Start a transport-layer recording for this session, if appropriate.
+
+        Recording is gated on observability being configured: the recording's
+        only purpose is to be uploaded as part of the session report, and
+        ``finalize_session`` uploads then deletes it. Without observability
+        there's nowhere to send it and nothing would clean up the file, so we
+        skip it entirely. This is the single source of the "record iff we'll
+        upload" policy — the symmetric counterpart to ``finalize_session``.
+
+        Returns ``(recording_path, started_at)`` or ``(None, None)``.
+        """
+        if not (self._recording and _get_observability_url()):
+            return None, None
+        try:
+            os.makedirs(self._recording_dir, exist_ok=True)
+            rec_path = os.path.join(self._recording_dir, f"recording_{session_id}.ogg")
+            self._ep.start_recording(session_id, rec_path, self._recording_stereo)
+            return rec_path, time.time()
+        except Exception:
+            self._logger.warning("Failed to start recording for %s", session_id, exc_info=True)
+            return None, None
 
     def _configure_logging(self, mode: str) -> None:
         if mode == "debug":
