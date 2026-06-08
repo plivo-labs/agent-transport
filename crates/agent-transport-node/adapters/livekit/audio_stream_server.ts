@@ -30,7 +30,7 @@ import { AudioStreamEndpoint } from 'agent-transport';
 import { initializeLogger, InferenceRunner, runWithJobContext } from '@livekit/agents';
 import { AudioStreamJobContext } from './audio_stream_context.js';
 import { JobProcess } from './agent_server.js';
-import { getObservabilityUrl } from './observability.js';
+import { logObservabilityStatus } from './observability.js';
 import { finalizeSession } from './_session_finalize.js';
 import { runServerCleanup, forceShutdownAgentSession, installUnhandledRejectionHandler, registerSignalCleanup } from './_session_teardown.js';
 import { brokerFor, isAudioEvent } from './_audio_events.js';
@@ -252,16 +252,7 @@ export class AudioStreamServer {
     this.startHttpServer();
     console.log(`HTTP server on http://${this.host}:${this.port}`);
 
-    const obsUrl = getObservabilityUrl();
-    if (obsUrl && this.agentId) {
-      console.log(`Observability enabled, target ${obsUrl}`);
-    } else if (obsUrl) {
-      console.warn(
-        `Observability is configured (AGENT_OBSERVABILITY_URL=${obsUrl}) but agentId is ` +
-          `unset — session reports will NOT be uploaded. Pass agentId to the server ` +
-          `constructor or set the AGENT_ID env var to enable observability.`,
-      );
-    }
+    logObservabilityStatus(this.agentId);
 
     // Start event loop. Track the promise so we can await its exit during
     // shutdown — without this the infinite while loop pins libuv forever.

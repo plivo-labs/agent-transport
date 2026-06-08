@@ -25,6 +25,28 @@ export function getObservabilityUrl(): string | undefined {
   return process.env.AGENT_OBSERVABILITY_URL;
 }
 
+/**
+ * Log at boot whether observability uploads are active.
+ *
+ * agentId is required to upload (obs keys sessions on it; the sessions table is
+ * NOT NULL). When the URL is configured but agentId is unset we warn here —
+ * uploads are skipped per-session in `uploadReport` — so the misconfig is
+ * visible at startup rather than as a silently empty dashboard.
+ */
+export function logObservabilityStatus(agentId: string | undefined): void {
+  const obsUrl = getObservabilityUrl();
+  if (!obsUrl) return;
+  if (agentId) {
+    console.log(`Observability enabled, target ${obsUrl}`);
+  } else {
+    console.warn(
+      `Observability is configured (AGENT_OBSERVABILITY_URL=${obsUrl}) but agentId is ` +
+        `unset — session reports will NOT be uploaded. Pass agentId to the server ` +
+        `constructor or set the AGENT_ID env var to enable observability.`,
+    );
+  }
+}
+
 async function buildBearerAuthHeaders(): Promise<Record<string, string>> {
   const apiKey = process.env.LIVEKIT_API_KEY;
   const apiSecret = process.env.LIVEKIT_API_SECRET;
