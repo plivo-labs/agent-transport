@@ -59,7 +59,7 @@ from livekit.rtc.room import SipDTMF
 from ._audio_io import TransportAudioInput, TransportAudioOutput
 from ._aio_utils import call_setup as _call_setup
 from ._session_teardown import force_shutdown_agent_session
-from .observability import _ensure_transport_tags
+from .observability import _ensure_transport_tags, _get_observability_url
 
 
 class JobProcess:
@@ -330,18 +330,14 @@ class AgentServerBase:
         """
         self._host = host
         self._port = port or int(os.environ.get("PORT", "8080"))
-        # Accept agent_id from kwarg or AGENT_ID env var. Raise on missing
-        # rather than substituting a slug — surface the gap loudly at boot
-        # instead of corrupting telemetry downstream (obs's agents view keys
-        # on it; agent_transport_sessions.agent_id is NOT NULL).
-        resolved_agent_id = agent_id or os.environ.get("AGENT_ID") or None
-        if not resolved_agent_id:
-            raise ValueError(
-                f"{type(self).__name__} requires `agent_id` — pass a stable "
-                "identifier (typically a UUID4) via the `agent_id=` kwarg or the "
-                "AGENT_ID env var. This is the value that keys the obs agents view."
-            )
-        self._agent_id = resolved_agent_id
+        # agent_id (kwarg or AGENT_ID env) is OPTIONAL — the server runs fine
+        # without it. It's only required to *upload* observability: obs's agents
+        # view keys on it and agent_transport_sessions.agent_id is NOT NULL, so
+        # if it's unset while AGENT_OBSERVABILITY_URL is configured we warn at
+        # boot and skip the upload (see _log_observability_status /
+        # finalize_session) rather than corrupt telemetry — or hard-break
+        # servers that don't use observability at all.
+        self._agent_id = agent_id or os.environ.get("AGENT_ID") or ""
         self._agent_name = agent_name
         self._auth = auth
         self._recording = recording
@@ -634,6 +630,27 @@ class AgentServerBase:
                 _clear_inference_context()
             self._userdata = self._proc.userdata
             self._logger.info("Setup complete: %s", list(self._userdata.keys()))
+
+    def _log_observability_status(self) -> None:
+        """Log whether observability uploads are active at boot.
+
+        Observability needs ``agent_id`` (obs keys on it; the sessions table is
+        NOT NULL). If the URL is configured but agent_id is unset we warn loudly
+        here — uploads are skipped per-session in ``finalize_session`` — so the
+        misconfig is visible at startup rather than as a silently empty dashboard.
+        """
+        obs_url = _get_observability_url()
+        if not obs_url:
+            return
+        if self._agent_id:
+            self._logger.info("Observability enabled, target %s", obs_url)
+        else:
+            self._logger.warning(
+                "Observability is configured (AGENT_OBSERVABILITY_URL=%s) but agent_id "
+                "is unset — session reports will NOT be uploaded. Pass agent_id=… to the "
+                "server constructor or set the AGENT_ID env var to enable observability.",
+                obs_url,
+            )
 
     def _configure_logging(self, mode: str) -> None:
         if mode == "debug":

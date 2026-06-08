@@ -45,7 +45,6 @@ from ._aio_utils import schedule_hangup
 from ._session_finalize import finalize_session
 from ._server_base import AgentServerBase, JobContextBase, JobProcess, _nodename
 from .judging import EvaluationConfig
-from .observability import _get_observability_url
 
 logger = logging.getLogger("agent_transport.server")
 
@@ -395,9 +394,7 @@ class AgentServer(AgentServerBase):
 
         logger.info("Registered as %s@%s:%d", self._sip_username, self._sip_server, self._sip_port)
 
-        obs_url = _get_observability_url()
-        if obs_url:
-            logger.info("Observability enabled, target %s", obs_url)
+        self._log_observability_status()
 
         await self._serve_until_shutdown(loop)
 

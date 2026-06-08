@@ -45,7 +45,6 @@ from ._room_facade import TransportJobContextMixin, TransportRoom, create_transp
 from ._session_finalize import finalize_session
 from ._server_base import AgentServerBase, JobContextBase, _nodename
 from .judging import EvaluationConfig
-from .observability import _get_observability_url
 
 logger = logging.getLogger("agent_transport.audio_stream_server")
 
@@ -264,9 +263,7 @@ class AudioStreamServer(AgentServerBase):
         )
         logger.info("Audio stream WebSocket server on ws://%s", self._listen_addr)
 
-        obs_url = _get_observability_url()
-        if obs_url:
-            logger.info("Observability enabled, target %s", obs_url)
+        self._log_observability_status()
 
         # Wire the constrained pyo3 sink — spawns a dispatcher thread inside
         # Rust that drains ``inner.events()``, translates each event to a

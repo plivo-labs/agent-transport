@@ -93,8 +93,19 @@ async def finalize_session(
         # Upload session report after close so history is complete. Runs BEFORE
         # close_session_services because post-session judges invoke an LLM and
         # must not race the vendor socket teardown.
+        #
+        # agent_id is required to upload: obs keys sessions on it and the
+        # sessions table is NOT NULL. When it's unset we skip the upload (and
+        # judges) and keep the local recording rather than write an unparented
+        # session — startup already warned (see _log_observability_status).
         obs_url = _get_observability_url()
-        if obs_url:
+        if obs_url and not agent_id:
+            logger.warning(
+                "Skipping session report upload for %s — observability is configured "
+                "but agent_id is unset (local recording, if any, is kept).",
+                session_id,
+            )
+        elif obs_url:
             try:
                 from .observability import upload_session_report
 

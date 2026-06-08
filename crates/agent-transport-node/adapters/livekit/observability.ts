@@ -405,6 +405,17 @@ export async function uploadReport(options: {
     transport,
   } = options;
 
+  // agent_id is required to upload: obs keys sessions on it and the sessions
+  // table is NOT NULL. Skip (rather than write an unparented session) when it's
+  // unset — startup already warned. See the server constructors.
+  if (!agentId) {
+    console.warn(
+      `Skipping session report upload for ${callId} — observability is configured ` +
+        `but agentId is unset (local recording, if any, is kept).`,
+    );
+    return;
+  }
+
   const report = buildReport(session, callId, recordingPath, recordingStartedAt);
   const roomTags = buildRoomTags({ agentId, agentName, accountId, metadata, transport, direction });
   const authHeaders = await buildBearerAuthHeaders();

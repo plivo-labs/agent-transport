@@ -85,8 +85,10 @@ export async function finalizeSession(opts: FinalizeSessionOptions): Promise<voi
     console.warn(`Failed to upload session report for ${noun.toLowerCase()} ${sessionId}:`, e);
   }
 
-  // Clean up local recording after the upload attempt.
-  if (getObservabilityUrl() && recordingPath) {
+  // Clean up local recording after the upload attempt. Only when an upload was
+  // actually attempted (obs URL + agentId): if agentId is unset the upload is
+  // skipped, so keep the recording on disk rather than silently dropping it.
+  if (getObservabilityUrl() && agentId && recordingPath) {
     try { unlinkSync(recordingPath); } catch (e) {
       console.warn(`Failed to clean up recording ${recordingPath}:`, e);
     }

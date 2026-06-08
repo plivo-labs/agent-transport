@@ -120,18 +120,12 @@ export class AudioStreamServer {
     this.sampleRate = opts.sampleRate ?? 8000;
     this.host = opts.host ?? '0.0.0.0';
     this.port = opts.port ?? parseInt(process.env.PORT ?? '8080');
-    // Accept agentId from explicit opt or AGENT_ID env var; raise on
-    // missing rather than substituting a slug — surfaces the gap loudly
-    // at server-start time instead of corrupting telemetry downstream.
-    const resolvedAgentId = opts.agentId ?? process.env.AGENT_ID ?? '';
-    if (!resolvedAgentId) {
-      throw new Error(
-        'AudioStreamServer requires `agentId` — pass a stable identifier ' +
-          '(typically a UUID4) via `agentId` in the constructor options or ' +
-          'the AGENT_ID env var. This is the value that keys the obs agents view.',
-      );
-    }
-    this.agentId = resolvedAgentId;
+    // agent_id (opt or AGENT_ID env) is OPTIONAL — the server runs fine
+    // without it. It's only required to upload observability (obs keys on it;
+    // the sessions table is NOT NULL), so when it's unset while
+    // AGENT_OBSERVABILITY_URL is configured we warn at boot and skip the upload
+    // (see uploadReport) rather than hard-break servers that don't use obs.
+    this.agentId = opts.agentId ?? process.env.AGENT_ID ?? '';
     this.agentName = opts.agentName ?? 'audio-stream-agent';
     this.authFn = opts.auth;
   }
@@ -259,8 +253,14 @@ export class AudioStreamServer {
     console.log(`HTTP server on http://${this.host}:${this.port}`);
 
     const obsUrl = getObservabilityUrl();
-    if (obsUrl) {
+    if (obsUrl && this.agentId) {
       console.log(`Observability enabled, target ${obsUrl}`);
+    } else if (obsUrl) {
+      console.warn(
+        `Observability is configured (AGENT_OBSERVABILITY_URL=${obsUrl}) but agentId is ` +
+          `unset — session reports will NOT be uploaded. Pass agentId to the server ` +
+          `constructor or set the AGENT_ID env var to enable observability.`,
+      );
     }
 
     // Start event loop. Track the promise so we can await its exit during
