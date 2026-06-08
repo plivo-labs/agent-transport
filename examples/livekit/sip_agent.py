@@ -48,6 +48,10 @@ server = AgentServer(
     sip_username=os.environ["SIP_USERNAME"],
     sip_password=os.environ["SIP_PASSWORD"],
     sip_server=os.environ.get("SIP_DOMAIN", "phone.plivo.com"),
+    # Shared with audio_stream_agent.{py,ts} so both transports of this
+    # demo land on one agent record in obs. Override with AGENT_ID env.
+    agent_id=os.environ.get("AGENT_ID", "f90d7c10-bf35-4f26-bf3e-29d20ec857cb"),
+    agent_name=os.environ.get("AGENT_NAME", "demo-phone-assistant"),
 )
 
 

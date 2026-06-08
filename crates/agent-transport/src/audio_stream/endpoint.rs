@@ -144,12 +144,14 @@ impl AudioStreamEndpoint {
             // on `_ffi_handle.disposed` — the equivalent pre-call guard for our
             // sid-keyed handle model. Audio is discarded; the per-frame async_id
             // contract is preserved so the Python audio source's wait_for(...)
-            // resolves without surfacing CallNotActive.
+            // resolves without surfacing CallNotActive. The frame is discarded
+            // (not sent), so the completion carries `cancelled: true` per the
+            // `AudioCaptureComplete` contract — Pipecat counts it as dropped.
             if sess.terminated.load(Ordering::Acquire) {
                 let _ = self.event_tx.try_send(EndpointEvent::AudioCaptureComplete {
                     session_id: session_id.to_string(),
                     async_id,
-                    cancelled: false,
+                    cancelled: true,
                 });
                 return Ok(async_id);
             }
@@ -308,7 +310,10 @@ impl AudioStreamEndpoint {
 
     pub fn checkpoint(&self, session_id: &str, name: Option<&str>) -> Result<String> {
         let s = self.sessions.lock_or_recover();
-        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
+        let sess = match s.get(session_id) {
+            Some(s) => s,
+            None => return Ok(String::new()),
+        };
         let cp_name = name.map(String::from).unwrap_or_else(|| {
             format!("cp-{}", sess.checkpoint_counter.fetch_add(1, Ordering::Relaxed))
         });
@@ -323,18 +328,21 @@ impl AudioStreamEndpoint {
     /// so Plivo's playedStream confirms when ALL audio has actually been played.
     pub fn flush(&self, session_id: &str) -> Result<()> {
         let s = self.sessions.lock_or_recover();
-        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
-        let cp_name = format!("cp-{}", sess.checkpoint_counter.fetch_add(1, Ordering::Relaxed));
-        *sess.pending_flush.lock_or_recover() = Some(cp_name.clone());
-        debug!("Flush: checkpoint '{}' queued for session {} (send loop will send after drain)", cp_name, session_id);
+        if let Some(sess) = s.get(session_id) {
+            let cp_name = format!("cp-{}", sess.checkpoint_counter.fetch_add(1, Ordering::Relaxed));
+            *sess.pending_flush.lock_or_recover() = Some(cp_name.clone());
+            debug!("Flush: checkpoint '{}' queued for session {} (send loop will send after drain)", cp_name, session_id);
+        }
         Ok(())
     }
 
     pub fn wait_for_playout(&self, session_id: &str, timeout_ms: u64) -> Result<bool> {
         let notify = {
             let s = self.sessions.lock_or_recover();
-            let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
-            sess.checkpoint_notify.clone()
+            match s.get(session_id) {
+                Some(sess) => sess.checkpoint_notify.clone(),
+                None => return Ok(true),
+            }
         };
         let (lock, cvar) = &*notify;
         let guard = lock.lock_or_recover();
@@ -470,12 +478,10 @@ impl AudioStreamEndpoint {
 
     /// Register an async_id for "buffer drained to empty" notification.
     ///
-    /// - Returns `Ok(None)` if buffer is already empty — emits
-    ///   `AudioPlayoutComplete` immediately (caller awaits on the event
-    ///   channel; the await resolves on the next event-loop tick).
-    ///
     /// **Always returns `Ok(async_id)`** — the completion event always
-    /// fires (immediately if buffer already empty, deferred if not).
+    /// fires (immediately if the buffer is already empty, deferred if not).
+    /// The caller awaits on the event channel; an immediate completion
+    /// resolves on the next event-loop tick.
     /// Multiple concurrent waiters are supported — each gets its own
     /// async_id and all resolve when the buffer next reaches empty.
     pub fn wait_for_playout_async(&self, session_id: &str) -> Result<u64> {

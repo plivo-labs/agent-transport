@@ -12,6 +12,7 @@ from livekit.plugins import deepgram, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 server = AgentServer(
+    agent_id=os.environ.get("AGENT_ID"),  # optional; stable UUID4, required only for observability
     sip_username=os.environ["SIP_USERNAME"],
     sip_password=os.environ["SIP_PASSWORD"],
     sip_server=os.environ.get("SIP_DOMAIN", "phone.plivo.com"),
@@ -87,6 +88,7 @@ Equivalent of LiveKit's `AgentServer` + `cli.run_app()`. Handles SIP registratio
 
 ```python
 AgentServer(
+    agent_id="da3d4071-…",          # Stable agent id, UUID4 (or AGENT_ID env); required only for observability
     sip_server="phone.plivo.com",   # SIP provider domain (or SIP_DOMAIN env)
     sip_port=5060,                  # SIP port (or SIP_PORT env)
     sip_username="user",            # SIP credentials (or SIP_USERNAME env)
@@ -330,6 +332,7 @@ import * as livekit from '@livekit/agents-plugin-livekit';
 import { z } from 'zod';
 
 const server = new AgentServer({
+  agentId: process.env.AGENT_ID,  // optional; stable UUID4, required only for observability
   sipUsername: process.env.SIP_USERNAME!,
   sipPassword: process.env.SIP_PASSWORD!,
 });

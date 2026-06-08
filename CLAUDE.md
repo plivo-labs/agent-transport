@@ -34,6 +34,17 @@ crates/
 └── beep-detector/            # Standalone beep detection
 ```
 
+### Observability adapters
+
+The Python LiveKit adapters carry a thin observability layer:
+
+- `agent_transport/sip/livekit/observability.py` (and the `audio_stream/livekit` mirror) — builds a `voice.SessionReport` from the JobContext, attaches transport tags via the SDK `Tagger`, and delegates the upload to LiveKit's telemetry helpers. Uploads land at `agent-observability` (recordings + OTLP). Auth: Bearer JWT signed with `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET`.
+- `agent_transport/sip/livekit/judging.py` — runs LiveKit's `JudgeGroup` post-session and uploads outcomes via the SDK telemetry channel. Hook fires once per call from both SIP and audio_stream cleanup paths. Before judges run it tags the session with `evaluations:enabled` so the obs dashboard surfaces its Evaluation button immediately, even if judging fails or is still pending. Callers can also flag a session with `metadata={"evaluations": True}` (handled in `_ensure_transport_tags`) for custom eval pipelines that bypass `JudgeGroup`.
+
+Session IDs in `room.name` / `room.sid` use the bare transport ID (`ws-<hex>` for audio_stream, SIP Call-ID for SIP) — no `transport-` prefix — so they match the Node adapter's room IDs and the obs dashboard groups them consistently.
+
+Node side is intentionally lighter: `crates/agent-transport-node/adapters/livekit/observability.ts` covers the SessionReport / OTLP construction (since the Node SDK has no `Tagger`), but there's no `JudgeGroup` integration — the Node SDK doesn't expose one. Do not port the Python `judging.py` to Node without first adding upstream support. Two contracts to preserve when editing the Node file: (a) the recording multipart must upload **before** OTLP records — the obs server's `mergeSessionRawReport` UPDATEs an existing row and silently no-ops if it doesn't exist yet; (b) events embedded in the session-report record are normalized to snake_case keys + float-second timestamps to match the Python SDK's Pydantic projection that the obs UI is keyed off.
+
 ## Build
 
 System dependencies: `cmake` (for audiopus_sys/aws-lc-sys).

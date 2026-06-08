@@ -54,6 +54,7 @@ _ensure_http_context()
 from .server import AgentServer, JobContext, JobProcess, run_app
 from .audio_stream_server import AudioStreamServer, JobContext as AudioStreamJobContext
 from ._room_facade import TransportRoom
+from .judging import EvaluationConfig
 
 # Backward compat aliases
 CallContext = JobContext
@@ -63,5 +64,5 @@ __all__ = [
     "TransportAudioInput", "TransportAudioOutput",
     "AgentServer", "JobContext", "JobProcess", "CallContext", "run_app",
     "AudioStreamServer", "AudioStreamJobContext", "AudioStreamCallContext",
-    "TransportRoom",
+    "TransportRoom", "EvaluationConfig",
 ]

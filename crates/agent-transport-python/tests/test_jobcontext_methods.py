@@ -14,6 +14,8 @@ event loop).
 """
 
 import asyncio
+from types import SimpleNamespace
+
 import pytest
 
 from agent_transport.sip.livekit._room_facade import TransportRoom, _StubJobContext
@@ -127,3 +129,71 @@ async def test_add_participant_entrypoint_accepts_coroutine_fn():
     ctx.add_participant_entrypoint(entrypoint)
     # Entrypoint is scheduled as a Task; yield so it runs.
     await asyncio.wait_for(done.wait(), timeout=1.0)
+
+
+def test_tagger_uses_livekit_sdk_tagger():
+    ctx, _, _ = _make_ctx()
+    ctx.tagger.add("transport:sip")
+    assert "transport:sip" in ctx.tagger.tags
+
+
+def test_make_session_report_returns_livekit_report():
+    ctx, room, _ = _make_ctx()
+
+    class FakeHistory:
+        def copy(self):
+            return self
+
+    fake_session = SimpleNamespace(
+        _recorder_io=None,
+        _recording_options={"audio": True, "traces": True, "logs": True, "transcript": True},
+        options=SimpleNamespace(),
+        _started_at=123.0,
+        _recorded_events=[],
+        history=FakeHistory(),
+        usage=SimpleNamespace(model_usage=[]),
+    )
+    ctx._primary_agent_session = fake_session
+
+    report = ctx.make_session_report()
+
+    assert report.room_id == room.sid
+    assert report.job_id == "job-call-1"
+    assert report.chat_history is fake_session.history
+
+
+def test_make_session_report_uses_transport_recording_override(tmp_path):
+    ctx, _, _ = _make_ctx()
+
+    class FakeHistory:
+        def copy(self):
+            return self
+
+    fake_session = SimpleNamespace(
+        _recorder_io=None,
+        _recording_options={"audio": False, "traces": True, "logs": True, "transcript": True},
+        options=SimpleNamespace(),
+        _started_at=123.0,
+        _recorded_events=[],
+        history=FakeHistory(),
+        usage=SimpleNamespace(model_usage=[]),
+    )
+    rec_path = tmp_path / "recording.ogg"
+    rec_path.write_bytes(b"audio")
+
+    report = ctx.make_session_report(
+        fake_session,
+        recording_path=rec_path,
+        recording_started_at=456.0,
+        recording_options={"audio": True, "traces": False, "logs": True, "transcript": True},
+    )
+
+    assert report.audio_recording_path == rec_path
+    assert report.audio_recording_started_at == 456.0
+    assert report.recording_options == {
+        "audio": True,
+        "traces": False,
+        "logs": True,
+        "transcript": True,
+    }
+    assert report.duration == pytest.approx(report.timestamp - 456.0)

@@ -69,14 +69,8 @@ def _on_event_from_rust(event_dict: Mapping[str, Any]) -> None:
 
     See module docstring for the contract.
     """
-    try:
-        events = _build_ffi_events(event_dict)
-    except Exception:
-        logger.exception("event sink: failed to build FfiEvent from %r", event_dict)
-        return
     # Throttled debug logging — every 50th event of each type and every
-    # lifecycle/error event. Useful to confirm the dispatcher thread is
-    # firing and what it's translating.
+    # lifecycle/error event. Useful to confirm the dispatcher thread is firing.
     ev_type = event_dict.get("type", "?")
     _SINK_COUNTERS[ev_type] = _SINK_COUNTERS.get(ev_type, 0) + 1
     count = _SINK_COUNTERS[ev_type]
@@ -85,34 +79,49 @@ def _on_event_from_rust(event_dict: Mapping[str, Any]) -> None:
         or ev_type not in ("audio_capture_complete", "audio_playout_complete")
         or count % 50 == 0
     )
-    if log_this:
-        logger.debug(
-            "event_sink: type=%s count=%d → %d FfiEvent(s)",
-            ev_type, count, len(events),
-        )
     # Routing key for the FfiQueue: per-frame async-id completion events carry
     # ``session_id``, so keying lets put() dispatch only to that session's
     # subscriber instead of scanning every concurrent call's subscriber.
     # Lifecycle events that only carry a ``session`` object have no top-level
     # session_id → key is None → broadcast (correct, and they're low-frequency).
-    _sid = event_dict.get("session_id")
     # Match the exact form the subscribers key on: source_handle is built as
     # ``str(session_id)`` (and audio_source subscribes with key=self._id, a str),
     # so wrap here too. Absent session_id → None → broadcast.
+    _sid = event_dict.get("session_id")
     key = str(_sid) if _sid is not None else None
-    for ev in events:
+
+    # Both brokers are fan-outs with no buffering — a put() with no subscribers
+    # delivers to nobody. So when a broker family has zero subscribers we skip
+    # its (non-trivial) per-frame work entirely: a pure-LiveKit deployment never
+    # builds the dict copy, and a pure-pipecat one never builds the FfiEvent.
+    # This is behaviour-preserving: gating on subscriber_count()==0 is identical
+    # to calling put() that reaches no one, just without the wasted translation.
+    if GLOBAL.subscriber_count():
         try:
-            GLOBAL.put(ev, key=key)
+            events = _build_ffi_events(event_dict)
         except Exception:
-            logger.exception("event sink: GLOBAL.put failed")
-    # Parallel fan-out to the dict-shaped broker for pipecat-style
-    # consumers. Same event payload, no translation — pipecat reads
-    # ``event["session"].session_id`` and similar attribute-on-PyO3
-    # accesses that LiveKit-shape FfiEvent would have flattened.
-    try:
-        GLOBAL_DICT.put(dict(event_dict), key=key)
-    except Exception:
-        logger.exception("event sink: GLOBAL_DICT.put failed")
+            logger.exception("event sink: failed to build FfiEvent from %r", event_dict)
+            events = []
+        if log_this:
+            logger.debug(
+                "event_sink: type=%s count=%d → %d FfiEvent(s)", ev_type, count, len(events),
+            )
+        for ev in events:
+            try:
+                GLOBAL.put(ev, key=key)
+            except Exception:
+                logger.exception("event sink: GLOBAL.put failed")
+    elif log_this:
+        logger.debug("event_sink: type=%s count=%d (no LiveKit subscribers)", ev_type, count)
+
+    # Dict-shaped broker for pipecat-style consumers. Same event payload, no
+    # translation — pipecat reads ``event["session"].session_id`` and similar
+    # attribute-on-PyO3 accesses that the LiveKit-shape FfiEvent would flatten.
+    if GLOBAL_DICT.subscriber_count():
+        try:
+            GLOBAL_DICT.put(dict(event_dict), key=key)
+        except Exception:
+            logger.exception("event sink: GLOBAL_DICT.put failed")
 
 
 def _build_ffi_events(d: Mapping[str, Any]):

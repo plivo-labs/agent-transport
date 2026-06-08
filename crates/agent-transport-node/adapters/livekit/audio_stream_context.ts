@@ -9,7 +9,7 @@
  *   });
  */
 
-import { mkdirSync, writeSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import type { AudioStreamEndpoint } from 'agent-transport';
 import { SipAudioInput } from './sip_audio_input.js';
 import { SipAudioOutput } from './sip_audio_output.js';
@@ -24,6 +24,9 @@ export interface AudioStreamJobContextOptions {
   extraHeaders: Record<string, string>;
   endpoint: AudioStreamEndpoint;
   userdata: Record<string, unknown>;
+  /** Stable developer-supplied identifier — plumbed through from the
+   * AudioStreamServer constructor. */
+  agentId?: string;
   agentName?: string;
   callEnded: Promise<void>;
   resolveCallEnded: () => void;
@@ -48,6 +51,10 @@ export class AudioStreamJobContext {
   readonly worker_id = 'local';
   readonly sessionDirectory: string;
   readonly inferenceExecutor: unknown;
+  metadata: Record<string, unknown> = {};
+
+  /** Account ID for multi-tenancy — set by the consumer per session. */
+  accountId: string | undefined;
 
   /** @internal Primary AgentSession used by LiveKit job-context helpers. */
   _primaryAgentSession: any = undefined;
@@ -59,6 +66,7 @@ export class AudioStreamJobContext {
   private _shutdownCallbacksFired = false;
 
   constructor(opts: AudioStreamJobContextOptions) {
+    const agentName = opts.agentName ?? 'audio-stream-agent';
     this.sessionId = opts.sessionId;
     this.plivoCallUuid = opts.plivoCallUuid;
     this.streamId = opts.streamId;
@@ -74,12 +82,12 @@ export class AudioStreamJobContext {
     try { mkdirSync(this.sessionDirectory, { recursive: true }); } catch {}
 
     this.room = new TransportRoom(opts.endpoint as any, opts.sessionId, {
-      agentName: opts.agentName ?? 'audio-stream-agent',
+      agentName,
       callerIdentity: opts.plivoCallUuid,
     });
     this.job = {
       id: `job-${opts.sessionId}`,
-      agentName: opts.agentName ?? 'audio-stream-agent',
+      agentName,
       enableRecording: opts.enableRecording ?? false,
       room: this.room,
     };
@@ -94,6 +102,12 @@ export class AudioStreamJobContext {
    * After setting, call session.start({ agent, room: ctx.room }).
    */
   set session(session: any) {
+    if (session == null) {
+      throw new TypeError(
+        "JobContext.session cannot be set to null/undefined. Assign a "
+        + "valid voice.AgentSession instance (or use ctx.session to read)."
+      );
+    }
     this._session = session;
     this._primaryAgentSession = session;
 
@@ -113,7 +127,6 @@ export class AudioStreamJobContext {
         const tts = (session as any).tts;
         if (tts?.setMaxListeners) {
           tts.setMaxListeners(100);
-          writeSync(2, `[AudioStreamContext] TTS maxListeners set to 100\n`);
         }
       } catch {}
     };
@@ -124,6 +137,20 @@ export class AudioStreamJobContext {
       this._resolveCallEnded();
       try { (this.endpoint as any).hangup(this.sessionId); } catch {}
     });
+  }
+
+  setMetadata(metadata: Record<string, unknown>): void {
+    for (const [key, value] of Object.entries(metadata)) {
+      if (value !== undefined && value !== null) {
+        this.metadata[key] = value;
+      }
+    }
+
+    const accountId = this.metadata.account_id ?? this.metadata.accountId;
+    if (accountId !== undefined && accountId !== null) {
+      this.accountId = String(accountId);
+      this.metadata.account_id = this.accountId;
+    }
   }
 
   addShutdownCallback(callback: (reason?: string) => void | Promise<void>): void {

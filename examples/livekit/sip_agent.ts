@@ -27,6 +27,10 @@ const server = new AgentServer({
   sipUsername: process.env.SIP_USERNAME!,
   sipPassword: process.env.SIP_PASSWORD!,
   sipServer: process.env.SIP_DOMAIN ?? 'phone.plivo.com',
+  // Shared with audio_stream_agent.{py,ts} so both transports of this
+  // demo land on one agent record in obs. Override with AGENT_ID env.
+  agentId: process.env.AGENT_ID ?? 'f90d7c10-bf35-4f26-bf3e-29d20ec857cb',
+  agentName: process.env.AGENT_NAME ?? 'demo-phone-assistant',
 });
 
 server.setupFnc = async (proc: JobProcess) => {
@@ -35,6 +39,8 @@ server.setupFnc = async (proc: JobProcess) => {
 };
 
 server.sipSession(async (ctx: JobContext) => {
+  ctx.setMetadata({ account_id: process.env.AGENT_ACCOUNT_ID ?? 'demo-account' });
+
   // Create a fresh Agent per call — agent._agentActivity persists across calls
   // and prevents reuse of the same Agent instance for multiple sessions.
   const agent = new voice.Agent({

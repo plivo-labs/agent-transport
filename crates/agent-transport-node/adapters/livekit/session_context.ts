@@ -26,6 +26,10 @@ export interface JobContextOptions {
   direction: 'inbound' | 'outbound';
   endpoint: SipEndpoint;
   userdata: Record<string, unknown>;
+  /** Stable developer-supplied identifier — plumbed through from the
+   * AgentServer constructor. Kept on the options shape so the per-
+   * session context can attach it to outgoing telemetry. */
+  agentId?: string;
   agentName?: string;
   callEnded: Promise<void>;
   resolveCallEnded: () => void;
@@ -48,6 +52,10 @@ export class JobContext {
   readonly worker_id = 'local';
   readonly sessionDirectory: string;
   readonly inferenceExecutor: unknown;
+  metadata: Record<string, unknown> = {};
+
+  /** Account ID for multi-tenancy — set by the consumer per session. */
+  accountId: string | undefined;
 
   /** @internal Primary AgentSession used by LiveKit job-context helpers. */
   _primaryAgentSession: any = undefined;
@@ -59,6 +67,7 @@ export class JobContext {
   private _shutdownCallbacksFired = false;
 
   constructor(opts: JobContextOptions) {
+    const agentName = opts.agentName ?? 'sip-agent';
     this.sessionId = opts.sessionId;
     this.remoteUri = opts.remoteUri;
     this.direction = opts.direction;
@@ -73,12 +82,12 @@ export class JobContext {
 
     // Create Room facade
     this.room = new TransportRoom(opts.endpoint as any, opts.sessionId, {
-      agentName: opts.agentName ?? 'sip-agent',
+      agentName,
       callerIdentity: opts.remoteUri,
     });
     this.job = {
       id: `job-${opts.sessionId}`,
-      agentName: opts.agentName ?? 'sip-agent',
+      agentName,
       enableRecording: opts.enableRecording ?? false,
       room: this.room,
     };
@@ -141,6 +150,20 @@ export class JobContext {
       this._resolveCallEnded();
       try { this.endpoint.hangup(this.sessionId); } catch {}
     });
+  }
+
+  setMetadata(metadata: Record<string, unknown>): void {
+    for (const [key, value] of Object.entries(metadata)) {
+      if (value !== undefined && value !== null) {
+        this.metadata[key] = value;
+      }
+    }
+
+    const accountId = this.metadata.account_id ?? this.metadata.accountId;
+    if (accountId !== undefined && accountId !== null) {
+      this.accountId = String(accountId);
+      this.metadata.account_id = this.accountId;
+    }
   }
 
   addShutdownCallback(callback: (reason?: string) => void | Promise<void>): void {

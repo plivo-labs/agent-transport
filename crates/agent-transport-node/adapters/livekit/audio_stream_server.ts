@@ -30,7 +30,8 @@ import { AudioStreamEndpoint } from 'agent-transport';
 import { initializeLogger, InferenceRunner, runWithJobContext } from '@livekit/agents';
 import { AudioStreamJobContext } from './audio_stream_context.js';
 import { JobProcess } from './agent_server.js';
-import { closeSessionServices } from './_session_cleanup.js';
+import { logObservabilityStatus } from './observability.js';
+import { finalizeSession } from './_session_finalize.js';
 import { runServerCleanup, forceShutdownAgentSession, installUnhandledRejectionHandler, registerSignalCleanup } from './_session_teardown.js';
 import { brokerFor, isAudioEvent } from './_audio_events.js';
 
@@ -41,6 +42,10 @@ export interface AudioStreamServerOptions {
   sampleRate?: number;
   host?: string;
   port?: number;
+  /** Stable developer-supplied identifier (typically UUID4). Mandatory:
+   * obs's agents view keys on it, and agent_transport_sessions.agent_id
+   * is NOT NULL after migration 013. Throws at construction if missing. */
+  agentId?: string;
   agentName?: string;
   auth?: (req: IncomingMessage) => boolean | Promise<boolean>;
 }
@@ -88,6 +93,7 @@ export class AudioStreamServer {
   private sampleRate: number;
   private host: string;
   private port: number;
+  private agentId: string;
   private agentName: string;
   private authFn?: (req: IncomingMessage) => boolean | Promise<boolean>;
   private entrypointFn?: EntrypointFn;
@@ -114,6 +120,12 @@ export class AudioStreamServer {
     this.sampleRate = opts.sampleRate ?? 8000;
     this.host = opts.host ?? '0.0.0.0';
     this.port = opts.port ?? parseInt(process.env.PORT ?? '8080');
+    // agent_id (opt or AGENT_ID env) is OPTIONAL — the server runs fine
+    // without it. It's only required to upload observability (obs keys on it;
+    // the sessions table is NOT NULL), so when it's unset while
+    // AGENT_OBSERVABILITY_URL is configured we warn at boot and skip the upload
+    // (see uploadReport) rather than hard-break servers that don't use obs.
+    this.agentId = opts.agentId ?? process.env.AGENT_ID ?? '';
     this.agentName = opts.agentName ?? 'audio-stream-agent';
     this.authFn = opts.auth;
   }
@@ -239,6 +251,8 @@ export class AudioStreamServer {
     // Start HTTP server
     this.startHttpServer();
     console.log(`HTTP server on http://${this.host}:${this.port}`);
+
+    logObservabilityStatus(this.agentId);
 
     // Start event loop. Track the promise so we can await its exit during
     // shutdown — without this the infinite while loop pins libuv forever.
@@ -386,6 +400,7 @@ export class AudioStreamServer {
       extraHeaders,
       endpoint: this.ep!,
       userdata: this.userdata,
+      agentId: this.agentId,
       agentName: this.agentName,
       callEnded,
       resolveCallEnded: resolveEnded,
@@ -398,8 +413,10 @@ export class AudioStreamServer {
       this.sessionCount++;
       const sessionStart = performance.now();
 
+      const sessionDir = ctx.sessionDirectory;
+      let recPath: string | undefined;
+      let recordingStartedAt: number | undefined;
       try {
-        const sessionDir = ctx.sessionDirectory;
         if (runWithJobContext) {
           await runWithJobContext(ctx as any, () => this.entrypointFn!(ctx));
         } else {
@@ -410,8 +427,10 @@ export class AudioStreamServer {
         try {
           const { mkdirSync } = await import('node:fs');
           mkdirSync(sessionDir, { recursive: true });
-          this.ep!.startRecording(sessionId, `${sessionDir}/recording_${sessionId}.ogg`, true);
-          console.log(`Recording started: ${sessionDir}/recording_${sessionId}.ogg`);
+          recPath = `${sessionDir}/recording_${sessionId}.ogg`;
+          recordingStartedAt = Date.now();
+          this.ep!.startRecording(sessionId, recPath, true);
+          console.log(`Recording started: ${recPath}`);
         } catch {}
 
         // Hook user state changes for debug logging
@@ -430,19 +449,20 @@ export class AudioStreamServer {
         const durationSec = (performance.now() - sessionStart) / 1000;
         this.sessionDurations.push(durationSec);
 
-        if (ctx.session) {
-          try { await (ctx.session as any).close(); } catch {}
-          // AgentSession.close() does NOT cascade-close the user-supplied
-          // STT/TTS/LLM, so their vendor WebSockets would leak per session
-          // on our long-lived in-process server. Close them explicitly
-          // after the session has closed, before hangup. Never throws.
-          await closeSessionServices(ctx.session, {
-            logger: (msg, err) => console.warn(`[session ${sessionId}] ${msg}`, err ?? ''),
-          });
-        }
+        await finalizeSession({
+          session: ctx.session,
+          endpoint: this.ep!,
+          sessionId,
+          transport: 'audio_stream',
+          agentId: this.agentId,
+          agentName: this.agentName,
+          accountId: ctx.accountId,
+          metadata: ctx.metadata,
+          direction: ctx.direction,
+          recordingPath: recPath,
+          recordingStartedAt,
+        });
 
-        // Stop Rust recording if active
-        try { this.ep!.stopRecording(sessionId); } catch {}
         try { this.ep!.hangup(sessionId); } catch {}
 
         ctx.room._onSessionEnded();

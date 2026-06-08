@@ -57,6 +57,10 @@ server = AudioStreamServer(
     listen_addr=os.environ.get("AUDIO_STREAM_ADDR", "0.0.0.0:8765"),
     plivo_auth_id=os.environ.get("PLIVO_AUTH_ID", ""),
     plivo_auth_token=os.environ.get("PLIVO_AUTH_TOKEN", ""),
+    # Shared with sip_agent.{py,ts} so both transports of this demo
+    # land on one agent record in obs. Override with AGENT_ID env.
+    agent_id=os.environ.get("AGENT_ID", "f90d7c10-bf35-4f26-bf3e-29d20ec857cb"),
+    agent_name=os.environ.get("AGENT_NAME", "demo-phone-assistant"),
 )
 
 

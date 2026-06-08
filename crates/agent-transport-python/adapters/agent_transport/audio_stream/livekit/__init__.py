@@ -30,6 +30,7 @@ from agent_transport.sip.livekit._audio_io import (
 )
 from agent_transport.sip.livekit.server import JobProcess
 from agent_transport.sip.livekit._room_facade import TransportRoom
+from agent_transport.sip.livekit.judging import EvaluationConfig
 
 __all__ = [
     "AudioStreamServer",
@@ -38,4 +39,5 @@ __all__ = [
     "TransportAudioInput",
     "TransportAudioOutput",
     "TransportRoom",
+    "EvaluationConfig",
 ]

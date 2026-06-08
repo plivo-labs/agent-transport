@@ -32,6 +32,10 @@ const server = new AudioStreamServer({
   listenAddr: process.env.AUDIO_STREAM_ADDR ?? '0.0.0.0:8765',
   plivoAuthId: process.env.PLIVO_AUTH_ID ?? '',
   plivoAuthToken: process.env.PLIVO_AUTH_TOKEN ?? '',
+  // Shared with sip_multi_agent.{py,ts} so both transports of this
+  // demo land on one agent record in obs. Override with AGENT_ID env.
+  agentId: process.env.AGENT_ID ?? '85b7c410-a9e3-4ec8-bf94-d8e7cd5c6fe8',
+  agentName: process.env.AGENT_NAME ?? 'demo-receptionist-handoff',
 });
 
 server.setupFnc = async (proc: JobProcess) => {
@@ -225,6 +229,8 @@ class SupportAgent extends voice.Agent<CallData> {
 // ─── Server ──────────────────────────────────────────────────────
 
 server.audioStreamSession(async (ctx: AudioStreamJobContext) => {
+  ctx.setMetadata({ account_id: process.env.AGENT_ACCOUNT_ID ?? 'demo-account' });
+
   const session = new voice.AgentSession<CallData>({
     vad: ctx.proc.userData.vad as silero.VAD,
     stt: new deepgram.STT({ model: 'nova-3' }),

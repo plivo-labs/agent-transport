@@ -1,1 +1,4 @@
 /livekit/
+
+# locally-built tarballs (created by 'npm pack' for manual installs in agent-transport-test/)
+*.tgz

@@ -12,6 +12,7 @@ from livekit.plugins import deepgram, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 server = AudioStreamServer(
+    agent_id=os.environ.get("AGENT_ID"),  # optional; stable UUID4, required only for observability
     listen_addr=os.environ.get("AUDIO_STREAM_ADDR", "0.0.0.0:8765"),
     plivo_auth_id=os.environ.get("PLIVO_AUTH_ID", ""),
     plivo_auth_token=os.environ.get("PLIVO_AUTH_TOKEN", ""),
@@ -84,6 +85,7 @@ Equivalent of LiveKit's `AgentServer`. Handles WebSocket connections from Plivo,
 
 ```python
 AudioStreamServer(
+    agent_id="da3d4071-…",          # Stable agent id, UUID4 (or AGENT_ID env); required only for observability
     listen_addr="0.0.0.0:8765",     # WebSocket server address
     plivo_auth_id="",               # Plivo auth (or PLIVO_AUTH_ID env)
     plivo_auth_token="",            # Plivo token (or PLIVO_AUTH_TOKEN env)

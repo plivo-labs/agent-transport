@@ -150,6 +150,8 @@ npm install agent-transport @livekit/agents @livekit/rtc-node
 | [`livekit/audio_stream_agent.ts`](examples/livekit/audio_stream_agent.ts) | TypeScript agent over Plivo audio streaming |
 | [`livekit/audio_stream_multi_agent.py`](examples/livekit/audio_stream_multi_agent.py) | Audio streaming multi-agent with handoff and tool calling |
 | [`livekit/audio_stream_multi_agent.ts`](examples/livekit/audio_stream_multi_agent.ts) | TypeScript audio streaming multi-agent |
+| [`livekit/sip_agent_with_judges.py`](examples/livekit/sip_agent_with_judges.py) | SIP agent with post-session `JudgeGroup` evaluations uploaded via the SDK telemetry channel |
+| [`livekit/audio_stream_agent_with_judges.py`](examples/livekit/audio_stream_agent_with_judges.py) | Audio-streaming variant of the post-session judging example |
 | [`pipecat/sip_agent.py`](examples/pipecat/sip_agent.py) | Pipecat pipeline over SIP/RTP with VAD |
 | [`pipecat/sip_multi_agent.py`](examples/pipecat/sip_multi_agent.py) | Pipecat multi-agent with greeter → sales/support handoff |
 | [`pipecat/audio_stream_agent.py`](examples/pipecat/audio_stream_agent.py) | Pipecat over Plivo audio streaming with Rust recorder + mixer |
@@ -157,6 +159,24 @@ npm install agent-transport @livekit/agents @livekit/rtc-node
 | [`cli/phone.py`](examples/cli/phone.py) | Interactive CLI softphone with mic/speaker, DTMF, mute, hold/unhold |
 
 See also: [Feature Flags & CLI Phone docs](docs/features.md)
+
+## Observability
+
+Both Python and Node LiveKit adapters can upload session recordings + OTLP logs (events, options, usage, chat history) to an [`agent-observability`](https://github.com/plivo-labs/agent-observability) server. Set:
+
+```bash
+AGENT_OBSERVABILITY_URL=https://obs.example.com
+LIVEKIT_API_KEY=<key>
+LIVEKIT_API_SECRET=<secret>   # signs the Bearer JWT used for upload auth
+AGENT_ACCOUNT_ID=<account>    # optional, surfaces in the dashboard for tenant correlation
+```
+
+Python additionally supports:
+
+- **Post-session judging** — register a `JudgeGroup` on the session (see [`examples/livekit/sip_agent_with_judges.py`](examples/livekit/sip_agent_with_judges.py)); verdicts and outcome upload via the SDK telemetry channel.
+- **Eval-button gating** — pass `metadata={"evaluations": True}` to flag a session as evaluation-capable in the dashboard, even when judging runs outside `JudgeGroup`.
+
+Node ships SessionReport + OTLP only; the Node SDK has no `Tagger`/`JudgeGroup` equivalent.
 
 ## Releasing
 
