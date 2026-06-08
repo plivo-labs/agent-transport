@@ -9,7 +9,7 @@
  *   });
  */
 
-import { mkdirSync, writeSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import type { AudioStreamEndpoint } from 'agent-transport';
 import { SipAudioInput } from './sip_audio_input.js';
 import { SipAudioOutput } from './sip_audio_output.js';
@@ -102,6 +102,12 @@ export class AudioStreamJobContext {
    * After setting, call session.start({ agent, room: ctx.room }).
    */
   set session(session: any) {
+    if (session == null) {
+      throw new TypeError(
+        "JobContext.session cannot be set to null/undefined. Assign a "
+        + "valid voice.AgentSession instance (or use ctx.session to read)."
+      );
+    }
     this._session = session;
     this._primaryAgentSession = session;
 
@@ -121,7 +127,6 @@ export class AudioStreamJobContext {
         const tts = (session as any).tts;
         if (tts?.setMaxListeners) {
           tts.setMaxListeners(100);
-          writeSync(2, `[AudioStreamContext] TTS maxListeners set to 100\n`);
         }
       } catch {}
     };

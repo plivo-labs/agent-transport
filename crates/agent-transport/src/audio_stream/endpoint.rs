@@ -476,12 +476,10 @@ impl AudioStreamEndpoint {
 
     /// Register an async_id for "buffer drained to empty" notification.
     ///
-    /// - Returns `Ok(None)` if buffer is already empty — emits
-    ///   `AudioPlayoutComplete` immediately (caller awaits on the event
-    ///   channel; the await resolves on the next event-loop tick).
-    ///
     /// **Always returns `Ok(async_id)`** — the completion event always
-    /// fires (immediately if buffer already empty, deferred if not).
+    /// fires (immediately if the buffer is already empty, deferred if not).
+    /// The caller awaits on the event channel; an immediate completion
+    /// resolves on the next event-loop tick.
     /// Multiple concurrent waiters are supported — each gets its own
     /// async_id and all resolve when the buffer next reaches empty.
     pub fn wait_for_playout_async(&self, session_id: &str) -> Result<u64> {

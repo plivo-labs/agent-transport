@@ -48,15 +48,14 @@ export async function finalizeSession(opts: FinalizeSessionOptions): Promise<voi
 
   // Wait for natural session close (preserves in-flight LLM/TTS responses in
   // history). The participant_disconnected event triggers _close_soon(), which
-  // does a graceful close; fall back to an explicit close on error.
-  try {
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, 5000);
-      session.on('close', () => { clearTimeout(timer); resolve(); });
-    });
-  } catch {
-    try { await (session as any).close(); } catch {}
-  }
+  // does a graceful close. If 'close' never fires within the window, force an
+  // explicit close so we don't proceed (and stop recording) mid-drain.
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      Promise.resolve((session as any).close?.()).catch(() => {}).finally(() => resolve());
+    }, 5000);
+    session.on('close', () => { clearTimeout(timer); resolve(); });
+  });
 
   // Stop recording and wait for the file to be finalized. Runs AFTER the close
   // wait so the final drained turn is captured.
