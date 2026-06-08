@@ -42,6 +42,72 @@ fn py_err(e: impl std::fmt::Display) -> PyErr {
 ///
 /// On ``stop`` set, the loop exits after the next ``recv_timeout``
 /// returns. ``recv_timeout`` of 100ms bounds shutdown latency.
+
+/// The constrained event-sink dispatcher shared by both endpoint pyclasses.
+///
+/// Owns the spawn-once dispatcher thread plus the cross-thread state it needs:
+/// the `EventSink` (cloned into the thread), a `stop` flag, and the thread's
+/// `JoinHandle`. `SipEndpoint` and `AudioStreamEndpoint` each hold one and
+/// forward `set_event_sink` / `shutdown` to it, so this concurrency protocol
+/// lives in exactly one place.
+struct Dispatcher {
+    /// `Arc` so the spawned thread holds a clone independent of the pyclass.
+    sink: Arc<EventSink>,
+    stop: Arc<AtomicBool>,
+    /// Set once on first `install`; `None` until a sink is registered.
+    handle: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl Dispatcher {
+    fn new() -> Self {
+        Self {
+            sink: Arc::new(EventSink::new()),
+            stop: Arc::new(AtomicBool::new(false)),
+            handle: Mutex::new(None),
+        }
+    }
+
+    fn is_set(&self, py: Python) -> bool {
+        self.sink.is_set(py)
+    }
+
+    /// Register (or clear) the sink callback and spawn the dispatcher thread
+    /// on first use. `rx_factory` yields the event receiver and is invoked
+    /// only when the thread is actually spawned (kept off the no-sink path).
+    fn install(
+        &self,
+        py: Python,
+        callback: Option<Py<PyAny>>,
+        rx_factory: impl FnOnce() -> crossbeam_channel::Receiver<EndpointEvent>,
+    ) -> PyResult<()> {
+        self.sink.set(py, callback);
+        let mut handle_slot = self
+            .handle
+            .lock()
+            .map_err(|_| py_err("dispatcher handle lock poisoned"))?;
+        if handle_slot.is_none() {
+            let rx = rx_factory();
+            let sink = self.sink.clone();
+            let stop = self.stop.clone();
+            *handle_slot = Some(thread::spawn(move || dispatcher_loop(rx, sink, stop)));
+        }
+        Ok(())
+    }
+
+    /// Signal the dispatcher thread to exit and join it (GIL released for the
+    /// join). Safe to call when no thread was ever spawned.
+    fn shutdown(&self, py: Python) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Ok(mut slot) = self.handle.lock() {
+            if let Some(handle) = slot.take() {
+                py.detach(|| {
+                    let _ = handle.join();
+                });
+            }
+        }
+    }
+}
+
 fn dispatcher_loop(
     rx: crossbeam_channel::Receiver<EndpointEvent>,
     sink: Arc<EventSink>,
@@ -335,17 +401,10 @@ fn event_to_dict<'py>(py: Python<'py>, event: &EndpointEvent) -> PyResult<Bound<
 #[pyclass]
 struct SipEndpoint {
     inner: Core<RustSipEndpoint>,
-    /// LiveKit-style constrained event sink. When a Python callable is
-    /// registered, the dispatcher thread drains ``inner.events()`` and
-    /// invokes the callable under the GIL. See ``set_event_sink`` for the
-    /// contract. ``Arc<Mutex<Option<Py<PyAny>>>>`` so the dispatcher
-    /// thread can hold a clone independently of the pyclass lifetime.
-    event_sink: Arc<EventSink>,
-    /// Signals the dispatcher thread to exit on endpoint drop/shutdown.
-    dispatcher_stop: Arc<AtomicBool>,
-    /// JoinHandle for the dispatcher thread (so we can wait on it during
-    /// shutdown). Wrapped in Mutex<Option<...>> for interior mutability.
-    dispatcher_handle: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
+    /// LiveKit-style constrained event dispatcher: when a Python callable is
+    /// registered, a thread drains ``inner.events()`` and invokes the callable
+    /// under the GIL. See ``set_event_sink`` / :struct:`Dispatcher`.
+    dispatcher: Dispatcher,
 }
 
 #[pymethods]
@@ -400,9 +459,7 @@ impl SipEndpoint {
 
         Ok(Self {
             inner,
-            event_sink: Arc::new(EventSink::new()),
-            dispatcher_stop: Arc::new(AtomicBool::new(false)),
-            dispatcher_handle: Arc::new(Mutex::new(None)),
+            dispatcher: Dispatcher::new(),
         })
     }
 
@@ -705,21 +762,8 @@ impl SipEndpoint {
     /// ``wait_for_event``/``poll_event`` as before).
     #[pyo3(signature = (callback=None))]
     fn set_event_sink(&self, py: Python, callback: Option<Py<PyAny>>) -> PyResult<()> {
-        self.event_sink.set(py, callback);
-        // Spawn dispatcher if not already running. Spawning the FIRST time
-        // a sink is set keeps the cost off the new() path for users who
-        // don't use the sink.
-        let mut handle_slot = self
-            .dispatcher_handle
-            .lock()
-            .map_err(|_| py_err("dispatcher handle lock poisoned"))?;
-        if handle_slot.is_none() {
-            let rx = self.inner.with(py, |c| c.events());
-            let sink = self.event_sink.clone();
-            let stop = self.dispatcher_stop.clone();
-            *handle_slot = Some(thread::spawn(move || dispatcher_loop(rx, sink, stop)));
-        }
-        Ok(())
+        self.dispatcher
+            .install(py, callback, || self.inner.with(py, |c| c.events()))
     }
 
     /// Poll for the next event (non-blocking). Returns a dict or None.
@@ -729,7 +773,7 @@ impl SipEndpoint {
     /// the dual-consumer race that hit prod pre-Phase-B. Kept functional
     /// when no sink is set (CLI examples still rely on it).
     fn poll_event(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
-        if self.event_sink.is_set(py) {
+        if self.dispatcher.is_set(py) {
             return Ok(None);
         }
         match self.inner.with(py, |c| c.events().try_recv()) {
@@ -756,7 +800,7 @@ impl SipEndpoint {
         // temporary is dropped at the end of this statement, before allow_threads.
         // Sleep briefly to avoid busy-looping callers that still poll after
         // registering a sink.
-        let sink_active = self.event_sink.is_set(py);
+        let sink_active = self.dispatcher.is_set(py);
         if sink_active {
             py.detach(|| thread::sleep(Duration::from_millis(timeout_ms.max(10).min(1000))));
             return Ok(None);
@@ -782,15 +826,7 @@ impl SipEndpoint {
         // Stop dispatcher first so the inner shutdown() path doesn't race
         // with the dispatcher trying to invoke a sink that may already
         // have been GC'd.
-        self.dispatcher_stop.store(true, Ordering::Relaxed);
-        if let Ok(mut slot) = self.dispatcher_handle.lock() {
-            if let Some(handle) = slot.take() {
-                // Best-effort join — don't hold the GIL while waiting.
-                py.detach(|| {
-                    let _ = handle.join();
-                });
-            }
-        }
+        self.dispatcher.shutdown(py);
         self.inner.with(py, |c| c.shutdown()).map_err(py_err)
     }
 }
@@ -799,10 +835,8 @@ impl SipEndpoint {
 #[pyclass]
 struct AudioStreamEndpoint {
     inner: Core<RustAudioStreamEndpoint>,
-    /// See ``SipEndpoint.event_sink`` — same architectural shape.
-    event_sink: Arc<EventSink>,
-    dispatcher_stop: Arc<AtomicBool>,
-    dispatcher_handle: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
+    /// See ``SipEndpoint.dispatcher`` — same architectural shape.
+    dispatcher: Dispatcher,
 }
 
 #[pymethods]
@@ -817,27 +851,15 @@ impl AudioStreamEndpoint {
         let inner = Core::new(RustAudioStreamEndpoint::new(config, protocol).map_err(py_err)?);
         Ok(Self {
             inner,
-            event_sink: Arc::new(EventSink::new()),
-            dispatcher_stop: Arc::new(AtomicBool::new(false)),
-            dispatcher_handle: Arc::new(Mutex::new(None)),
+            dispatcher: Dispatcher::new(),
         })
     }
 
     /// See ``SipEndpoint.set_event_sink``.
     #[pyo3(signature = (callback=None))]
     fn set_event_sink(&self, py: Python, callback: Option<Py<PyAny>>) -> PyResult<()> {
-        self.event_sink.set(py, callback);
-        let mut handle_slot = self
-            .dispatcher_handle
-            .lock()
-            .map_err(|_| py_err("dispatcher handle lock poisoned"))?;
-        if handle_slot.is_none() {
-            let rx = self.inner.with(py, |c| c.events());
-            let sink = self.event_sink.clone();
-            let stop = self.dispatcher_stop.clone();
-            *handle_slot = Some(thread::spawn(move || dispatcher_loop(rx, sink, stop)));
-        }
-        Ok(())
+        self.dispatcher
+            .install(py, callback, || self.inner.with(py, |c| c.events()))
     }
 
     /// Send an audio frame. Releases GIL during mutex ops.
@@ -1030,7 +1052,7 @@ impl AudioStreamEndpoint {
 
     /// **Deprecated when a sink is registered** — see ``set_event_sink``.
     fn poll_event(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
-        if self.event_sink.is_set(py) {
+        if self.dispatcher.is_set(py) {
             return Ok(None);
         }
         match self.inner.with(py, |c| c.events().try_recv()) {
@@ -1045,7 +1067,7 @@ impl AudioStreamEndpoint {
         // See SipEndpoint.wait_for_event: release the event_sink guard BEFORE
         // allow_threads to keep this method GIL->event_sink. Holding it across
         // allow_threads would deadlock the dispatcher_loop via AB-BA.
-        let sink_active = self.event_sink.is_set(py);
+        let sink_active = self.dispatcher.is_set(py);
         if sink_active {
             py.detach(|| thread::sleep(Duration::from_millis(timeout_ms.max(10).min(1000))));
             return Ok(None);
@@ -1067,12 +1089,7 @@ impl AudioStreamEndpoint {
 
     fn shutdown(&self, py: Python) -> PyResult<()> {
         // Stop dispatcher first so it doesn't race with inner.shutdown().
-        self.dispatcher_stop.store(true, Ordering::Relaxed);
-        if let Ok(mut slot) = self.dispatcher_handle.lock() {
-            if let Some(handle) = slot.take() {
-                py.detach(|| { let _ = handle.join(); });
-            }
-        }
+        self.dispatcher.shutdown(py);
         self.inner.with(py, |c| c.shutdown()).map_err(py_err)
     }
 }

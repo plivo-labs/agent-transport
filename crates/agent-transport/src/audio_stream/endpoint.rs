@@ -144,12 +144,14 @@ impl AudioStreamEndpoint {
             // on `_ffi_handle.disposed` — the equivalent pre-call guard for our
             // sid-keyed handle model. Audio is discarded; the per-frame async_id
             // contract is preserved so the Python audio source's wait_for(...)
-            // resolves without surfacing CallNotActive.
+            // resolves without surfacing CallNotActive. The frame is discarded
+            // (not sent), so the completion carries `cancelled: true` per the
+            // `AudioCaptureComplete` contract — Pipecat counts it as dropped.
             if sess.terminated.load(Ordering::Acquire) {
                 let _ = self.event_tx.try_send(EndpointEvent::AudioCaptureComplete {
                     session_id: session_id.to_string(),
                     async_id,
-                    cancelled: false,
+                    cancelled: true,
                 });
                 return Ok(async_id);
             }

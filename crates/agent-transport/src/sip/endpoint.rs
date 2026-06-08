@@ -1110,12 +1110,15 @@ impl SipEndpoint {
             // Terminated call: short-circuit with immediate completion event,
             // mirroring LiveKit's `rtc.AudioSource.capture_frame:119`
             // `_ffi_handle.disposed` short-circuit. See
-            // `CallContext.terminated` doc.
+            // `CallContext.terminated` doc. The frame is discarded (not sent),
+            // so the completion carries `cancelled: true` per the
+            // `AudioCaptureComplete` contract — non-LiveKit consumers (Pipecat)
+            // count it as dropped rather than delivered.
             if ctx.terminated.load(Ordering::Acquire) {
                 let _ = self.event_tx.try_send(EndpointEvent::AudioCaptureComplete {
                     session_id: call_id.to_string(),
                     async_id,
-                    cancelled: false,
+                    cancelled: true,
                 });
                 return Ok(async_id);
             }
