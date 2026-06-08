@@ -43,7 +43,6 @@ from agent_transport._event_sink import _on_event_from_rust
 from agent_transport._ffi_queue import GLOBAL
 from ._room_facade import TransportJobContextMixin, TransportRoom, create_transport_context
 from ._session_finalize import finalize_session
-from .observability import _get_observability_url
 from ._server_base import AgentServerBase, JobContextBase, _nodename
 from .judging import EvaluationConfig
 
@@ -329,21 +328,7 @@ class AudioStreamServer(AgentServerBase):
             STREAM_SESSIONS_TOTAL.labels(nodename=node).inc()
             session_start = time.monotonic()
 
-            # Start recording if enabled — only when observability is configured,
-            # since the recording's only purpose is to be uploaded as part of the
-            # session report. Without observability there's nowhere to send it
-            # and nothing would clean up the file.
-            rec_path = None
-            rec_started_at = None
-            if self._recording and _get_observability_url():
-                try:
-                    os.makedirs(self._recording_dir, exist_ok=True)
-                    rec_path = os.path.join(self._recording_dir, f"recording_{session_id}.ogg")
-                    self._ep.start_recording(session_id, rec_path, self._recording_stereo)
-                    rec_started_at = time.time()
-                except Exception:
-                    rec_path = None
-                    logger.warning("Failed to start recording for session %s", session_id, exc_info=True)
+            rec_path, rec_started_at = self._start_session_recording(session_id)
 
             try:
                 await self._entrypoint_fnc(ctx)

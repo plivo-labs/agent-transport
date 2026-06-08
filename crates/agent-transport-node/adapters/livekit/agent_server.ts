@@ -25,12 +25,11 @@
 import { createServer, type Server, type IncomingMessage } from 'node:http';
 import { cpus } from 'node:os';
 import { hostname } from 'node:os';
-import { mkdirSync } from 'node:fs';
 import { SipEndpoint } from 'agent-transport';
 import { initializeLogger, InferenceRunner, runWithJobContext, log as agentLog } from '@livekit/agents';
 import { JobContext } from './session_context.js';
-import { logObservabilityStatus, getObservabilityUrl } from './observability.js';
-import { finalizeSession } from './_session_finalize.js';
+import { logObservabilityStatus } from './observability.js';
+import { finalizeSession, startSessionRecording } from './_session_finalize.js';
 import { runServerCleanup, forceShutdownAgentSession, installUnhandledRejectionHandler, registerSignalCleanup } from './_session_teardown.js';
 import { brokerFor, isAudioEvent } from './_audio_events.js';
 
@@ -549,21 +548,7 @@ export class AgentServer {
           });
         }
 
-        // Start Rust recording (stereo OGG/Opus at transport layer) — only when
-        // observability is configured, since the recording's only purpose is to be
-        // uploaded as part of the session report. Without observability there's
-        // nowhere to send it and nothing would clean up the file.
-        if (getObservabilityUrl()) {
-          try {
-            mkdirSync(sessionDir, { recursive: true });
-            recPath = `${sessionDir}/recording_${sessionId}.ogg`;
-            recordingStartedAt = Date.now();
-            this.ep!.startRecording(sessionId, recPath, true);
-          } catch {
-            recPath = undefined;
-            recordingStartedAt = undefined;
-          }
-        }
+        ({ recordingPath: recPath, recordingStartedAt } = startSessionRecording(this.ep!, sessionId, sessionDir));
 
         // Entrypoint returned — session.start() is non-blocking,
         // so wait for call to actually end (BYE or agent shutdown)

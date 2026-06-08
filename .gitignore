@@ -46,9 +46,6 @@ recording_*.ogg
 # Local recordings dir (test/debug captures, not source-controlled)
 recordings/
 
-# Git worktrees
-.worktrees/
-
 # Python crate build artifacts
 crates/agent-transport-python/adapters/agent_transport/*.so
 crates/agent-transport-python/adapters/agent_transport/*.dylib*

@@ -1,6 +1,35 @@
-import { existsSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { uploadReport, getObservabilityUrl } from './observability.js';
 import { closeSessionServices } from './_session_cleanup.js';
+
+/**
+ * Start a transport-layer recording for this session, if appropriate.
+ *
+ * Gated on observability being configured: the recording's only purpose is to
+ * be uploaded as part of the session report, and {@link finalizeSession}
+ * uploads then deletes it. Without observability there's nowhere to send it and
+ * nothing would clean up the file, so we skip it. This is the single source of
+ * the "record iff we'll upload" policy — the symmetric counterpart to
+ * {@link finalizeSession}.
+ *
+ * Returns the recording path + start timestamp, or an empty object when no
+ * recording was started.
+ */
+export function startSessionRecording(
+  endpoint: any,
+  sessionId: string,
+  sessionDir: string,
+): { recordingPath?: string; recordingStartedAt?: number } {
+  if (!getObservabilityUrl()) return {};
+  try {
+    mkdirSync(sessionDir, { recursive: true });
+    const recordingPath = `${sessionDir}/recording_${sessionId}.ogg`;
+    endpoint.startRecording(sessionId, recordingPath, true);
+    return { recordingPath, recordingStartedAt: Date.now() };
+  } catch {
+    return {};
+  }
+}
 
 export interface FinalizeSessionOptions {
   session: any;
