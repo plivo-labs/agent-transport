@@ -67,30 +67,41 @@ export async function finalizeSession(opts: FinalizeSessionOptions): Promise<voi
     }
   }
 
-  // Upload session report (transcript, audio, metrics).
-  try {
-    await uploadReport({
-      agentId,
-      agentName,
-      session,
-      callId: sessionId,
-      accountId,
-      metadata,
-      direction,
-      recordingPath,
-      recordingStartedAt,
-      transport,
-    });
-  } catch (e) {
-    console.warn(`Failed to upload session report for ${noun.toLowerCase()} ${sessionId}:`, e);
-  }
+  // Upload session report (transcript, audio, metrics) after close so history
+  // is complete. agentId is required to upload — obs keys sessions on it and the
+  // sessions table is NOT NULL — so when it's unset we skip (and keep the local
+  // recording) rather than write an unparented session. Single gate here,
+  // mirroring the Python finalize_session.
+  const obsUrl = getObservabilityUrl();
+  if (obsUrl && !agentId) {
+    console.warn(
+      `Skipping session report upload for ${sessionId} — observability is configured ` +
+        `but agentId is unset (local recording, if any, is kept).`,
+    );
+  } else if (obsUrl) {
+    try {
+      await uploadReport({
+        agentId,
+        agentName,
+        session,
+        callId: sessionId,
+        accountId,
+        metadata,
+        direction,
+        recordingPath,
+        recordingStartedAt,
+        transport,
+      });
+    } catch (e) {
+      console.warn(`Failed to upload session report for ${noun.toLowerCase()} ${sessionId}:`, e);
+    }
 
-  // Clean up local recording after the upload attempt. Only when an upload was
-  // actually attempted (obs URL + agentId): if agentId is unset the upload is
-  // skipped, so keep the recording on disk rather than silently dropping it.
-  if (getObservabilityUrl() && agentId && recordingPath) {
-    try { unlinkSync(recordingPath); } catch (e) {
-      console.warn(`Failed to clean up recording ${recordingPath}:`, e);
+    // Clean up the local recording after the upload attempt — co-located with
+    // the upload under the same gate (kept on disk on the skip path above).
+    if (recordingPath) {
+      try { unlinkSync(recordingPath); } catch (e) {
+        console.warn(`Failed to clean up recording ${recordingPath}:`, e);
+      }
     }
   }
 
