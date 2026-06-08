@@ -38,12 +38,48 @@ def _get_observability_url() -> str | None:
     return os.environ.get("AGENT_OBSERVABILITY_URL")
 
 
+def merge_tagger_tags_into_dict(
+    d: Any,
+    tagger_tags: Any,
+) -> Any:
+    """Merge tagger.tags into the chat_history dict's `tags[]` field.
+
+    The obs server's extractAgentId reads `agent_id:<value>` from
+    rawReport.tags[] (the multipart's chat_history JSON). LiveKit's
+    ``ChatContext.to_dict`` doesn't include tagger tags by default — they
+    only ride along on the OTLP "tag" body, which arrives *after* the
+    multipart. Without this merge, the recording multipart hits the obs
+    server first, INSERT runs with agent_id=null, the NOT NULL column
+    rejects the row, and the OTLP tag has no row to UPDATE.
+
+    Exported as a pure helper so tests can pin the contract without
+    setting up the full LiveKit upload pipeline.
+    """
+    if not isinstance(d, dict):
+        return d
+    tags = sorted(tagger_tags or [])
+    if not tags:
+        return d
+    existing = d.get("tags")
+    if isinstance(existing, list):
+        # Preserve any tags LiveKit may have already serialized (none
+        # today, but stay defensive about upstream changes).
+        seen = set(existing)
+        for t in tags:
+            if t not in seen:
+                existing.append(t)
+    else:
+        d["tags"] = list(tags)
+    return d
+
+
 def _ensure_transport_tags(
     tagger: Any,
     *,
     account_id: str | None,
     transport: str | None,
     direction: str | None,
+    agent_id: str,
     agent_name: str,
     metadata: dict[str, Any] | None = None,
 ) -> None:
@@ -53,6 +89,7 @@ def _ensure_transport_tags(
 
     session_metadata = {
         **(metadata or {}),
+        "agent_id": agent_id,
         "agent_name": agent_name,
         **({"account_id": account_id} if account_id else {}),
         **({"transport": transport} if transport else {}),
@@ -60,7 +97,11 @@ def _ensure_transport_tags(
     }
 
     add("agent.session", metadata=session_metadata)
-    add(f"agent.name:{agent_name}", metadata={"agent_name": agent_name})
+    # agent_id:<value> matches the obs server's applySessionTagMetadata
+    # prefix extractor — landing the UUID into agent_transport_sessions
+    # .agent_id directly. agent_name preserved for human-readable display.
+    add(f"agent_id:{agent_id}", metadata={"agent_id": agent_id})
+    add(f"agent_name:{agent_name}", metadata={"agent_name": agent_name})
     if account_id:
         add(f"account_id:{account_id}", metadata={"account_id": account_id})
     if transport:
@@ -161,6 +202,7 @@ async def upload_session_report(
     recording_path: str | None = None,
     recording_started_at: float | None = None,
     account_id: str | None = None,
+    agent_id: str = "",
     transport: str | None = None,
     direction: str | None = None,
     metadata: dict[str, Any] | None = None,
@@ -187,6 +229,7 @@ async def upload_session_report(
         account_id=account_id,
         transport=transport,
         direction=direction,
+        agent_id=agent_id,
         agent_name=agent_name,
         metadata=metadata,
     )
@@ -216,6 +259,31 @@ async def upload_session_report(
             enable_traces=False,
             enable_logs=True,
         )
+        # The multipart that _upload_session_report sends arrives at obs
+        # before the OTLP records (multipart is sync; OTLP is buffered).
+        # LiveKit doesn't put the tagger's tags in the multipart's
+        # chat_history JSON — they're only in the OTLP "session report"
+        # body's `session.tags` attr — but obs's recording validator runs
+        # at multipart time and needs to extract `agent_id` from
+        # `rawReport.tags[]` (the `agent_id:<value>` prefix tag that
+        # _ensure_transport_tags already added to the tagger).
+        #
+        # Patch `report.chat_history.to_dict` to mirror tagger.tags into
+        # the multipart, riding alongside the chat items. obs's existing
+        # `extractAgentId(rawReport)` picks it up; the other prefix tags
+        # (account_id:, transport:, …) carry through too. agent_name
+        # arrives shortly after via the OTLP "tag" body, which obs
+        # persists and runs `applySessionTagMetadata` on (UPDATE the
+        # session + upsertAgent merge).
+        chat_ctx = report.chat_history
+        original_to_dict = chat_ctx.to_dict
+
+        def _patched_to_dict(*args, **kwargs):
+            d = original_to_dict(*args, **kwargs)
+            return merge_tagger_tags_into_dict(d, getattr(tagger, "tags", None))
+
+        chat_ctx.to_dict = _patched_to_dict  # type: ignore[assignment]
+
         try:
             async with aiohttp.ClientSession() as http_session:
                 await _upload_session_report(
@@ -230,6 +298,12 @@ async def upload_session_report(
                 # below flushes everything out.
                 _emit_runtime_events(session, report)
         finally:
+            # Restore the original to_dict so we don't bleed into any
+            # subsequent re-serialization of this report.
+            try:
+                chat_ctx.to_dict = original_to_dict  # type: ignore[assignment]
+            except Exception:
+                pass
             _shutdown_telemetry()
 
     logger.info("Native LiveKit session report uploaded for %s", session_id)

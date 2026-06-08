@@ -41,6 +41,13 @@ fn err(e: impl Display) -> EndpointError { EndpointError::Other(e.to_string()) }
 struct CallContext {
     session: CallSession,
     rtp: Option<Arc<RtpTransport>>,
+    /// Two-state lifecycle (see audio_stream/endpoint.rs `StreamSession::terminated`):
+    /// `false` = Active (RTP up), `true` = Terminated (BYE received or local
+    /// hangup initiated, but the call still lingers in the `calls` HashMap
+    /// until Python releases it via a second `hangup(sid)` call). FFI methods
+    /// short-circuit to success-early on terminated, matching LiveKit's
+    /// `rtc.AudioSource` behaviour after `_ffi_handle.disposed`.
+    terminated: Arc<AtomicBool>,
     /// Shared audio buffer — agent voice with backpressure.
     audio_buf: Arc<AudioBuffer>,
     /// Background audio buffer (hold music, ambient) — mixed in send loop.
@@ -148,7 +155,8 @@ fn setup_rtp_attach(
         itx,
         etx.clone(),
         call_id.to_string(),
-        ctx.session.direction,
+        ctx.terminated.clone(),
+        ctx.session.clone(),
         ctx.beep_detector.clone(),
         ctx.held.clone(),
         ctx.recorder.clone(),
@@ -196,6 +204,37 @@ async fn setup_rtp(
         output_sample_rate,
     );
     Ok((ip, rtp_port, answer_copy, remote_rtp))
+}
+
+/// Two-state SIP call termination: mark `CallContext.terminated`, cancel
+/// per-call tasks, emit `CallTerminated`. Idempotent — returns true if
+/// the call was newly transitioned (i.e. terminated flipped false→true).
+/// Does NOT remove the call from `EndpointState.calls`; that's reserved
+/// for Python's `hangup(call_id)` (the equivalent of LiveKit's
+/// `_ffi_handle.dispose()`).
+fn terminate_sip_call(
+    call_id: &str,
+    st: &Arc<Mutex<EndpointState>>,
+    etx: &Sender<EndpointEvent>,
+    reason: String,
+) -> bool {
+    let (do_emit, session_for_event) = {
+        let st_g = st.lock_or_recover();
+        let Some(ctx) = st_g.calls.get(call_id) else { return false; };
+        if ctx.terminated.swap(true, Ordering::AcqRel) {
+            (false, None)
+        } else {
+            // Cancel per-call tasks immediately so the RTP loop exits
+            // promptly; AudioBuffer Drop fires on the actual HashMap
+            // removal (which happens later via `hangup`).
+            ctx.cancel.cancel();
+            (true, Some(ctx.session.clone()))
+        }
+    };
+    if let (true, Some(session)) = (do_emit, session_for_event) {
+        let _ = etx.try_send(EndpointEvent::CallTerminated { session, reason });
+    }
+    do_emit
 }
 
 /// Classify a `TerminatedReason` + call direction into a human-readable
@@ -270,8 +309,12 @@ fn spawn_dialog_watcher(
                     if let DialogState::Terminated(_, reason) = ds {
                         let side = classify_termination(&reason, direction);
                         info!("Call {} terminated {}: {:?}", call_id, side, reason);
-                        let sess = st.lock_or_recover().calls.remove(&call_id).map(|c| { c.cancel.cancel(); c.session });
-                        if let Some(s) = sess { let _ = etx.try_send(EndpointEvent::CallTerminated { session: s, reason: format!("{:?}", reason) }); }
+                        // Two-state transition: mark terminated + cancel
+                        // RTP/dialog tasks + emit CallTerminated, but DO NOT
+                        // remove from the HashMap. Python's `hangup(call_id)`
+                        // (called after `_run_call.finally` runs
+                        // `session.aclose()`) is the canonical release.
+                        terminate_sip_call(&call_id, &st, &etx, format!("{:?}", reason));
                         cc.cancel();
                         break;
                     }
@@ -405,21 +448,44 @@ fn start_session_timer(
     });
 }
 
-fn new_call_context(call_id: &str, direction: CallDirection, cc: CancellationToken, output_sample_rate: u32) -> (CallContext, CallSession) {
+fn new_call_context(
+    call_id: &str,
+    direction: CallDirection,
+    cc: CancellationToken,
+    output_sample_rate: u32,
+    event_tx: Sender<EndpointEvent>,
+) -> (CallContext, CallSession) {
     let session = CallSession::new(call_id.to_string(), direction);
     let (_itx, irx) = crossbeam_channel::unbounded();
     let ctx = CallContext {
-        session: session.clone(), rtp: None,
-        audio_buf: Arc::new(AudioBuffer::with_queue_size(200, output_sample_rate)),
-        bg_audio_buf: Arc::new(AudioBuffer::with_queue_size(200, output_sample_rate)),
+        session: session.clone(),
+        rtp: None,
+        terminated: Arc::new(AtomicBool::new(false)),
+        audio_buf: Arc::new(AudioBuffer::with_queue_size(
+            200,
+            output_sample_rate,
+            call_id.to_string(),
+            event_tx.clone(),
+        )),
+        bg_audio_buf: Arc::new(AudioBuffer::with_queue_size(
+            200,
+            output_sample_rate,
+            format!("{}-bg", call_id),
+            event_tx,
+        )),
         incoming_rx: irx,
-        muted: Arc::new(AtomicBool::new(false)), paused: Arc::new(AtomicBool::new(false)),
+        muted: Arc::new(AtomicBool::new(false)),
+        paused: Arc::new(AtomicBool::new(false)),
         held: Arc::new(AtomicBool::new(false)),
         playout_notify: Arc::new((Mutex::new(false), Condvar::new())),
-        beep_detector: Arc::new(Mutex::new(None)), recorder: Arc::new(Mutex::new(None)),
-        input_resampler: Arc::new(Mutex::new(None)), cancel: cc,
+        beep_detector: Arc::new(Mutex::new(None)),
+        recorder: Arc::new(Mutex::new(None)),
+        input_resampler: Arc::new(Mutex::new(None)),
+        cancel: cc,
         rtp_tasks: Vec::new(),
-        client_dialog: None, server_dialog: None, local_sdp: None,
+        client_dialog: None,
+        server_dialog: None,
+        local_sdp: None,
     };
     (ctx, session)
 }
@@ -456,13 +522,20 @@ pub struct SipEndpoint {
     event_rx: Receiver<EndpointEvent>,
     cancel: CancellationToken,
     recording_mgr: Arc<RecordingManager>,
+    /// Monotonic counter for allocating async_ids returned by
+    /// `send_audio_async` / `wait_for_playout_async`. See AudioStreamEndpoint
+    /// for full rationale — same pattern, same event channel.
+    async_id_counter: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SipEndpoint {
     pub fn new(config: EndpointConfig) -> Result<Self> {
         if config.input_sample_rate == 0 || config.output_sample_rate == 0 { return Err(EndpointError::Other("sample_rate must be > 0".into())); }
         let rt = Runtime::new().map_err(err)?;
-        let (etx, erx) = crossbeam_channel::unbounded();
+        // Bounded so a stalled Python dispatcher can't grow this without limit
+        // (OOM). Emits use try_send → drop-on-full; the dispatcher warns at a
+        // high-water mark well before the cap. See events::EVENT_CHANNEL_CAP.
+        let (etx, erx) = crossbeam_channel::bounded(crate::events::EVENT_CHANNEL_CAP);
         let cancel = CancellationToken::new();
         let state = Arc::new(Mutex::new(EndpointState {
             registered: false, calls: HashMap::new(),
@@ -544,7 +617,16 @@ impl SipEndpoint {
         })?;
 
         info!("Agent transport initialized");
-        Ok(Self { config, runtime: rt, state, event_tx: etx, event_rx: erx, cancel, recording_mgr: RecordingManager::new() })
+        Ok(Self {
+            config,
+            runtime: rt,
+            state,
+            event_tx: etx,
+            event_rx: erx,
+            cancel,
+            recording_mgr: RecordingManager::new(),
+            async_id_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        })
     }
 
     pub fn register(&self, username: &str, password: &str) -> Result<()> {
@@ -716,7 +798,7 @@ impl SipEndpoint {
             }
 
             let cc = CancellationToken::new();
-            let (mut ctx, mut session) = new_call_context(&call_id, CallDirection::Outbound, cc.clone(), cfg.output_sample_rate);
+            let (mut ctx, mut session) = new_call_context(&call_id, CallDirection::Outbound, cc.clone(), cfg.output_sample_rate, etx.clone());
             session.remote_uri = dest;
             extract_x_headers(&resp, &mut session);
             ctx.session = session.clone();
@@ -798,12 +880,21 @@ impl SipEndpoint {
         let handle = self.runtime.handle().clone();
         let jh = self.runtime.spawn_blocking(move || {
         handle.block_on(async {
+            // First transition: if still Active, mark terminated + cleanup +
+            // emit CallTerminated. Idempotent — no-op if the dialog watcher
+            // already terminated the call.
+            terminate_sip_call(&call_id, &st, &etx, "local hangup".into());
+            // Second transition: remove from the calls HashMap. This is the
+            // "release the FFI handle" step that lets the underlying audio
+            // buffer Drop and frees per-call resources.
             let ctx = st.lock_or_recover().calls.remove(&call_id);
             if let Some(ctx) = ctx {
-                ctx.cancel.cancel();
+                // Send BYE if the dialog is still up. If terminate_sip_call
+                // ran first, cancel was already cancelled and per-call tasks
+                // are exiting; the dialog handle may still be alive though,
+                // so we send BYE explicitly.
                 if let Some(ref d) = ctx.client_dialog { let _ = d.hangup().await; }
                 else if let Some(ref d) = ctx.server_dialog { let _ = d.bye().await; }
-                let _ = etx.try_send(EndpointEvent::CallTerminated { session: ctx.session, reason: "local hangup".into() });
             }
             Ok(())
         })
@@ -821,17 +912,24 @@ impl SipEndpoint {
         let handle = self.runtime.handle().clone();
         let jh = self.runtime.spawn_blocking(move || {
         handle.block_on(async {
-            let s = st.lock_or_recover();
-            let ctx = s.calls.get(&call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
+            // Snapshot the handles under the lock, then DROP the guard before the
+            // digit loop. The loop awaits per-digit SIP INFO / RFC2833 sends
+            // (~160-200ms each); holding the global EndpointState mutex across
+            // those awaits would stall every other call for the whole DTMF burst.
+            let (client_dialog, server_dialog, rtp) = {
+                let s = st.lock_or_recover();
+                let ctx = s.calls.get(&call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
+                (ctx.client_dialog.clone(), ctx.server_dialog.clone(), ctx.rtp.clone())
+            };
             for d in digits.chars() {
                 match method.as_str() {
                     "sip_info" | "info" => {
                         let body = format!("Signal={}\r\nDuration=160\r\n", d);
                         let hdrs = vec![rsip::Header::ContentType("application/dtmf-relay".into())];
-                        if let Some(ref dl) = ctx.client_dialog { let _ = dl.info(Some(hdrs), Some(body.into_bytes())).await; }
-                        else if let Some(ref dl) = ctx.server_dialog { let _ = dl.info(Some(hdrs), Some(body.into_bytes())).await; }
+                        if let Some(ref dl) = client_dialog { let _ = dl.info(Some(hdrs), Some(body.into_bytes())).await; }
+                        else if let Some(ref dl) = server_dialog { let _ = dl.info(Some(hdrs), Some(body.into_bytes())).await; }
                     }
-                    _ => { if let Some(ref rtp) = ctx.rtp { let _ = rtp.send_dtmf_event(d, 200).await; } }
+                    _ => { if let Some(ref rtp) = rtp { let _ = rtp.send_dtmf_event(d, 200).await; } }
                 }
             }
             Ok(())
@@ -951,17 +1049,33 @@ impl SipEndpoint {
         Ok(f(ctx))
     }
 
-    pub fn mute(&self, call_id: &str) -> Result<()> { self.with_call(call_id, |c| c.muted.store(true, Ordering::Release)) }
-    pub fn unmute(&self, call_id: &str) -> Result<()> { self.with_call(call_id, |c| c.muted.store(false, Ordering::Release)) }
-    pub fn pause(&self, call_id: &str) -> Result<()> { self.with_call(call_id, |c| c.paused.store(true, Ordering::Release)) }
-    pub fn resume(&self, call_id: &str) -> Result<()> { self.with_call(call_id, |c| c.paused.store(false, Ordering::Release)) }
+    /// Like `with_call`, but on a terminated call returns ``Ok(default())``
+    /// instead of running the closure. Used by FFI methods that should
+    /// no-op after the underlying RTP transport is gone (mute, pause,
+    /// clear_buffer, etc.) — mirrors LiveKit's
+    /// ``_ffi_handle.disposed`` short-circuit in
+    /// ``rtc.AudioSource.capture_frame``.
+    fn with_active_call<F, R>(&self, call_id: &str, default: R, f: F) -> Result<R>
+    where F: FnOnce(&CallContext) -> R {
+        let s = self.state.lock_or_recover();
+        let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
+        if ctx.terminated.load(Ordering::Acquire) {
+            return Ok(default);
+        }
+        Ok(f(ctx))
+    }
+
+    pub fn mute(&self, call_id: &str) -> Result<()> { self.with_active_call(call_id, (), |c| c.muted.store(true, Ordering::Release)) }
+    pub fn unmute(&self, call_id: &str) -> Result<()> { self.with_active_call(call_id, (), |c| c.muted.store(false, Ordering::Release)) }
+    pub fn pause(&self, call_id: &str) -> Result<()> { self.with_active_call(call_id, (), |c| c.paused.store(true, Ordering::Release)) }
+    pub fn resume(&self, call_id: &str) -> Result<()> { self.with_active_call(call_id, (), |c| c.paused.store(false, Ordering::Release)) }
     /// Reset playout flag so next wait_for_playout blocks until audio buffer drains.
     /// Call this before wait_for_playout to ensure accurate playout tracking.
     /// Does NOT clear buffered audio — use clear_buffer for that.
-    pub fn flush(&self, call_id: &str) -> Result<()> { self.with_call(call_id, |c| { if let Ok(mut d) = c.playout_notify.0.lock() { *d = false; } }) }
+    pub fn flush(&self, call_id: &str) -> Result<()> { self.with_active_call(call_id, (), |c| { if let Ok(mut d) = c.playout_notify.0.lock() { *d = false; } }) }
     pub fn clear_buffer(&self, call_id: &str) -> Result<()> {
         debug!("clear_buffer: call={} clearing audio buffer", call_id);
-        self.with_call(call_id, |c| {
+        self.with_active_call(call_id, (), |c| {
             c.audio_buf.clear();
             // Reset the input resampler — stale filter state from the previous speech
             // segment would produce a click/tick at the start of the next segment.
@@ -977,24 +1091,41 @@ impl SipEndpoint {
         })
     }
 
-    /// Push audio samples into the shared AudioBuffer.
+    /// Push audio samples and return the `async_id` the caller must
+    /// await on `EndpointEvent::AudioCaptureComplete` (or
+    /// `AudioCaptureError`).
     ///
-    /// If buffer is below threshold (1s), the completion callback fires immediately
-    /// and this returns quickly. If above threshold, the callback is deferred until
-    /// the RTP send loop drains below threshold.
+    /// **Always returns `Ok(async_id)` on success** — the completion
+    /// event always fires (immediately if buffer ended at-or-below
+    /// threshold, deferred if above). Mirrors LiveKit's
+    /// `capture_audio_frame` invariant.
     ///
-    /// The `on_complete` callback is called from the RTP send loop's tokio thread.
-    /// It should use loop.call_soon_threadsafe to signal Python asynchronously.
-    ///
-    /// Matches WebRTC C++ InternalSource::capture_frame exactly.
-    pub fn send_audio_with_callback(&self, call_id: &str, frame: &AudioFrame, on_complete: crate::sip::audio_buffer::CompletionCallback) -> Result<()> {
+    /// Returns `Err` synchronously only for misuse (call not active,
+    /// buffer overflow); no event is emitted on that path.
+    pub fn send_audio_async(&self, call_id: &str, frame: &AudioFrame) -> Result<u64> {
+        let async_id = self.async_id_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (audio_buf, resampler) = {
             let s = self.state.lock_or_recover();
             let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
+            // Terminated call: short-circuit with immediate completion event,
+            // mirroring LiveKit's `rtc.AudioSource.capture_frame:119`
+            // `_ffi_handle.disposed` short-circuit. See
+            // `CallContext.terminated` doc. The frame is discarded (not sent),
+            // so the completion carries `cancelled: true` per the
+            // `AudioCaptureComplete` contract — non-LiveKit consumers (Pipecat)
+            // count it as dropped rather than delivered.
+            if ctx.terminated.load(Ordering::Acquire) {
+                let _ = self.event_tx.try_send(EndpointEvent::AudioCaptureComplete {
+                    session_id: call_id.to_string(),
+                    async_id,
+                    cancelled: true,
+                });
+                return Ok(async_id);
+            }
             (ctx.audio_buf.clone(), ctx.input_resampler.clone())
         };
         let target_rate = self.config.output_sample_rate;
-        if frame.sample_rate != 0 && frame.sample_rate != target_rate {
+        let result = if frame.sample_rate != 0 && frame.sample_rate != target_rate {
             let mut guard = resampler.lock_or_recover();
             // Recreate the resampler if the source rate has changed (e.g. TTS
             // switched from 24kHz to 16kHz) — reusing stale filter state would
@@ -1010,29 +1141,33 @@ impl SipEndpoint {
             if let Some(ref mut r) = *guard {
                 let resampled = r.process(&frame.data).to_vec();
                 debug!("send_audio: resampled {} -> {} samples", frame.data.len(), resampled.len());
-                audio_buf.push(&resampled, on_complete)
-                    .map_err(|e| EndpointError::Other(e.into()))
+                audio_buf.push(&resampled, async_id)
             } else {
                 info!("send_audio: resampler init failed, pushing raw {} samples at {}Hz", frame.data.len(), frame.sample_rate);
-                audio_buf.push(&frame.data, on_complete)
-                    .map_err(|e| EndpointError::Other(e.into()))
+                audio_buf.push(&frame.data, async_id)
             }
         } else {
-            audio_buf.push(&frame.data, on_complete)
-                .map_err(|e| EndpointError::Other(e.into()))
-        }
+            audio_buf.push(&frame.data, async_id)
+        };
+        result.map_err(|e| EndpointError::Other(e.into()))?;
+        Ok(async_id)
     }
 
-    /// Simple send_audio without callback — for backward compatibility.
+    /// Convenience: push audio without an async_id wait.
     pub fn send_audio(&self, call_id: &str, frame: &AudioFrame) -> Result<()> {
-        self.send_audio_with_callback(call_id, frame, Box::new(|| {}))
+        let _ = self.send_audio_async(call_id, frame)?;
+        Ok(())
     }
 
     /// Send audio without backpressure — push directly, drop if full.
     /// Used by Node.js adapter where napi ThreadsafeFunction callbacks
     /// don't reliably fire from tokio threads.
     pub fn send_audio_no_backpressure(&self, call_id: &str, frame: &AudioFrame) -> Result<()> {
-        let audio_buf = self.with_call(call_id, |c| c.audio_buf.clone())?;
+        // Terminated: silent drop (matches send_audio_async behaviour).
+        let audio_buf = match self.with_active_call(call_id, None, |c| Some(c.audio_buf.clone()))? {
+            Some(buf) => buf,
+            None => return Ok(()),
+        };
         let target_rate = self.config.output_sample_rate;
         if frame.sample_rate != 0 && frame.sample_rate != target_rate {
             let resampled = crate::sip::resampler::Resampler::new_voip(frame.sample_rate, target_rate)
@@ -1048,7 +1183,14 @@ impl SipEndpoint {
     /// Send background audio to be mixed with agent voice in the RTP send loop.
     /// Used by publish_track (background audio, hold music, etc.).
     pub fn send_background_audio(&self, call_id: &str, frame: &AudioFrame) -> Result<()> {
-        let bg_buf = self.with_call(call_id, |c| c.bg_audio_buf.clone())?;
+        // Terminated call: silently drop. See audio_stream/endpoint.rs's
+        // send_background_audio for the rationale (BackgroundAudioPlayer keeps
+        // pumping after BYE; we no-op to match LiveKit's track-auto-unpublish
+        // behaviour).
+        let bg_buf = match self.with_active_call(call_id, None, |c| Some(c.bg_audio_buf.clone()))? {
+            Some(buf) => buf,
+            None => return Ok(()),
+        };
         let target_rate = self.config.output_sample_rate;
         if frame.sample_rate != 0 && frame.sample_rate != target_rate {
             let resampled = crate::sip::resampler::Resampler::new_voip(frame.sample_rate, target_rate)
@@ -1089,12 +1231,30 @@ impl SipEndpoint {
         self.with_call(call_id, |c| c.audio_buf.queued_duration_ms(self.config.output_sample_rate))
     }
 
-    /// Set a callback to fire when buffer drains to empty (playout complete).
-    /// Matches WebRTC's audioSource.waitForPlayout() — truly async, pause-aware.
-    pub fn wait_for_playout_notify(&self, call_id: &str, on_complete: crate::sip::audio_buffer::CompletionCallback) -> Result<()> {
-        let audio_buf = self.with_call(call_id, |c| c.audio_buf.clone())?;
-        audio_buf.set_playout_callback(on_complete);
-        Ok(())
+    /// Register an async_id for "buffer drained to empty" notification.
+    ///
+    /// **Always returns `Ok(async_id)`** — the completion event always
+    /// fires (immediately if buffer already empty, deferred if not).
+    /// Multiple concurrent waiters supported. Pause-aware (RTP loop
+    /// doesn't drain while paused).
+    pub fn wait_for_playout_async(&self, call_id: &str) -> Result<u64> {
+        let async_id = self.async_id_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let audio_buf = {
+            let s = self.state.lock_or_recover();
+            let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
+            // Terminated call: short-circuit with immediate completion.
+            // See send_audio_async above for the rationale.
+            if ctx.terminated.load(Ordering::Acquire) {
+                let _ = self.event_tx.try_send(EndpointEvent::AudioPlayoutComplete {
+                    session_id: call_id.to_string(),
+                    async_id,
+                });
+                return Ok(async_id);
+            }
+            ctx.audio_buf.clone()
+        };
+        audio_buf.add_pending_playout(async_id);
+        Ok(async_id)
     }
 
     pub fn start_recording(&self, call_id: &str, path: &str, stereo: bool) -> Result<()> {
@@ -1181,8 +1341,13 @@ async fn handle_incoming(
 
     let call_id = format!("c{:016x}", rand::random::<u64>());
     let cc = CancellationToken::new();
-    let (mut ctx, mut session) =
-        new_call_context(&call_id, CallDirection::Inbound, cc.clone(), cfg.output_sample_rate);
+    let (mut ctx, mut session) = new_call_context(
+        &call_id,
+        CallDirection::Inbound,
+        cc.clone(),
+        cfg.output_sample_rate,
+        etx.clone(),
+    );
 
     let req = dialog.initial_request();
     if let Ok(from) = req.from_header() {

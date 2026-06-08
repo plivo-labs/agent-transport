@@ -91,17 +91,20 @@ def test_transport_tags_use_generic_account_names():
         account_id="acct-1",
         transport="sip",
         direction="inbound",
+        agent_id="agent-9",
         agent_name="support-agent",
     )
 
     assert tagger.added == [
         "agent.session",
-        "agent.name:support-agent",
+        "agent_id:agent-9",
+        "agent_name:support-agent",
         "account_id:acct-1",
         "transport:sip",
         "direction:inbound",
     ]
     assert tagger.metadata["agent.session"] == {
+        "agent_id": "agent-9",
         "agent_name": "support-agent",
         "account_id": "acct-1",
         "transport": "sip",
@@ -119,7 +122,8 @@ def test_sip_job_context_set_metadata_adds_observability_tags():
         endpoint=FakeEndpoint(),
     )
     ctx._agent_name = "support-agent"
-    ctx._job_stub = SimpleNamespace(tagger=tagger)
+    ctx._agent_id = "agent-9"
+    ctx._tagger = tagger
 
     ctx.set_metadata({"account_id": "acct-1", "customer_tier": "gold", "empty": None})
 
@@ -127,7 +131,8 @@ def test_sip_job_context_set_metadata_adds_observability_tags():
     assert ctx.metadata == {"account_id": "acct-1", "customer_tier": "gold"}
     assert tagger.added == [
         "agent.session",
-        "agent.name:support-agent",
+        "agent_id:agent-9",
+        "agent_name:support-agent",
         "account_id:acct-1",
         "transport:sip",
         "direction:inbound",
@@ -135,6 +140,7 @@ def test_sip_job_context_set_metadata_adds_observability_tags():
     assert tagger.metadata["agent.session"] == {
         "account_id": "acct-1",
         "customer_tier": "gold",
+        "agent_id": "agent-9",
         "agent_name": "support-agent",
         "transport": "sip",
         "direction": "inbound",
@@ -152,14 +158,16 @@ def test_audio_stream_job_context_set_metadata_adds_observability_tags():
         endpoint=FakeEndpoint(),
     )
     ctx._agent_name = "support-agent"
-    ctx._job_stub = SimpleNamespace(tagger=tagger)
+    ctx._agent_id = "agent-9"
+    ctx._tagger = tagger
 
     ctx.set_metadata({"account_id": "acct-1"})
 
     assert ctx.account_id == "acct-1"
     assert tagger.added == [
         "agent.session",
-        "agent.name:support-agent",
+        "agent_id:agent-9",
+        "agent_name:support-agent",
         "account_id:acct-1",
         "transport:audio_stream",
         "direction:inbound",

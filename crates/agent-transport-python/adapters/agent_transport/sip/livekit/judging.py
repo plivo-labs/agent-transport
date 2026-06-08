@@ -1,4 +1,10 @@
-"""Post-session judge integration for the LiveKit transport facade."""
+"""Post-session judge integration for the LiveKit transport facade.
+
+The livekit-agents version range that this module's JudgeGroup integration
+works against (`>=1.5.2,<1.6`) is pinned in agent-transport-python's
+pyproject.toml `[livekit]` extra — pip / uv resolution enforces it, so no
+runtime version check is needed here.
+"""
 
 from __future__ import annotations
 

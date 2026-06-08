@@ -193,18 +193,28 @@ impl StreamProtocol for PlivoProtocol {
         let atk = auth_token_override.unwrap_or(&self.auth_token);
         if aid.is_empty() { return; }
         let (aid, atk, cid) = (aid.to_string(), atk.to_string(), call_id.to_string());
-        let handle = rt.handle().clone();
-        let jh = rt.spawn_blocking(move || {
-            handle.block_on(async {
-                let url = format!("https://api.plivo.com/v1/Account/{}/Call/{}/", aid, cid);
-                match reqwest::Client::new().delete(&url).basic_auth(&aid, Some(&atk)).send().await {
-                    Ok(r) if r.status().is_success() || r.status().as_u16() == 404 => info!("Call {} hung up", cid),
-                    Ok(r) => warn!("Hangup: {} {}", r.status(), r.text().await.unwrap_or_default()),
-                    Err(e) => warn!("Hangup: {}", e),
-                }
-            });
+        // Fire-and-forget on the endpoint's own tokio runtime. The REST DELETE
+        // runs as a detached async task and this fn returns IMMEDIATELY, so the
+        // caller — a PyO3 pymethod invoked from Python — is never blocked for the
+        // network round-trip. No Python thread (loop OR executor worker) is held
+        // while Plivo is contacted. The completion is logged from inside the task.
+        //
+        // The timeouts are a safety ceiling for the detached task (nothing awaits
+        // it on the hot path); they also bound how long the shutdown drain in
+        // `AudioStreamEndpoint::shutdown` must wait before the runtime is dropped.
+        rt.spawn(async move {
+            let url = format!("https://api.plivo.com/v1/Account/{}/Call/{}/", aid, cid);
+            let client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(2))
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
+            match client.delete(&url).basic_auth(&aid, Some(&atk)).send().await {
+                Ok(r) if r.status().is_success() || r.status().as_u16() == 404 => info!("Call {} hung up", cid),
+                Ok(r) => warn!("Hangup: {} {}", r.status(), r.text().await.unwrap_or_default()),
+                Err(e) => warn!("Hangup: {}", e),
+            }
         });
-        let _ = rt.block_on(jh);
     }
 }
 

@@ -57,14 +57,80 @@ jobs:
       - name: Run tests with audio streaming
         run: cargo test --features audio-stream
 
+  run-python-tests:
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.94.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y cmake libopus-dev
+
+      - name: Build wheel
+        working-directory: crates/agent-transport-python
+        run: |
+          pip install --upgrade pip maturin
+          maturin build --release --out dist
+
+      - name: Install wheel with test extras
+        working-directory: crates/agent-transport-python
+        run: |
+          # Install the freshly-built wheel plus the `all` (livekit+pipecat)
+          # and `test` extras. `pip install <path-to-wheel>[test,all]` works
+          # because the wheel's metadata exposes the extras.
+          WHEEL=$(ls dist/*.whl | head -1)
+          pip install "${WHEEL}[all,test]"
+
+      - name: Run pytest
+        working-directory: crates/agent-transport-python
+        # Skip the existing test_pipecat_* suites: they fail to import under
+        # pipecat-ai >= 0.0.108 because pipecat's own base_serializer hits a
+        # missing `rtvi` subpackage. That's a pre-existing dep issue in the
+        # Pipecat adapter tests, unrelated to this PR — track separately.
+        run: pytest -v tests/ --ignore-glob='tests/test_pipecat_*.py'
+
+  run-node-tests:
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run TS unit tests
+        working-directory: crates/agent-transport-node
+        # tsx is the only dep needed; no native build required for these
+        # tests since they only exercise pure-TS helpers.
+        run: |
+          npm install --no-save tsx typescript @types/node
+          npx tsx --test adapters/livekit/*.test.ts
+
   test:
     if: always()
-    needs: [changes, run-tests]
+    needs: [changes, run-tests, run-python-tests, run-node-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Passed
-        if: needs.run-tests.result == 'success' || needs.run-tests.result == 'skipped'
+        if: |
+          (needs.run-tests.result == 'success' || needs.run-tests.result == 'skipped') &&
+          (needs.run-python-tests.result == 'success' || needs.run-python-tests.result == 'skipped') &&
+          (needs.run-node-tests.result == 'success' || needs.run-node-tests.result == 'skipped')
         run: echo "Tests passed or skipped (docs-only change)"
       - name: Failed
-        if: needs.run-tests.result == 'failure' || needs.run-tests.result == 'cancelled'
+        if: |
+          needs.run-tests.result == 'failure' || needs.run-tests.result == 'cancelled' ||
+          needs.run-python-tests.result == 'failure' || needs.run-python-tests.result == 'cancelled' ||
+          needs.run-node-tests.result == 'failure' || needs.run-node-tests.result == 'cancelled'
         run: exit 1

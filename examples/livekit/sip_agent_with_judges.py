@@ -41,6 +41,11 @@ Optional for dashboard account correlation:
 Usage:
     uv run examples/livekit/sip_agent_with_judges.py start
     uv run examples/livekit/sip_agent_with_judges.py dev
+
+Companion pytest sims (same agent_id, so live + sim land on one agent
+record in the obs dashboard):
+    agent-observability/plugins/examples/pytest/pytest_shopify_agent.py
+    agent-observability/plugins/examples/pytest/pytest_shopify_with_judges.py
 """
 
 import logging
@@ -271,6 +276,14 @@ server = AgentServer(
     sip_username=os.environ["SIP_USERNAME"],
     sip_password=os.environ["SIP_PASSWORD"],
     sip_server=os.environ.get("SIP_DOMAIN", "phone.plivo.com"),
+    # Stable opaque UUID4 — uploaded with every session so the obs
+    # dashboard groups this agent's calls together. Same id as the
+    # audio_stream variant (same Shopify domain, different transport)
+    # and as the pytest simulation file in agent-observability so all
+    # three surfaces land under one agent in the dashboard. AGENT_ID
+    # env wins when set.
+    agent_id=os.environ.get("AGENT_ID", "da3d4071-34ce-41b2-8c9e-05eef23a43bb"),
+    agent_name=os.environ.get("AGENT_NAME", "northstar-shopify-bot"),
 )
 
 

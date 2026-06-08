@@ -29,6 +29,11 @@ const server = new AgentServer({
   sipUsername: process.env.SIP_USERNAME!,
   sipPassword: process.env.SIP_PASSWORD!,
   sipServer: process.env.SIP_DOMAIN ?? 'phone.plivo.com',
+  // Shared with audio_stream_multi_agent.{py,ts} so both transports
+  // of this demo land on one agent record in obs. Override with
+  // AGENT_ID env.
+  agentId: process.env.AGENT_ID ?? '85b7c410-a9e3-4ec8-bf94-d8e7cd5c6fe8',
+  agentName: process.env.AGENT_NAME ?? 'demo-receptionist-handoff',
 });
 
 server.setupFnc = async (proc: JobProcess) => {

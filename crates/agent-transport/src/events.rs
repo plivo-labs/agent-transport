@@ -1,5 +1,16 @@
 use crate::sip::call::CallSession;
 
+/// Capacity of the endpoint event channel (SIP + audio_stream).
+///
+/// Generous on purpose: in normal operation the dispatcher drains continuously
+/// and the queue stays near-empty, so this is never approached. Bounding it
+/// caps worst-case memory — a stalled Python dispatcher on an *unbounded*
+/// channel grows without limit (OOM → the whole process dies, all sessions).
+/// At the cap, `try_send` drops the event and the awaiter's 30s timeout handles
+/// the rare lost completion; the dispatcher logs a high-water warning long
+/// before the cap is reached. ~65k small events ≈ a few MB.
+pub const EVENT_CHANNEL_CAP: usize = 65_536;
+
 /// Events emitted by the SIP endpoint.
 #[derive(Debug, Clone)]
 pub enum EndpointEvent {
@@ -66,6 +77,60 @@ pub enum EndpointEvent {
     /// the next poll timeout. Adapter event loops should treat this as a
     /// signal to stop dispatching and exit cleanly.
     Shutdown,
+
+    /// A previously-deferred `send_audio_async` has cleared — the buffer
+    /// has drained below the backpressure threshold, so the caller may
+    /// push more audio without blocking. The `async_id` matches the value
+    /// returned by `send_audio_async` so adapters can resolve the right
+    /// awaiter.
+    ///
+    /// Replaces the old `pending_complete` Python callback. The event
+    /// pattern is mandatory: Rust threads do NOT invoke Python callbacks,
+    /// which was the source of the GIL+Mutex AB-BA deadlock seen in prod.
+    ///
+    /// `cancelled` is `true` when the completion was synthesized by
+    /// `clear_buffer()` (or an equivalent buffer drop / session
+    /// teardown) rather than a real RTP/WS send. LiveKit consumers
+    /// ignore this field — clear semantics for them are silent-discard,
+    /// matching `rtc.AudioSource.clear_queue` behaviour. Pipecat's
+    /// `write_audio_frame -> bool` API checks it so the frame counts as
+    /// dropped rather than delivered.
+    AudioCaptureComplete {
+        session_id: String,
+        async_id: u64,
+        cancelled: bool,
+    },
+
+    /// All queued audio for this session has been played out — the buffer
+    /// is empty AND (where applicable) the remote endpoint has confirmed
+    /// playback (Plivo `playedStream` / RTP send-complete). Matches the
+    /// `async_id` returned by `wait_for_playout_async`.
+    ///
+    /// Replaces the old `playout_callback`.
+    AudioPlayoutComplete {
+        session_id: String,
+        async_id: u64,
+    },
+
+    /// The audio buffer has drained completely (independent of any
+    /// specific async_id). Used for observational backpressure / metrics;
+    /// adapters that care about per-frame completion should use
+    /// `AudioCaptureComplete` instead.
+    AudioBufferDrained {
+        session_id: String,
+        async_id: u64,
+    },
+
+    /// A pending audio operation (`send_audio_async` /
+    /// `wait_for_playout_async`) was cancelled — e.g., the buffer was
+    /// cleared via `clear_buffer()`, flushed, or the session went away
+    /// while the operation was outstanding. Adapters must surface this as
+    /// a cancellation/error to the awaiter rather than hanging forever.
+    AudioCaptureError {
+        session_id: String,
+        async_id: u64,
+        error: String,
+    },
 }
 
 impl EndpointEvent {
@@ -83,6 +148,10 @@ impl EndpointEvent {
             EndpointEvent::BeepDetected { .. } => "beep_detected",
             EndpointEvent::BeepTimeout { .. } => "beep_timeout",
             EndpointEvent::Shutdown => "shutdown",
+            EndpointEvent::AudioCaptureComplete { .. } => "audio_capture_complete",
+            EndpointEvent::AudioPlayoutComplete { .. } => "audio_playout_complete",
+            EndpointEvent::AudioBufferDrained { .. } => "audio_buffer_drained",
+            EndpointEvent::AudioCaptureError { .. } => "audio_capture_error",
         }
     }
 }
@@ -154,6 +223,40 @@ mod tests {
         assert_eq!(
             EndpointEvent::BeepTimeout { call_id: "0".into() }.callback_name(),
             "beep_timeout"
+        );
+        assert_eq!(
+            EndpointEvent::AudioCaptureComplete {
+                session_id: "s".into(),
+                async_id: 42,
+                cancelled: false,
+            }
+            .callback_name(),
+            "audio_capture_complete"
+        );
+        assert_eq!(
+            EndpointEvent::AudioPlayoutComplete {
+                session_id: "s".into(),
+                async_id: 7,
+            }
+            .callback_name(),
+            "audio_playout_complete"
+        );
+        assert_eq!(
+            EndpointEvent::AudioBufferDrained {
+                session_id: "s".into(),
+                async_id: 1,
+            }
+            .callback_name(),
+            "audio_buffer_drained"
+        );
+        assert_eq!(
+            EndpointEvent::AudioCaptureError {
+                session_id: "s".into(),
+                async_id: 99,
+                error: "cleared".into(),
+            }
+            .callback_name(),
+            "audio_capture_error"
         );
     }
 }

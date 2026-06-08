@@ -25,6 +25,28 @@ export function getObservabilityUrl(): string | undefined {
   return process.env.AGENT_OBSERVABILITY_URL;
 }
 
+/**
+ * Log at boot whether observability uploads are active.
+ *
+ * agentId is required to upload (obs keys sessions on it; the sessions table is
+ * NOT NULL). When the URL is configured but agentId is unset we warn here —
+ * uploads are skipped per-session in `uploadReport` — so the misconfig is
+ * visible at startup rather than as a silently empty dashboard.
+ */
+export function logObservabilityStatus(agentId: string | undefined): void {
+  const obsUrl = getObservabilityUrl();
+  if (!obsUrl) return;
+  if (agentId) {
+    console.log(`Observability enabled, target ${obsUrl}`);
+  } else {
+    console.warn(
+      `Observability is configured (AGENT_OBSERVABILITY_URL=${obsUrl}) but agentId is ` +
+        `unset — session reports will NOT be uploaded. Pass agentId to the server ` +
+        `constructor or set the AGENT_ID env var to enable observability.`,
+    );
+  }
+}
+
 async function buildBearerAuthHeaders(): Promise<Record<string, string>> {
   const apiKey = process.env.LIVEKIT_API_KEY;
   const apiSecret = process.env.LIVEKIT_API_SECRET;
@@ -54,6 +76,7 @@ function scalarMetadata(metadata?: Record<string, unknown>): Record<string, stri
 }
 
 export function buildRoomTags(options: {
+  agentId: string;
   agentName: string;
   accountId?: string;
   metadata?: Record<string, unknown>;
@@ -62,6 +85,7 @@ export function buildRoomTags(options: {
 }): Record<string, string> {
   return {
     ...scalarMetadata(options.metadata),
+    agent_id: options.agentId,
     agent_name: options.agentName,
     ...(options.accountId ? { account_id: options.accountId } : {}),
     ...(options.transport ? { transport: options.transport } : {}),
@@ -237,6 +261,7 @@ function normalizeEvents(events: unknown[]): unknown[] {
 
 export function buildOtlpLogRecords(
   report: voice.SessionReport,
+  agentId: string,
   agentName: string,
   roomTags: Record<string, string>,
 ): OtlpLogRecord[] {
@@ -253,6 +278,9 @@ export function buildOtlpLogRecords(
         job_id: report.jobId,
         'logger.name': 'chat_history',
         'session.report': sessionReportJson,
+        // Top-level attribute so the obs receiver's session-report
+        // branch reads it directly via `log.attributes.agent_id`.
+        agent_id: agentId,
         agent_name: agentName,
         sdk_version: sdkVersion,
         room_tags: roomTags,
@@ -299,6 +327,35 @@ function blobBytes(bytes: Uint8Array): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }
 
+/**
+ * Mirror Python's tagger-tags injection: the obs server's
+ * extractAgentId reads agent_id from rawReport.tags[] (looking for a
+ * `agent_id:<value>` prefix string), not from the protobuf recording
+ * header's roomTags. Without this, the multipart arrives first,
+ * INSERT INTO sessions runs with agent_id=null, the column is NOT
+ * NULL → 400 missing_agent_id, and the OTLP record landing moments
+ * later has no row to UPDATE. Stuffing the same prefix tags Python's
+ * Tagger emits (`agent_id:<uuid>`, `account_id:<v>`, `transport:<v>`,
+ * …) into the chat_history JSON's tags[] field makes obs's existing
+ * extractor work for the Node SDK too.
+ *
+ * Exported as a pure helper so tests can pin the contract without
+ * mocking the fetch boundary.
+ */
+export function injectRoomTagsIntoChatHistory(
+  chatHistoryJson: Record<string, unknown>,
+  roomTags: Record<string, string>,
+): Record<string, unknown> {
+  const prefixTags = Object.entries(roomTags).map(([k, v]) => `${k}:${v}`);
+  const existingTags = Array.isArray(chatHistoryJson.tags)
+    ? (chatHistoryJson.tags as unknown[]).filter((t): t is string => typeof t === 'string')
+    : [];
+  return {
+    ...chatHistoryJson,
+    tags: Array.from(new Set([...existingTags, ...prefixTags])),
+  };
+}
+
 async function uploadRecordingCallback(
   obsUrl: string,
   authHeaders: Record<string, string>,
@@ -307,9 +364,15 @@ async function uploadRecordingCallback(
 ): Promise<void> {
   const formData = new FormData();
   formData.append('header', new Blob([blobBytes(recordingHeader(report, roomTags))], { type: 'application/protobuf' }), 'header.binpb');
+
+  const chatHistoryJson = injectRoomTagsIntoChatHistory(
+    report.chatHistory.toJSON({ excludeTimestamp: false }) as Record<string, unknown>,
+    roomTags,
+  );
+
   formData.append(
     'chat_history',
-    new Blob([JSON.stringify(report.chatHistory.toJSON({ excludeTimestamp: false }))], { type: 'application/json' }),
+    new Blob([JSON.stringify(chatHistoryJson)], { type: 'application/json' }),
     'chat_history.json',
   );
 
@@ -337,6 +400,7 @@ async function uploadRecordingCallback(
 }
 
 export async function uploadReport(options: {
+  agentId: string;
   agentName: string;
   session: any;
   callId: string;
@@ -351,6 +415,7 @@ export async function uploadReport(options: {
   if (!obsUrl) return;
 
   const {
+    agentId,
     agentName,
     session,
     callId,
@@ -363,7 +428,7 @@ export async function uploadReport(options: {
   } = options;
 
   const report = buildReport(session, callId, recordingPath, recordingStartedAt);
-  const roomTags = buildRoomTags({ agentName, accountId, metadata, transport, direction });
+  const roomTags = buildRoomTags({ agentId, agentName, accountId, metadata, transport, direction });
   const authHeaders = await buildBearerAuthHeaders();
 
   console.log(`Uploading native LiveKit observability for ${callId} to ${obsUrl} (account_id=${accountId})`);
@@ -371,6 +436,6 @@ export async function uploadReport(options: {
   // events/options/usage onto it via UPDATE. If OTLP arrives first the UPDATE
   // no-ops and the patch is lost, leaving raw_report with only chat_history.
   await uploadRecordingCallback(obsUrl, authHeaders, report, roomTags);
-  await uploadOtlpLogs(obsUrl, authHeaders, report, buildOtlpLogRecords(report, agentName, roomTags));
+  await uploadOtlpLogs(obsUrl, authHeaders, report, buildOtlpLogRecords(report, agentId, agentName, roomTags));
   console.log(`Native LiveKit observability uploaded for ${callId}`);
 }

@@ -4,6 +4,13 @@
  * Handles SIP registration, call routing, HTTP server (health/worker/metrics/call),
  * CLI (start/dev/debug), and call lifecycle management.
  *
+ * Shutdown behavior (SIGINT/SIGTERM): active calls are hung up, cleanup is
+ * bounded by short timeouts, then the process force-exits via
+ * `process.exit(0)`. The Rust endpoint owns background threads that can pin
+ * libuv, so natural exit isn't reliable. Flush recordings / observability
+ * POSTs per-session (e.g., from `ctx.session.on("close", ...)`) — NOT at
+ * server shutdown.
+ *
  * Usage:
  *   const server = new AgentServer({ sipUsername: '...', sipPassword: '...' });
  *
@@ -15,17 +22,21 @@
  *   server.run();
  */
 
-import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer, type Server, type IncomingMessage } from 'node:http';
 import { cpus } from 'node:os';
 import { hostname } from 'node:os';
-import { mkdirSync, existsSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import { SipEndpoint } from 'agent-transport';
-import { initializeLogger, InferenceRunner, runWithJobContext, log as agentLog, voice } from '@livekit/agents';
+import { initializeLogger, InferenceRunner, runWithJobContext, log as agentLog } from '@livekit/agents';
 import { JobContext } from './session_context.js';
-import { uploadReport, getObservabilityUrl } from './observability.js';
+import { logObservabilityStatus, getObservabilityUrl } from './observability.js';
+import { finalizeSession } from './_session_finalize.js';
+import { runServerCleanup, forceShutdownAgentSession, installUnhandledRejectionHandler, registerSignalCleanup } from './_session_teardown.js';
+import { brokerFor, isAudioEvent } from './_audio_events.js';
 
 export class JobProcess {
   userData: Record<string, unknown> = {};
+  executorType: unknown = null;
 }
 
 export interface AgentServerOptions {
@@ -35,6 +46,10 @@ export interface AgentServerOptions {
   sipPassword: string;
   host?: string;
   port?: number;
+  /** Stable developer-supplied identifier (typically UUID4). Mandatory:
+   * obs's agents view keys on it; agent_transport_sessions.agent_id is
+   * NOT NULL. Throws at construction if missing. */
+  agentId?: string;
   agentName?: string;
   auth?: (req: IncomingMessage) => boolean | Promise<boolean>;
 }
@@ -92,6 +107,7 @@ export class AgentServer {
   private sipPassword: string;
   private host: string;
   private port: number;
+  private agentId: string;
   private agentName: string;
   private authFn?: (req: IncomingMessage) => boolean | Promise<boolean>;
 
@@ -130,6 +146,12 @@ export class AgentServer {
     this.sipPassword = opts.sipPassword ?? process.env.SIP_PASSWORD ?? '';
     this.host = opts.host ?? '0.0.0.0';
     this.port = opts.port ?? parseInt(process.env.PORT ?? '8080', 10);
+    // agent_id (opt or AGENT_ID env) is OPTIONAL — the server runs fine
+    // without it. It's only required to upload observability (obs keys on it;
+    // the sessions table is NOT NULL), so when it's unset while
+    // AGENT_OBSERVABILITY_URL is configured we warn at boot and skip the upload
+    // (see uploadReport) rather than hard-break servers that don't use obs.
+    this.agentId = opts.agentId ?? process.env.AGENT_ID ?? '';
     this.agentName = opts.agentName ?? 'sip-agent';
     this.authFn = opts.auth;
   }
@@ -207,11 +229,9 @@ export class AgentServer {
    */
   async run(): Promise<void> {
     // Handle unhandled rejections from LiveKit SDK TTS abort paths gracefully
-    // (StreamAdapter rejects with undefined when TTS is cancelled during interruption)
-    process.on('unhandledRejection', (reason) => {
-      if (reason === undefined || reason === null) return; // TTS abort — benign
-      console.error('Unhandled rejection:', reason);
-    });
+    // (StreamAdapter rejects with undefined when TTS is cancelled during
+    // interruption). Idempotent — safe if both servers run in one process.
+    installUnhandledRejectionHandler();
 
     // Strip tsx/ts-node loader hooks from execArgv before any child process forks
     // (pino-pretty worker, inference subprocess). These hooks corrupt IPC channels.
@@ -316,6 +336,11 @@ export class AgentServer {
 
     // Create SIP endpoint and register
     this.ep = new SipEndpoint({ sipServer: this.sipServer });
+    // This server's sipEventLoop is the single reader of the endpoint event
+    // channel — claim the audio-event broker so it dispatches to us (and
+    // suppresses its standalone self-pump, preserving the single-reader
+    // invariant). SipAudioOutput awaits async-id completions via this broker.
+    brokerFor(this.ep).claimFeeder();
     this.ep.register(this.sipUsername, this.sipPassword);
 
     // Wait for registration
@@ -330,50 +355,45 @@ export class AgentServer {
     this.startHttpServer();
     console.log(`HTTP server on http://${this.host}:${this.port}`);
 
-    const obsUrl = getObservabilityUrl();
-    if (obsUrl) {
-      console.log(`Observability enabled, target ${obsUrl}`);
-    }
+    logObservabilityStatus(this.agentId);
 
     // Start SIP event loop. Track the promise so we can await its exit
     // during shutdown — without this the infinite while loop would pin
     // Node's event loop forever.
     const eventLoopDone = this.sipEventLoop();
 
-    // Wait for shutdown signal
-    await new Promise<void>((resolve) => {
-      const onSignal = () => {
-        this.shutdownRequested = true;
-        resolve();
-      };
-      process.on('SIGINT', onSignal);
-      process.on('SIGTERM', onSignal);
-    });
-
-    console.log('Shutting down...');
-
-    // Drain active calls with 10-second timeout
-    if (this.activeCalls.size > 0) {
-      console.log(`Draining ${this.activeCalls.size} active call(s)...`);
-      await Promise.race([
-        Promise.allSettled([...this.activeCalls.values()].map((c) => c.promise)),
-        new Promise<void>((resolve) => setTimeout(() => {
-          console.warn('Shutdown timeout reached (10s), forcing exit');
-          resolve();
-        }, 10000)),
-      ]);
-    }
-
-    this.loadMonitor.stop();
-    if (this.inferenceExecutor) {
-      try { await this.inferenceExecutor.close(); } catch {}
-    }
-    this.httpServer?.close();
-    this.ep?.shutdown();
-    // Wait for the event loop to actually exit so Node can release the
-    // libuv handle and the process can terminate. The shutdown sentinel
-    // pushed by ep.shutdown() above wakes the loop immediately.
+    // On signal: hang up everything, run critical cleanup with short
+    // timeouts, then process.exit. The Rust endpoint owns a background
+    // thread that pins libuv, so natural exit isn't reliable — we force it.
+    // Idempotent registration: the signal listeners install once per process
+    // and run every registered server's cleanup, so two servers (or a second
+    // run()) don't double-register listeners.
+    registerSignalCleanup(() => this.runCleanup());
     await eventLoopDone;
+  }
+
+  /**
+   * Hang up active calls, drain ancillary resources with short timeouts.
+   *
+   * Thin wrapper around {@link runServerCleanup} so the signal-handler path
+   * stays a one-liner and tests can drive the shared cleanup helper without
+   * loading the native `agent-transport` binding.
+   */
+  async runCleanup(): Promise<void> {
+    this.shutdownRequested = true;
+    await runServerCleanup({
+      activeSessionIds: () => this.activeCalls.keys(),
+      hangup: (id) => this.ep?.hangup(id),
+      stopLoadMonitor: () => this.loadMonitor.stop(),
+      inferenceExecutor: this.inferenceExecutor ?? null,
+      closeHttpServer: () => {
+        if (this.httpServer) {
+          try { (this.httpServer as any).closeAllConnections?.(); } catch {}
+          this.httpServer.close();
+        }
+      },
+      shutdownEndpoint: () => this.ep?.shutdown(),
+    });
   }
 
   /**
@@ -399,6 +419,15 @@ export class AgentServer {
       // waiting for the next 1 s waitForEvent timeout, then exit cleanly.
       if (ev.eventType === 'shutdown') {
         break;
+      }
+
+      // Route async-id audio completion events (audio_capture_complete /
+      // audio_playout_complete / audio_capture_error) to the broker, which
+      // resolves the pending SipAudioOutput captureFrame / waitForPlayout
+      // awaits. Must happen before call-lifecycle routing.
+      if (isAudioEvent(ev)) {
+        brokerFor(this.ep!).dispatch(ev);
+        continue;
       }
 
       if (ev.eventType === 'call_ringing' && ev.session) {
@@ -436,29 +465,15 @@ export class AgentServer {
         const reason = ev.reason ?? 'unknown';
         console.log(`Call ${sessionId} terminated (reason=${reason})`);
 
-        // Shut down the session gracefully BEFORE emitting
-        // participant_disconnected. LiveKit's default handler calls
-        // `_closeSoon({ drain: false })`, which force-interrupts any in-flight
-        // LLM/TTS response — the final assistant message (e.g. the reply
-        // after a tool call) would never land in chat_history. Calling
-        // `shutdown({ drain: true })` first sets the closing state so the
-        // subsequent `_closeSoon` becomes a no-op and the session drains
-        // normally, letting in-flight speech finalize into history.
         const active = this.activeCalls.get(sessionId);
-        if (active?.ctx?.session?.shutdown) {
-          try {
-            active.ctx.session.shutdown({ drain: true });
-          } catch (err) {
-            console.warn(
-              `Graceful session shutdown failed for ${sessionId}; falling back to default close`,
-              err,
-            );
-          }
-        }
+        // Synchronously begin tearing down the AgentSession so a buffered STT
+        // transcript delivered after disconnect can't trigger a wasted LLM +
+        // TTS turn on a dead call (issue #83). Must run before the Room facade
+        // emits participant_disconnected (which schedules the async close).
+        forceShutdownAgentSession(active?.ctx?.session);
 
-        // Emit participant_disconnected on Room facade (matches LiveKit WebRTC).
-        // RoomIO._on_participant_disconnected calls _closeSoon({ drain: false }),
-        // which is a no-op here because the session is already closing.
+        // Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
+        // RoomIO._on_participant_disconnected will call _close_soon() → session closes
         if (active?.room) {
           active.room.emitParticipantDisconnected();
         }
@@ -503,6 +518,7 @@ export class AgentServer {
       direction,
       endpoint: this.ep!,
       userdata: this.userdata,
+      agentId: this.agentId,
       agentName: this.agentName,
       callEnded,
       resolveCallEnded: resolveEnded,
@@ -558,60 +574,19 @@ export class AgentServer {
         const durationSec = (performance.now() - callStart) / 1000;
         this.sipCallDurations.push(durationSec);
 
-        // Log usage and upload session report
-        if (ctx.session) {
-          try {
-            const usage = (ctx.session as any).usage;
-            if (usage) {
-              console.log(`Call ${sessionId} usage:`, JSON.stringify(usage));
-            }
-          } catch {}
-
-          // Wait for natural session close (preserves in-flight LLM/TTS responses in history)
-          // The participant_disconnected event triggers _close_soon() which does a graceful close.
-          try {
-            await new Promise<void>((resolve) => {
-              const timer = setTimeout(resolve, 5000);
-              ctx.session.on('close', () => { clearTimeout(timer); resolve(); });
-            });
-          } catch {
-            try { await (ctx.session as any).close(); } catch {}
-          }
-
-          // Stop recording and wait for file to be finalized
-          if (recPath) {
-            try { this.ep!.stopRecording(sessionId); } catch {}
-            for (let i = 0; i < 20; i++) {
-              if (existsSync(recPath)) break;
-              await new Promise(r => setTimeout(r, 100));
-            }
-          }
-
-          // Upload session report (transcript, audio, metrics).
-          // Cleanup runs in finally so the on-disk recording is always removed
-          // after an upload attempt — including when the upload fails.
-          try {
-            await uploadReport({
-              agentName: this.agentName,
-              session: ctx.session,
-              callId: sessionId,
-              accountId: ctx.accountId,
-              metadata: ctx.metadata,
-              direction: ctx.direction,
-              recordingPath: recPath,
-              recordingStartedAt,
-              transport: 'sip',
-            });
-          } catch (e) {
-            console.warn(`Failed to upload session report for call ${sessionId}:`, e);
-          } finally {
-            if (recPath) {
-              try { const { unlinkSync } = await import('node:fs'); unlinkSync(recPath); } catch (e) {
-                console.warn(`Failed to clean up recording ${recPath}:`, e);
-              }
-            }
-          }
-        }
+        await finalizeSession({
+          session: ctx.session,
+          endpoint: this.ep!,
+          sessionId,
+          transport: 'sip',
+          agentId: this.agentId,
+          agentName: this.agentName,
+          accountId: ctx.accountId,
+          metadata: ctx.metadata,
+          direction: ctx.direction,
+          recordingPath: recPath,
+          recordingStartedAt,
+        });
 
         // Hangup
         try { this.ep!.hangup(sessionId); } catch {}

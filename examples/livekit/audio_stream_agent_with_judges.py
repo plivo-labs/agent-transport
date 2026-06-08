@@ -52,6 +52,11 @@ Optional for dashboard account correlation:
 Usage:
     uv run examples/livekit/audio_stream_agent_with_judges.py start
     uv run examples/livekit/audio_stream_agent_with_judges.py dev
+
+Companion pytest sims (same agent_id, so live + sim land on one agent
+record in the obs dashboard):
+    agent-observability/plugins/examples/pytest/pytest_shopify_agent.py
+    agent-observability/plugins/examples/pytest/pytest_shopify_with_judges.py
 """
 
 import logging
@@ -284,6 +289,14 @@ server = AudioStreamServer(
     listen_addr=os.environ.get("AUDIO_STREAM_ADDR", "0.0.0.0:8765"),
     plivo_auth_id=os.environ.get("PLIVO_AUTH_ID", ""),
     plivo_auth_token=os.environ.get("PLIVO_AUTH_TOKEN", ""),
+    # Stable opaque UUID4 — uploaded with every session so the obs
+    # dashboard groups this agent's calls together. Matches the id used
+    # by the pytest simulation file
+    # `agent-observability/plugins/examples/pytest/pytest_shopify_agent.py`
+    # so live conversation evals and simulation evals land under one
+    # agent in the dashboard. AGENT_ID env wins when set.
+    agent_id=os.environ.get("AGENT_ID", "da3d4071-34ce-41b2-8c9e-05eef23a43bb"),
+    agent_name=os.environ.get("AGENT_NAME", "northstar-shopify-bot"),
 )
 
 

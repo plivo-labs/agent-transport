@@ -129,8 +129,13 @@ pub trait StreamProtocol: Send + Sync + 'static {
     /// Build a "send DTMF" command.
     fn build_send_dtmf(&self, digits: &str) -> String;
 
-    /// Hang up the call via provider's API (REST, WebSocket command, etc.).
-    /// Called from a blocking context (tokio runtime).
+    /// Hang up the call via the provider's API (REST, WebSocket command, etc.).
+    ///
+    /// MUST be fire-and-forget: spawn the network work onto `rt` and return
+    /// immediately. The caller is a PyO3 pymethod invoked from Python, so this
+    /// must NOT block the calling thread for the provider round-trip. The
+    /// endpoint's `shutdown` gives detached tasks a bounded window to flush
+    /// before the runtime is dropped.
     fn hangup(&self, call_id: &str, rt: &tokio::runtime::Runtime, auth_id: Option<&str>, auth_token: Option<&str>);
 
     /// Build a "mute stream" command to pause audio output on the provider side.

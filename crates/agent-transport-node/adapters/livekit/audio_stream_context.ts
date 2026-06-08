@@ -9,7 +9,7 @@
  *   });
  */
 
-import { mkdirSync, writeSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import type { AudioStreamEndpoint } from 'agent-transport';
 import { SipAudioInput } from './sip_audio_input.js';
 import { SipAudioOutput } from './sip_audio_output.js';
@@ -24,6 +24,9 @@ export interface AudioStreamJobContextOptions {
   extraHeaders: Record<string, string>;
   endpoint: AudioStreamEndpoint;
   userdata: Record<string, unknown>;
+  /** Stable developer-supplied identifier — plumbed through from the
+   * AudioStreamServer constructor. */
+  agentId?: string;
   agentName?: string;
   callEnded: Promise<void>;
   resolveCallEnded: () => void;
@@ -45,6 +48,7 @@ export class AudioStreamJobContext {
   readonly proc: JobProcess;
   readonly job: { id: string; agentName: string; enableRecording: boolean; room: TransportRoom };
   readonly workerId = 'local';
+  readonly worker_id = 'local';
   readonly sessionDirectory: string;
   readonly inferenceExecutor: unknown;
   metadata: Record<string, unknown> = {};
@@ -98,6 +102,12 @@ export class AudioStreamJobContext {
    * After setting, call session.start({ agent, room: ctx.room }).
    */
   set session(session: any) {
+    if (session == null) {
+      throw new TypeError(
+        "JobContext.session cannot be set to null/undefined. Assign a "
+        + "valid voice.AgentSession instance (or use ctx.session to read)."
+      );
+    }
     this._session = session;
     this._primaryAgentSession = session;
 
@@ -117,7 +127,6 @@ export class AudioStreamJobContext {
         const tts = (session as any).tts;
         if (tts?.setMaxListeners) {
           tts.setMaxListeners(100);
-          writeSync(2, `[AudioStreamContext] TTS maxListeners set to 100\n`);
         }
       } catch {}
     };
@@ -220,5 +229,20 @@ export class AudioStreamJobContext {
 
   initRecording(): void {
     // agent-transport owns mixed transport recording; LiveKit RecorderIO is disabled.
+  }
+
+  get agent(): any {
+    return this.room.localParticipant;
+  }
+
+  async waitForParticipant(identity?: string): Promise<any> {
+    const participants = Array.from(this.room.remoteParticipants.values());
+    return participants.find((p: any) => !identity || p.identity === identity) ?? participants[0];
+  }
+
+  addParticipantEntrypoint(callback: (job: AudioStreamJobContext, participant: any) => unknown): void {
+    this.waitForParticipant()
+      .then((participant) => callback(this, participant))
+      .catch(() => {});
   }
 }
