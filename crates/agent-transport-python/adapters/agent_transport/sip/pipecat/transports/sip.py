@@ -3,8 +3,11 @@
 Manages SipEndpoint lifecycle, SIP registration, session acceptance,
 and per-session SipTransport creation.
 
-Uses a single event dispatcher loop (matching LiveKit AgentServer pattern)
-to avoid event-stealing race conditions between server and per-session loops.
+Events flow through ``agent_transport._ffi_queue.GLOBAL_DICT`` — the
+dict-shaped sibling of the LiveKit-shape FfiQueue. This lets pipecat
+and a LiveKit adapter coexist in the same process: both share the
+single ``ep.set_event_sink`` slot via :func:`install_pipecat_sink`,
+and each adapter subscribes to the broker shape it expects.
 
 Usage:
     from agent_transport.sip.pipecat import SipServerTransport
@@ -20,6 +23,12 @@ Usage:
         ...
 
     server.run()
+
+Shutdown behavior (SIGINT/SIGTERM): the ``run()`` finally block hangs up
+active sessions, closes the Rust endpoint with a 2s timeout, then
+force-exits via ``os._exit(0)``. Flush recordings / observability uploads
+per-session (e.g., on ``on_client_disconnected``) since ``os._exit`` skips
+Python's normal finalization.
 """
 
 import asyncio
@@ -33,6 +42,8 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional
 from loguru import logger
 
 from agent_transport import SipEndpoint
+from agent_transport._event_sink import _on_event_from_rust
+from agent_transport._ffi_queue import GLOBAL_DICT
 
 try:
     from pipecat.transports.base_transport import TransportParams
@@ -319,18 +330,31 @@ class SipServerTransport:
             comfort_noise=self._comfort_noise,
         )
 
-        # Register with SIP server
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None, lambda: self._ep.register(self._sip_username, self._sip_password)
+        # Install the shared event sink so events flow into GLOBAL_DICT
+        # (and the LiveKit-shape GLOBAL alongside it). Must precede the
+        # register call so the "registered" event is captured.
+        self._ep.set_event_sink(_on_event_from_rust)
+        reg_queue = GLOBAL_DICT.subscribe(
+            filter_fn=lambda e: e.get("type") in ("registered", "registration_failed"),
         )
 
-        event = await loop.run_in_executor(
-            None, lambda: self._ep.wait_for_event(timeout_ms=10000)
-        )
-        if not event or event["type"] != "registered":
-            logger.error("SIP registration failed: {}", event)
-            return
+        # Register with SIP server
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                None, lambda: self._ep.register(self._sip_username, self._sip_password)
+            )
+
+            try:
+                event = await asyncio.wait_for(reg_queue.get(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.error("SIP registration timed out after 10s")
+                return
+            if not event or event.get("type") != "registered":
+                logger.error("SIP registration failed: {}", event)
+                return
+        finally:
+            GLOBAL_DICT.unsubscribe(reg_queue)
 
         logger.info("Registered as {}@{}", self._sip_username, self._sip_server)
 
@@ -339,102 +363,175 @@ class SipServerTransport:
         if HAS_AIOHTTP and self._http_port:
             http_task = asyncio.create_task(self._run_http_server())
 
+        # Install SIGTERM handler so container stops hit the finally block.
+        # SIGINT is already turned into CancelledError by asyncio's default
+        # handler; SIGTERM without an explicit handler would kill abruptly.
+        import signal as _signal
+        stop = asyncio.Event()
+        for sig in (_signal.SIGINT, _signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+            except (NotImplementedError, ValueError):
+                pass  # Windows / non-main-thread / already handled
+        event_loop_task = asyncio.create_task(self._event_loop())
+        stop_task = asyncio.create_task(stop.wait())
+
         try:
-            await self._event_loop()
+            done, _pending = await asyncio.wait(
+                {event_loop_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # Surface any crash from the event loop task before we tear
+            # everything down — otherwise Python GC logs
+            # "Task exception was never retrieved" and we lose the signal.
+            if event_loop_task in done and not event_loop_task.cancelled():
+                exc = event_loop_task.exception()
+                if exc is not None:
+                    logger.error("SIP event loop crashed: {}", exc)
         except asyncio.CancelledError:
             pass
         except KeyboardInterrupt:
             pass
         finally:
-            if self._active_sessions:
-                logger.info("Draining {} active session(s)...", len(self._active_sessions))
+            # Hang up active calls first (parallel-ish, per session), then
+            # close the endpoint (which also cascade-hangs-up anything left
+            # and unregisters), then force-exit. Rust owns background threads
+            # that pin the process — os._exit is the only reliable way out.
+            import os as _os
+            import sys as _sys
+            try:
+                if self._ep is not None:
+                    for session_id in list(self._active_sessions.keys()):
+                        try:
+                            self._ep.hangup(session_id)
+                        except Exception:
+                            pass
                 for task in self._active_sessions.values():
                     task.cancel()
-                await asyncio.gather(*self._active_sessions.values(), return_exceptions=True)
-            if http_task:
-                http_task.cancel()
+                event_loop_task.cancel()
+                stop_task.cancel()
+                if http_task:
+                    http_task.cancel()
+                    try:
+                        await asyncio.wait_for(http_task, timeout=1.0)
+                    except Exception:
+                        pass
+                if self._ep is not None:
+                    try:
+                        await asyncio.wait_for(
+                            loop.run_in_executor(None, self._ep.shutdown),
+                            timeout=2.0,
+                        )
+                    except Exception:
+                        pass
+            finally:
+                logger.info("Server shut down")
+                # Flush stdio so the last log lines aren't lost —
+                # os._exit skips normal Python finalization.
                 try:
-                    await http_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            if self._ep:
-                try:
-                    await loop.run_in_executor(None, self._ep.shutdown)
+                    _sys.stdout.flush()
+                    _sys.stderr.flush()
                 except Exception:
                     pass
-            logger.info("Server shut down")
+                _os._exit(0)
 
     async def _event_loop(self) -> None:
         """Single event dispatcher — reads ALL events, routes to correct session.
 
-        Avoids event-stealing race between server loop and per-session loops.
-        With the post-answer event refactor, the flow is:
+        Subscribes to ``GLOBAL_DICT`` (the dict-shaped FfiQueue fed by
+        the shared event sink). Each call lifecycle event is dispatched
+        to either a server-level handler (``call_ringing``,
+        ``call_answered``) or the matching per-session queue
+        (``call_terminated``, ``dtmf_received``, ``beep_*``,
+        ``audio_capture_*``). The per-session queue is consumed by
+        ``SipInputTransport._event_loop_from_queue``.
 
-        - `call_ringing`: pre-answer observational event. Fires server-level
-          `ringing` hook. Rust auto-answers immediately after.
-        - `call_answered`: call is active. Create the agent session.
+        Audio-async-id events (``audio_capture_complete``, etc.) are
+        routed here so they reach the per-session ``_handle_event``
+        which puts them on the transport's private FfiQueue —
+        OutputTransport's per-frame ``wait_for`` then matches.
 
-        Outbound calls are owned by `SipServer.call()` which reserves the
-        session id in `_outbound_session_ids` before the event loop sees
-        `call_answered`, so outbound sessions aren't double-created.
+        Outbound calls are owned by ``SipServer.call()`` which reserves
+        the session id in ``_outbound_session_ids`` before the event
+        loop sees ``call_answered``, so outbound sessions aren't
+        double-created.
         """
-        loop = asyncio.get_running_loop()
+        queue = GLOBAL_DICT.subscribe()
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
 
-        while True:
-            event = await loop.run_in_executor(
-                None, lambda: self._ep.wait_for_event(timeout_ms=1000)
-            )
-            if not event:
-                continue
+                ev_type = event.get("type", "")
 
-            ev_type = event["type"]
+                if ev_type == "shutdown":
+                    logger.debug("pipecat sip event loop received shutdown sentinel")
+                    break
 
-            if ev_type == "shutdown":
-                logger.debug("pipecat sip event loop received shutdown sentinel")
-                break
+                if ev_type == "call_ringing":
+                    session = event["session"]
+                    session_id = session.session_id
+                    logger.info(
+                        "Incoming call {} ringing (from={}, call_uuid={})",
+                        session_id, session.remote_uri, session.call_uuid,
+                    )
+                    self._emit_server_event("ringing", session)
 
-            if ev_type == "call_ringing":
-                session = event["session"]
-                session_id = session.session_id
-                logger.info(
-                    "Incoming call {} ringing (from={}, call_uuid={})",
-                    session_id, session.remote_uri, session.call_uuid,
-                )
-                self._emit_server_event("ringing", session)
+                elif ev_type == "call_answered":
+                    session = event["session"]
+                    session_id = session.session_id
+                    if session_id in self._outbound_session_ids:
+                        # Owned by SipServer.call() — skip to avoid duplicate.
+                        self._outbound_session_ids.discard(session_id)
+                        continue
+                    if session_id in self._active_sessions:
+                        continue
+                    session_data = _session_to_dict(session)
+                    self._start_session(session_id, session_data)
 
-            elif ev_type == "call_answered":
-                session = event["session"]
-                session_id = session.session_id
-                if session_id in self._outbound_session_ids:
-                    # Owned by SipServer.call() — skip to avoid duplicate.
+                elif ev_type == "call_terminated":
+                    session = event["session"]
+                    session_id = session.session_id
                     self._outbound_session_ids.discard(session_id)
-                    continue
-                if session_id in self._active_sessions:
-                    continue
-                session_data = _session_to_dict(session)
-                self._start_session(session_id, session_data)
+                    q = self._session_event_queues.get(session_id)
+                    if q:
+                        await q.put(event)
 
-            elif ev_type == "call_terminated":
-                session = event["session"]
-                session_id = session.session_id
-                self._outbound_session_ids.discard(session_id)
-                q = self._session_event_queues.get(session_id)
-                if q:
-                    await q.put(event)
+                elif ev_type == "dtmf_received":
+                    session_id = event.get("session_id", "")
+                    q = self._session_event_queues.get(session_id)
+                    if q:
+                        await q.put(event)
 
-            elif ev_type == "dtmf_received":
-                session_id = event.get("session_id", "")
-                q = self._session_event_queues.get(session_id)
-                if q:
-                    await q.put(event)
+                elif ev_type in ("beep_detected", "beep_timeout"):
+                    session_id = event.get("session_id", "")
+                    q = self._session_event_queues.get(session_id)
+                    if q:
+                        await q.put(event)
+                    else:
+                        logger.warning("No session queue for {} event on call {} (session not yet started?)", ev_type, session_id)
 
-            elif ev_type in ("beep_detected", "beep_timeout"):
-                session_id = event.get("session_id", "")
-                q = self._session_event_queues.get(session_id)
-                if q:
-                    await q.put(event)
-                else:
-                    logger.warning("No session queue for {} event on call {} (session not yet started?)", ev_type, session_id)
+                elif ev_type in (
+                    "audio_capture_complete",
+                    "audio_playout_complete",
+                    "audio_buffer_drained",
+                    "audio_capture_error",
+                ):
+                    # Per-frame backpressure: route to the matching
+                    # session queue so InputTransport's _handle_event
+                    # forwards into the transport's private FfiQueue
+                    # where OutputTransport's per-frame wait_for picks
+                    # them up. Drop silently for unknown sessions —
+                    # late teardown can produce events for a session
+                    # whose queue we've already removed.
+                    session_id = event.get("session_id", "")
+                    q = self._session_event_queues.get(session_id)
+                    if q:
+                        await q.put(event)
+        finally:
+            GLOBAL_DICT.unsubscribe(queue)
 
     def _start_session(self, session_id: str, session_data: dict) -> None:
         """Create transport and spawn session handler task."""

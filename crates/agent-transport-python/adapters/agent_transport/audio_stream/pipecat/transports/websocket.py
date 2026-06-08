@@ -20,6 +20,10 @@ Usage:
         ...
 
     server.run()
+
+Shutdown behavior (SIGINT/SIGTERM): same as the Pipecat SIP transport —
+hangup active sessions, close endpoint (2s), then ``os._exit(0)``. Flush
+recordings / observability per-session, not at server shutdown.
 """
 
 import asyncio
@@ -32,6 +36,8 @@ from typing import Any, Callable, Coroutine, Dict, Optional
 from loguru import logger
 
 from agent_transport import AudioStreamEndpoint
+from agent_transport._event_sink import _on_event_from_rust
+from agent_transport._ffi_queue import GLOBAL_DICT
 
 try:
     from pipecat.transports.base_transport import TransportParams
@@ -103,8 +109,11 @@ class WebsocketServerTransport:
     and checkpoint-based audio pacing. Manages session lifecycle and creates
     per-session AudioStreamTransport instances.
 
-    Uses a single event dispatcher loop (matching LiveKit AgentServer pattern)
-    to avoid event-stealing race conditions between server and per-session loops.
+    The server runs one dispatcher loop that subscribes to
+    ``GLOBAL_DICT`` and routes events to per-session asyncio queues
+    consumed by each ``AudioStreamInputTransport``. Audio backpressure
+    completion events are routed too, so OutputTransport's
+    ``write_audio_frame`` ``wait_for`` resolves.
     """
 
     def __init__(
@@ -213,6 +222,11 @@ class WebsocketServerTransport:
             input_sample_rate=self._sample_rate,
             output_sample_rate=self._sample_rate,
         )
+        # Install the shared event sink so events flow into GLOBAL_DICT
+        # (and the LiveKit-shape GLOBAL alongside it). Required so a
+        # process hosting both pipecat + a LiveKit adapter doesn't see
+        # one of them silently lose events.
+        self._ep.set_event_sink(_on_event_from_rust)
         logger.info("WebSocket server listening on ws://{}", self._listen_addr)
 
         # Start HTTP server if aiohttp available and port configured
@@ -220,89 +234,160 @@ class WebsocketServerTransport:
         if HAS_AIOHTTP and self._http_port:
             http_task = asyncio.create_task(self._run_http_server())
 
+        # Install SIGTERM handler so container stops hit the finally block.
+        # SIGINT is already turned into CancelledError by asyncio's default
+        # handler; SIGTERM without an explicit handler would kill abruptly.
+        import signal as _signal
+        loop = asyncio.get_running_loop()
+        stop = asyncio.Event()
+        for sig in (_signal.SIGINT, _signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+            except (NotImplementedError, ValueError):
+                pass
+        event_loop_task = asyncio.create_task(self._event_loop())
+        stop_task = asyncio.create_task(stop.wait())
+
         try:
-            await self._event_loop()
+            done, _pending = await asyncio.wait(
+                {event_loop_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # Surface any crash from the event loop task before we tear
+            # everything down — otherwise Python GC logs
+            # "Task exception was never retrieved" and we lose the signal.
+            if event_loop_task in done and not event_loop_task.cancelled():
+                exc = event_loop_task.exception()
+                if exc is not None:
+                    logger.error("Audio stream event loop crashed: {}", exc)
         except asyncio.CancelledError:
             pass
         except KeyboardInterrupt:
             pass
         finally:
-            if self._active_sessions:
-                logger.info("Draining {} active session(s)...", len(self._active_sessions))
+            # Hang up active sessions first, then close the endpoint (which
+            # also cascade-hangs-up anything left), then force-exit. Rust
+            # owns background threads that pin the process — os._exit is the
+            # only reliable way out.
+            import os as _os
+            import sys as _sys
+            try:
+                if self._ep is not None:
+                    for session_id in list(self._active_sessions.keys()):
+                        try:
+                            self._ep.hangup(session_id)
+                        except Exception:
+                            pass
                 for task in self._active_sessions.values():
                     task.cancel()
-                await asyncio.gather(*self._active_sessions.values(), return_exceptions=True)
-            if http_task:
-                http_task.cancel()
+                event_loop_task.cancel()
+                stop_task.cancel()
+                if http_task:
+                    http_task.cancel()
+                    try:
+                        await asyncio.wait_for(http_task, timeout=1.0)
+                    except Exception:
+                        pass
+                if self._ep is not None:
+                    try:
+                        await asyncio.wait_for(
+                            loop.run_in_executor(None, self._ep.shutdown),
+                            timeout=2.0,
+                        )
+                    except Exception:
+                        pass
+            finally:
+                logger.info("Server shut down")
+                # Flush stdio so the last log lines aren't lost —
+                # os._exit skips normal Python finalization.
                 try:
-                    await http_task
-                except (asyncio.CancelledError, Exception):
+                    _sys.stdout.flush()
+                    _sys.stderr.flush()
+                except Exception:
                     pass
-            if self._ep:
-                await asyncio.get_running_loop().run_in_executor(None, self._ep.shutdown)
-            logger.info("Server shut down")
+                _os._exit(0)
 
     async def _event_loop(self) -> None:
         """Single event dispatcher — reads ALL events, routes to correct session.
 
-        With the post-answer event refactor, Plivo's WebSocket `start` maps
-        directly to Rust's `call_answered` — create the session immediately.
-        No pending map, no wait-for-first-media gate.
+        Subscribes to ``GLOBAL_DICT`` (the dict-shaped FfiQueue fed by
+        the shared event sink). Each event is dispatched to either a
+        server-level path (``call_answered`` creates a session) or the
+        matching per-session asyncio queue consumed by
+        ``AudioStreamInputTransport._event_loop_from_queue``. Audio
+        async-id events are routed here too so OutputTransport's
+        per-frame ``wait_for`` actually completes — previously the
+        server only routed lifecycle events and audio backpressure
+        was silently dropped.
         """
-        loop = asyncio.get_running_loop()
-
-        while True:
-            try:
-                event = await loop.run_in_executor(
-                    None, lambda: self._ep.wait_for_event(timeout_ms=1000)
-                )
-            except Exception:
-                logger.exception("wait_for_event failed")
-                break
-
-            if not event:
-                continue
-
-            try:
-                ev_type = event["type"]
-
-                if ev_type == "shutdown":
-                    logger.debug("pipecat audio_stream event loop received shutdown sentinel")
+        queue = GLOBAL_DICT.subscribe()
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                except Exception:
+                    logger.exception("audio_stream event loop fetch failed")
                     break
 
-                if ev_type == "call_answered":
-                    session = event["session"]
-                    session_id = session.session_id
-                    if session_id in self._active_sessions:
-                        continue
-                    session_data = _session_to_dict(session)
-                    logger.info("Session {} connected (call_uuid={})",
-                                session_id, session_data.get("call_uuid", ""))
-                    self._start_session(session_id, session_data)
+                try:
+                    ev_type = event.get("type", "")
 
-                elif ev_type == "call_terminated":
-                    session = event["session"]
-                    session_id = session.session_id
-                    # Route to per-session queue
-                    q = self._session_event_queues.get(session_id)
-                    if q:
-                        await q.put(event)
+                    if ev_type == "shutdown":
+                        logger.debug("pipecat audio_stream event loop received shutdown sentinel")
+                        break
 
-                elif ev_type == "dtmf_received":
-                    session_id = event.get("session_id", "")
-                    q = self._session_event_queues.get(session_id)
-                    if q:
-                        await q.put(event)
+                    if ev_type == "call_answered":
+                        session = event["session"]
+                        session_id = session.session_id
+                        if session_id in self._active_sessions:
+                            continue
+                        session_data = _session_to_dict(session)
+                        logger.info("Session {} connected (call_uuid={})",
+                                    session_id, session_data.get("call_uuid", ""))
+                        self._start_session(session_id, session_data)
 
-                elif ev_type in ("beep_detected", "beep_timeout"):
-                    session_id = event.get("session_id", "")
-                    q = self._session_event_queues.get(session_id)
-                    if q:
-                        await q.put(event)
-                    else:
-                        logger.warning("No session queue for {} event on session {} (session not yet started?)", ev_type, session_id)
-            except Exception:
-                logger.exception("Error handling WS event %r", event.get("type") if isinstance(event, dict) else event)
+                    elif ev_type == "call_terminated":
+                        session = event["session"]
+                        session_id = session.session_id
+                        # Route to per-session queue
+                        q = self._session_event_queues.get(session_id)
+                        if q:
+                            await q.put(event)
+
+                    elif ev_type == "dtmf_received":
+                        session_id = event.get("session_id", "")
+                        q = self._session_event_queues.get(session_id)
+                        if q:
+                            await q.put(event)
+
+                    elif ev_type in ("beep_detected", "beep_timeout"):
+                        session_id = event.get("session_id", "")
+                        q = self._session_event_queues.get(session_id)
+                        if q:
+                            await q.put(event)
+                        else:
+                            logger.warning("No session queue for {} event on session {} (session not yet started?)", ev_type, session_id)
+
+                    elif ev_type in (
+                        "audio_capture_complete",
+                        "audio_playout_complete",
+                        "audio_buffer_drained",
+                        "audio_capture_error",
+                    ):
+                        # Per-frame backpressure: route to the matching
+                        # session queue so InputTransport's
+                        # _handle_event forwards into the transport's
+                        # private FfiQueue.
+                        session_id = event.get("session_id", "")
+                        q = self._session_event_queues.get(session_id)
+                        if q:
+                            await q.put(event)
+                except Exception:
+                    logger.exception("Error handling WS event %r", event.get("type") if isinstance(event, dict) else event)
+        finally:
+            GLOBAL_DICT.unsubscribe(queue)
 
     def _start_session(self, session_id: str, session_data: dict) -> None:
         """Create transport and spawn session handler task."""

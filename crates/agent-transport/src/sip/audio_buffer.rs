@@ -1,21 +1,32 @@
 //! Shared audio buffer matching WebRTC C++ AudioSource's internal buffer.
 //!
-//! Architecture:
+//! Architecture (post-0.2.0 — event-queue model, LiveKit-faithful):
 //! - `send_audio` pushes samples under mutex, checks threshold
-//! - If below threshold: signals completion immediately
-//! - If above threshold: stores completion signal for deferred firing
-//! - RTP send loop drains samples under same mutex every 20ms
-//! - After draining, fires deferred completion if buffer dropped below threshold
+//! - **Every push always emits an `AudioCaptureComplete` event** —
+//!   immediately if buffer is below threshold, deferred (via
+//!   `pending_captures`) if above. Matches LiveKit's invariant that
+//!   every `capture_audio_frame` request produces exactly one
+//!   completion event (`livekit/rtc/audio_source.py:142-149`).
+//! - `add_pending_playout` is symmetric — immediate emit if buffer is
+//!   already empty, deferred otherwise.
+//! - RTP send loop drains samples under same mutex every 20ms.
+//! - After draining, emits `AudioCaptureComplete` for any async_id whose
+//!   threshold condition is now met, and `AudioPlayoutComplete` for any
+//!   playout-waiter whose buffer-empty condition is now met.
 //!
-//! This matches WebRTC's C++ InternalSource::capture_frame + audio_task_ exactly:
-//! - One buffer, one mutex
-//! - Immediate vs deferred on_complete callback
-//! - Only one deferred callback at a time
+//! **No `Box<dyn FnOnce() + Send>` callbacks are stored here.** Rust threads
+//! never invoke Python application code — events flow through the
+//! crossbeam channel to the central dispatch thread, which uses
+//! `loop.call_soon_threadsafe` to hand off to Python's asyncio loop.
+//! This eliminates the GIL+Mutex AB-BA deadlock that was hitting prod.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use tracing::debug;
 
+use crossbeam_channel::Sender;
+
+use crate::events::EndpointEvent;
 use crate::sync::LockExt;
 
 /// Default queue_size_ms matching _ParticipantAudioOutput production usage (200ms).
@@ -23,24 +34,19 @@ use crate::sync::LockExt;
 /// for tighter backpressure and faster interrupt response.
 const DEFAULT_QUEUE_SIZE_MS: u32 = 200;
 
-/// Completion callback — called from RTP send loop thread to signal Python.
-/// This is the equivalent of WebRTC's on_complete(ctx) callback.
-pub(crate) type CompletionCallback = Box<dyn FnOnce() + Send>;
-
-/// Inner state protected by mutex (matches WebRTC's mutex_-guarded fields).
+/// Inner state protected by mutex.
 struct Inner {
     /// PCM samples buffer (matches WebRTC's buffer_).
-    /// VecDeque for O(1) drain from front (WebRTC C++ uses deque-like circular buffer).
+    /// VecDeque for O(1) drain from front.
     pcm: VecDeque<i16>,
-    /// Deferred completion callback (matches WebRTC's on_complete_ + capture_userdata_)
-    /// Only one at a time — WebRTC rejects capture_frame if one is already pending.
-    pending_complete: Option<CompletionCallback>,
+    /// async_ids of pushes awaiting "buffer dropped below threshold".
+    /// VecDeque (FIFO) so pipelined captures resolve in submission order.
+    pending_captures: VecDeque<u64>,
     /// Flush flag — when set, pcm is cleared on next drain
     flush: bool,
-    /// Playout callback — fires when buffer drains to empty after flush.
-    /// Matches WebRTC's waitForPlayout() which resolves when all queued audio is consumed.
-    /// Per-flush: each flush() stores a new callback, replacing any previous one.
-    playout_callback: Option<CompletionCallback>,
+    /// async_ids of waiters awaiting "buffer drained to empty".
+    /// Multiple concurrent waiters are supported — all resolve when buffer empties.
+    pending_playouts: Vec<u64>,
 }
 
 /// Shared audio buffer for outbound audio.
@@ -53,99 +59,167 @@ pub(crate) struct AudioBuffer {
     capacity: usize,
     /// Sample rate used for debug logging
     sample_rate: u32,
+    /// Session id used to tag every emitted event so adapters can route correctly.
+    session_id: String,
+    /// Channel for emitting audio-completion events. The receiver is the
+    /// endpoint's event channel; events are picked up by `wait_for_event`
+    /// (Python/Node) and dispatched through the asyncio loop.
+    event_tx: Sender<EndpointEvent>,
 }
 
 impl AudioBuffer {
     /// Create with default queue_size_ms (200ms, matching _ParticipantAudioOutput production).
-    pub fn new() -> Self {
-        Self::with_queue_size(DEFAULT_QUEUE_SIZE_MS, 8000)
+    pub fn new(session_id: String, event_tx: Sender<EndpointEvent>) -> Self {
+        Self::with_queue_size(DEFAULT_QUEUE_SIZE_MS, 8000, session_id, event_tx)
     }
 
     /// Create with configurable queue_size_ms and sample_rate
     /// (matches WebRTC C++ InternalSource constructor).
     /// - notify_threshold = queue_size_ms * sample_rate / 1000
     /// - capacity = 2 * notify_threshold
-    pub fn with_queue_size(queue_size_ms: u32, sample_rate: u32) -> Self {
+    pub fn with_queue_size(
+        queue_size_ms: u32,
+        sample_rate: u32,
+        session_id: String,
+        event_tx: Sender<EndpointEvent>,
+    ) -> Self {
+        // Mirror LiveKit's `libwebrtc/src/native/audio_source.rs::NativeAudioSource::new`:
+        // `let queue_size_samples = (queue_size_ms * sample_rate * num_channels) / 1000;`
+        // We're mono-only today (num_channels = 1 implicitly), so the formula
+        // collapses to the same value. If a future change adds stereo support,
+        // this constructor MUST take num_channels and the multiplication MUST
+        // be reintroduced — otherwise queue_size_samples would be 2x undersized
+        // at stereo and LiveKit's 200 ms backpressure threshold would become
+        // 100 ms.
         let queue_size_samples = (queue_size_ms as u64 * sample_rate as u64 / 1000) as usize;
         let notify_threshold = queue_size_samples;
         let capacity = queue_size_samples + notify_threshold; // 2x, same as WebRTC C++
         debug!(
-            "AudioBuffer: queue_size_ms={} sample_rate={} threshold={} capacity={}",
-            queue_size_ms, sample_rate, notify_threshold, capacity
+            "AudioBuffer({}): queue_size_ms={} sample_rate={} threshold={} capacity={}",
+            session_id, queue_size_ms, sample_rate, notify_threshold, capacity
         );
         Self {
             inner: Mutex::new(Inner {
                 pcm: VecDeque::with_capacity(capacity),
-                pending_complete: None,
+                pending_captures: VecDeque::new(),
                 flush: false,
-                playout_callback: None,
+                pending_playouts: Vec::new(),
             }),
             notify_threshold,
             capacity,
             sample_rate,
+            session_id,
+            event_tx,
         }
     }
 
-    /// Push samples into the buffer (called from send_audio on Python thread).
+    /// Push samples into the buffer (called from send_audio on Python/tokio thread).
     ///
-    /// Matches WebRTC C++ InternalSource::capture_frame exactly:
-    /// 1. Check capacity → reject if full
-    /// 2. Append samples
-    /// 3. If below threshold → fire on_complete immediately
-    /// 4. If above threshold → store on_complete for deferred firing
-    pub fn push(&self, samples: &[i16], on_complete: CompletionCallback) -> Result<(), &'static str> {
+    /// **Always emits exactly one `AudioCaptureComplete { async_id }`** —
+    /// immediately if the buffer is at-or-below threshold after the push,
+    /// or deferred until a subsequent `drain` brings the buffer back
+    /// below threshold. This is the LiveKit invariant — every
+    /// `capture_audio_frame` request produces exactly one completion
+    /// event (`livekit/rtc/audio_source.py:142-149`).
+    ///
+    /// Returns `Err("buffer full")` synchronously if the push would
+    /// overflow capacity — no event is emitted in that case (the caller
+    /// gets a Python exception via the pyo3 binding and unwinds before
+    /// reaching its `wait_for`).
+    ///
+    /// The caller is responsible for allocating `async_id` (typically
+    /// from a monotonic counter on the endpoint) and ensuring it has
+    /// `subscribe()`d to the endpoint's event broker BEFORE calling
+    /// this — otherwise an immediate emit can land before the
+    /// subscriber is ready.
+    pub fn push(&self, samples: &[i16], async_id: u64) -> Result<(), &'static str> {
         let mut inner = self.inner.lock_or_recover();
 
-        // Check capacity (matches WebRTC: available = capacity - buffer_.size())
         let available = self.capacity.saturating_sub(inner.pcm.len());
         if available < samples.len() {
             return Err("buffer full");
         }
 
-        // Reject if a deferred callback is already pending
-        // (matches WebRTC: if (on_complete_ || capture_userdata_) return false)
-        if inner.pending_complete.is_some() {
-            return Err("previous capture still pending");
-        }
-
-        // Append samples
         inner.pcm.extend(samples.iter().copied());
 
-        // Decision: immediate vs deferred (matches WebRTC threshold check)
         let buf_len = inner.pcm.len();
-        if buf_len <= self.notify_threshold {
-            // Below threshold → fire immediately (matches WebRTC immediate on_complete)
-            drop(inner);
-            on_complete();
-            Ok(())
-        } else {
-            // Above threshold → store for deferred firing by RTP loop
-            debug!("AudioBuffer: deferred callback, buf={} samples ({}ms)", buf_len, buf_len * 1000 / self.sample_rate as usize);
-            inner.pending_complete = Some(on_complete);
-            Ok(())
+        let emit_immediate = buf_len <= self.notify_threshold;
+        if !emit_immediate {
+            // Deferred — register async_id for drain-below-threshold notification
+            debug!(
+                "AudioBuffer({}): deferred async_id={}, buf={} samples ({}ms)",
+                self.session_id,
+                async_id,
+                buf_len,
+                buf_len * 1000 / self.sample_rate as usize
+            );
+            inner.pending_captures.push_back(async_id);
+        }
+        drop(inner);
+        if emit_immediate {
+            self.emit(EndpointEvent::AudioCaptureComplete {
+                session_id: self.session_id.clone(),
+                async_id,
+                cancelled: false,
+            });
+        }
+        Ok(())
+    }
+
+    /// Register an async_id to be notified when the buffer drains to empty.
+    ///
+    /// **Always emits exactly one `AudioPlayoutComplete { async_id }`** —
+    /// immediately if the buffer is already empty, deferred until a
+    /// subsequent `drain` brings the buffer to empty. Matches LiveKit's
+    /// "every request produces one completion event" invariant.
+    ///
+    /// Multiple concurrent waiters are supported — each gets its own
+    /// async_id, and all of them resolve when the buffer next reaches
+    /// empty.
+    pub fn add_pending_playout(&self, async_id: u64) {
+        let mut inner = self.inner.lock_or_recover();
+        let emit_immediate = inner.pcm.is_empty();
+        if !emit_immediate {
+            inner.pending_playouts.push(async_id);
+        }
+        drop(inner);
+        if emit_immediate {
+            self.emit(EndpointEvent::AudioPlayoutComplete {
+                session_id: self.session_id.clone(),
+                async_id,
+            });
         }
     }
 
     /// Drain up to `count` samples from the front of the buffer.
     /// Called by RTP send loop every 20ms.
     ///
-    /// After draining, checks if a deferred completion should fire
-    /// (matches WebRTC's audio_task_ firing on_complete_ when buffer <= threshold).
+    /// After draining, emits:
+    /// - `AudioCaptureComplete` for every pending capture if buffer dropped
+    ///   to-or-below threshold;
+    /// - `AudioPlayoutComplete` for every pending playout if buffer emptied.
+    ///
+    /// On flush flag: clears the buffer, emits `AudioCaptureError` for every
+    /// pending capture and pending playout with reason "flushed".
     pub fn drain(&self, count: usize) -> Vec<i16> {
         let mut inner = self.inner.lock_or_recover();
 
-        // Check flush flag first
+        // Flush path — clear buffer, cancel all pending operations
         if inner.flush {
             let flushed = inner.pcm.len();
             inner.pcm.clear();
             inner.flush = false;
-            // Fire any pending completion immediately
-            let cb = inner.pending_complete.take();
+            let captures: Vec<u64> = inner.pending_captures.drain(..).collect();
+            let playouts: Vec<u64> = inner.pending_playouts.drain(..).collect();
             drop(inner);
             if flushed > 0 {
-                debug!("AudioBuffer flush: cleared {} samples", flushed);
+                debug!(
+                    "AudioBuffer({}) flush: cleared {} samples",
+                    self.session_id, flushed
+                );
             }
-            if let Some(cb) = cb { cb(); }
+            self.emit_errors(captures, "flushed");
+            self.emit_errors(playouts, "flushed");
             return Vec::new();
         }
 
@@ -156,24 +230,45 @@ impl AudioBuffer {
             Vec::new()
         };
 
-        // Fire deferred completion if buffer dropped below threshold
-        // (matches WebRTC: if on_complete_ && buffer_.size() <= notify_threshold_samples_)
-        let pending_cb = if inner.pending_complete.is_some() && inner.pcm.len() <= self.notify_threshold {
+        // Collect pending captures to fire if buffer dropped at-or-below threshold
+        let captures_to_fire: Vec<u64> = if !inner.pending_captures.is_empty()
+            && inner.pcm.len() <= self.notify_threshold
+        {
             let remaining = inner.pcm.len();
-            let cb = inner.pending_complete.take();
-            debug!("AudioBuffer: firing deferred callback, buf={} samples ({}ms)", remaining, remaining * 1000 / self.sample_rate as usize);
-            cb
-        } else { None };
+            debug!(
+                "AudioBuffer({}): firing {} deferred captures, buf={} samples ({}ms)",
+                self.session_id,
+                inner.pending_captures.len(),
+                remaining,
+                remaining * 1000 / self.sample_rate as usize
+            );
+            inner.pending_captures.drain(..).collect()
+        } else {
+            Vec::new()
+        };
 
-        // Fire playout callback when buffer drains to empty
-        // (matches WebRTC's waitForPlayout resolving when last frame consumed)
-        let playout_cb = if inner.pcm.is_empty() && inner.playout_callback.is_some() {
-            inner.playout_callback.take()
-        } else { None };
+        // Collect pending playouts to fire if buffer is now empty
+        let playouts_to_fire: Vec<u64> = if inner.pcm.is_empty() && !inner.pending_playouts.is_empty()
+        {
+            inner.pending_playouts.drain(..).collect()
+        } else {
+            Vec::new()
+        };
 
         drop(inner);
-        if let Some(cb) = pending_cb { cb(); }
-        if let Some(cb) = playout_cb { cb(); }
+        for async_id in captures_to_fire {
+            self.emit(EndpointEvent::AudioCaptureComplete {
+                session_id: self.session_id.clone(),
+                async_id,
+                cancelled: false,
+            });
+        }
+        for async_id in playouts_to_fire {
+            self.emit(EndpointEvent::AudioPlayoutComplete {
+                session_id: self.session_id.clone(),
+                async_id,
+            });
+        }
 
         samples
     }
@@ -189,23 +284,23 @@ impl AudioBuffer {
     }
 
     /// Set flush flag — buffer will be cleared on next drain tick.
+    /// All pending captures and playouts are cancelled immediately
+    /// with `AudioCaptureError { error: "flushed" }`.
     pub fn set_flush(&self) {
         let mut inner = self.inner.lock_or_recover();
         inner.flush = true;
-        // Also fire any pending completion immediately
-        let cb = inner.pending_complete.take();
+        let captures: Vec<u64> = inner.pending_captures.drain(..).collect();
+        let playouts: Vec<u64> = inner.pending_playouts.drain(..).collect();
         drop(inner);
-        if let Some(cb) = cb { cb(); }
+        self.emit_errors(captures, "flushed");
+        self.emit_errors(playouts, "flushed");
     }
 
     /// Push samples without backpressure — drop if buffer full.
     /// Used for background audio which is continuous and low priority.
     ///
-    /// Drops are logged at DEBUG level so we can diagnose bg audio gaps
-    /// (silent-ambient runs in recordings) as either drop-caused or
-    /// upstream-starvation-caused. Upstream path is Python-paced via the
-    /// rtc.AudioStream loopback reader; stalls on the Python event loop
-    /// (transformer inference etc.) can cause bursts that overflow here.
+    /// Does not allocate or fire any async_ids — background audio has no
+    /// completion semantics (it's continuous).
     pub fn push_no_backpressure(&self, samples: &[i16]) {
         let mut inner = self.inner.lock_or_recover();
         let buf_len = inner.pcm.len();
@@ -217,7 +312,8 @@ impl AudioBuffer {
             let sr = self.sample_rate;
             drop(inner);
             debug!(
-                "AudioBuffer: no-backpressure drop: dropped={} samples ({}ms), buf={} ({}ms), cap={} ({}ms)",
+                "AudioBuffer({}): no-backpressure drop: dropped={} samples ({}ms), buf={} ({}ms), cap={} ({}ms)",
+                self.session_id,
                 dropped,
                 dropped * 1000 / sr as usize,
                 buf_len,
@@ -228,23 +324,50 @@ impl AudioBuffer {
         }
     }
 
-    /// Clear buffer immediately and fire pending completion.
-    /// Called from clear_queue for immediate interrupt.
-    /// Does NOT fire playout_callback — interruption is handled by the
-    /// interrupted_event/interruptedFuture in the Python/TS layer.
-    /// Matches WebRTC: clearQueue() clears buffer but doesn't resolve waitForPlayout().
+    /// Clear buffer immediately. All pending captures and playouts complete
+    /// with **success** (frame discarded silently for captures; nothing to
+    /// wait for, so playouts resolve).
+    ///
+    /// This matches LiveKit's
+    /// `rtc.AudioSource.clear_queue` FFI semantics: the queue is wiped and
+    /// pending requests resolve normally. The previous behaviour (emit
+    /// `AudioCaptureError("cleared")`) caused LiveKit's base
+    /// ``_ParticipantAudioOutput._forward_audio`` to die on the very first
+    /// caller interrupt — its `await self._audio_source.capture_frame(frame)`
+    /// raised `RuntimeError("cleared")`, propagated out of the `async for`
+    /// loop, and the task ended uncaught. Subsequent TTS turns piled into
+    /// `_audio_buf` with no consumer.
+    ///
+    /// True error paths (session torn down, encoder failed) still emit
+    /// `AudioCaptureError` via other code paths — only the user-triggered
+    /// "interruption" clear is reclassified as success here.
     pub fn clear(&self) {
         let mut inner = self.inner.lock_or_recover();
         let cleared = inner.pcm.len();
         inner.pcm.clear();
         inner.flush = false;
-        let cb = inner.pending_complete.take();
-        let _playout_cb = inner.playout_callback.take(); // Drop without firing
+        let captures: Vec<u64> = inner.pending_captures.drain(..).collect();
+        let playouts: Vec<u64> = inner.pending_playouts.drain(..).collect();
         drop(inner);
         if cleared > 0 {
-            debug!("AudioBuffer clear: cleared {} samples", cleared);
+            debug!(
+                "AudioBuffer({}) clear: cleared {} samples",
+                self.session_id, cleared
+            );
         }
-        if let Some(cb) = cb { cb(); }
+        for async_id in captures {
+            self.emit(EndpointEvent::AudioCaptureComplete {
+                session_id: self.session_id.clone(),
+                async_id,
+                cancelled: true,
+            });
+        }
+        for async_id in playouts {
+            self.emit(EndpointEvent::AudioPlayoutComplete {
+                session_id: self.session_id.clone(),
+                async_id,
+            });
+        }
     }
 
     /// Get queued audio duration in milliseconds (real buffer state).
@@ -254,104 +377,198 @@ impl AudioBuffer {
         (len as f64 / sample_rate as f64) * 1000.0
     }
 
-    /// Set a callback to fire when buffer drains to empty after flush.
-    /// Matches WebRTC's audioSource.waitForPlayout() — resolves when all
-    /// queued audio is consumed by the RTP send loop.
-    /// Per-flush: fires any existing playout callback first (so previous
-    /// waiter isn't orphaned), then stores the new one.
-    /// Pause-aware: callback won't fire while paused (RTP loop doesn't drain).
-    pub fn set_playout_callback(&self, cb: CompletionCallback) {
-        let mut inner = self.inner.lock_or_recover();
-        // Fire any previously stored callback so its waiter isn't orphaned.
-        // This handles concurrent flush() calls where a new wait_for_playout
-        // replaces an in-flight one before the RTP loop has fired it.
-        let prev = inner.playout_callback.take();
-        // If buffer is already empty, fire the new callback immediately
-        if inner.pcm.is_empty() {
-            drop(inner);
-            if let Some(prev_cb) = prev { prev_cb(); }
-            cb();
-        } else {
-            inner.playout_callback = Some(cb);
-            drop(inner);
-            if let Some(prev_cb) = prev { prev_cb(); }
+    // ─── Internal helpers ──────────────────────────────────────────────────
+
+    /// Emit one event. Silently drops if the receiver is gone (endpoint
+    /// shutdown). MUST be called without holding `self.inner`.
+    fn emit(&self, event: EndpointEvent) {
+        let _ = self.event_tx.try_send(event);
+    }
+
+    /// Emit `AudioCaptureError` for every async_id in `ids`.
+    fn emit_errors(&self, ids: Vec<u64>, reason: &str) {
+        for async_id in ids {
+            self.emit(EndpointEvent::AudioCaptureError {
+                session_id: self.session_id.clone(),
+                async_id,
+                error: reason.into(),
+            });
         }
     }
 }
 
 impl Drop for AudioBuffer {
     fn drop(&mut self) {
-        // Fire any pending callbacks to unblock callers waiting on
-        // capture_frame or wait_for_playout. Without this, Python/TS callers
-        // awaiting these callbacks hang forever on session teardown.
-        // Recover from poisoning so even a panicked producer releases its
-        // waiters on drop.
+        // Emit `AudioCaptureError` for any still-pending operations so the
+        // Python/Node awaiters don't hang forever on session teardown.
+        //
+        // CRITICAL: this is a Rust thread emitting protobuf-style events
+        // through a crossbeam channel — there is no `Box<dyn FnOnce>` Python
+        // closure being invoked here. The pre-0.2.0 deadlock was caused by
+        // `cb()` (Python re-entry) happening while a sessions Mutex was held
+        // by the caller. With the event-channel model that risk is structural-
+        // ly impossible: events never run Python code on Rust threads.
         let mut inner = self.inner.lock_or_recover();
-        if let Some(cb) = inner.pending_complete.take() { cb(); }
-        if let Some(cb) = inner.playout_callback.take() { cb(); }
+        let captures: Vec<u64> = inner.pending_captures.drain(..).collect();
+        let playouts: Vec<u64> = inner.pending_playouts.drain(..).collect();
+        drop(inner);
+        for async_id in captures {
+            let _ = self.event_tx.try_send(EndpointEvent::AudioCaptureError {
+                session_id: self.session_id.clone(),
+                async_id,
+                error: "buffer_dropped".into(),
+            });
+        }
+        for async_id in playouts {
+            let _ = self.event_tx.try_send(EndpointEvent::AudioCaptureError {
+                session_id: self.session_id.clone(),
+                async_id,
+                error: "buffer_dropped".into(),
+            });
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use crossbeam_channel::Receiver;
 
-    // Small helper: 100 samples per push, threshold default = 200ms*8000/1000 = 1600
-    fn new_buf() -> AudioBuffer {
-        AudioBuffer::with_queue_size(200, 8000)
+    /// Build a fresh buffer + a receiver for inspecting events.
+    /// 200ms @ 8kHz → threshold 1600, capacity 3200.
+    fn new_buf() -> (AudioBuffer, Receiver<EndpointEvent>) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let buf = AudioBuffer::with_queue_size(200, 8000, "test-session".into(), tx);
+        (buf, rx)
+    }
+
+    /// Drain the receiver and return all queued events. Non-blocking.
+    fn drain_events(rx: &Receiver<EndpointEvent>) -> Vec<EndpointEvent> {
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        events
+    }
+
+    fn capture_complete_ids(events: &[EndpointEvent]) -> Vec<u64> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                EndpointEvent::AudioCaptureComplete { async_id, .. } => Some(*async_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn playout_complete_ids(events: &[EndpointEvent]) -> Vec<u64> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                EndpointEvent::AudioPlayoutComplete { async_id, .. } => Some(*async_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn capture_error_ids<'a>(events: &'a [EndpointEvent]) -> Vec<(u64, &'a str)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                EndpointEvent::AudioCaptureError {
+                    async_id, error, ..
+                } => Some((*async_id, error.as_str())),
+                _ => None,
+            })
+            .collect()
     }
 
     // ─── push / drain basics ─────────────────────────────────────────────
 
     #[test]
-    fn test_push_below_threshold_fires_complete_immediately() {
-        let buf = new_buf();
-        let fired = Arc::new(AtomicBool::new(false));
-        let f = fired.clone();
-        buf.push(&vec![0i16; 100], Box::new(move || f.store(true, Ordering::SeqCst))).unwrap();
-        assert!(fired.load(Ordering::SeqCst), "below threshold → immediate fire");
+    fn test_push_below_threshold_emits_immediately() {
+        let (buf, rx) = new_buf();
+        buf.push(&vec![0i16; 100], 1).unwrap();
+        let events = drain_events(&rx);
+        assert_eq!(
+            capture_complete_ids(&events),
+            vec![1],
+            "below threshold → immediate AudioCaptureComplete (LiveKit invariant: \
+             every push produces exactly one completion event)"
+        );
     }
 
     #[test]
-    fn test_push_above_threshold_defers_complete() {
-        let buf = new_buf();
-        let fired = Arc::new(AtomicBool::new(false));
-        let f = fired.clone();
-        // 2000 > threshold 1600, should defer
-        buf.push(&vec![0i16; 2000], Box::new(move || f.store(true, Ordering::SeqCst))).unwrap();
-        assert!(!fired.load(Ordering::SeqCst), "above threshold → deferred, not yet fired");
-        // Drain enough to drop below threshold, then it should fire
+    fn test_push_above_threshold_defers_and_fires_on_drain() {
+        let (buf, rx) = new_buf();
+        // 2000 > threshold 1600 → defer
+        buf.push(&vec![0i16; 2000], 42).unwrap();
+        assert!(drain_events(&rx).is_empty(), "no event yet — buffer still full");
+
+        // Drain enough to drop below threshold
         let _ = buf.drain(500);
-        assert!(fired.load(Ordering::SeqCst), "after drain below threshold → deferred callback fires");
+        let events = drain_events(&rx);
+        assert_eq!(
+            capture_complete_ids(&events),
+            vec![42],
+            "drain emits AudioCaptureComplete for async_id 42"
+        );
+    }
+
+    #[test]
+    fn test_push_always_emits_exactly_one_event_per_async_id() {
+        // LiveKit invariant: every push() either emits immediately (below
+        // threshold) or queues for deferred emission — never both, never neither.
+        // This test verifies the invariant by running a mix of small and
+        // large pushes and counting completion events.
+        let (buf, rx) = new_buf();
+        buf.push(&vec![0i16; 100], 1).unwrap();   // below → immediate
+        buf.push(&vec![0i16; 2000], 2).unwrap();  // above → deferred
+        buf.push(&vec![0i16; 100], 3).unwrap();   // pushed above-threshold (buf already 2100) → deferred
+        let events_before_drain = drain_events(&rx);
+        let mut completed_immediately = capture_complete_ids(&events_before_drain);
+        completed_immediately.sort();
+        assert_eq!(completed_immediately, vec![1], "only id 1 fires immediately");
+
+        // Drain enough to clear below threshold
+        let _ = buf.drain(1500);
+        let mut all_completed = capture_complete_ids(&drain_events(&rx));
+        all_completed.sort();
+        assert_eq!(all_completed, vec![2, 3], "ids 2 and 3 fire on drain");
     }
 
     #[test]
     fn test_push_rejects_when_full() {
-        let buf = new_buf();
-        // capacity = 2 * 1600 = 3200
-        let _ = buf.push(&vec![0i16; 3200], Box::new(|| {}));
-        // Already at capacity AND pending_complete pending → second push must fail
-        let r = buf.push(&vec![0i16; 100], Box::new(|| {}));
+        let (buf, _rx) = new_buf();
+        let _ = buf.push(&vec![0i16; 3200], 1);
+        let r = buf.push(&vec![0i16; 100], 2);
         assert!(r.is_err(), "buffer full should reject");
     }
 
     #[test]
-    fn test_push_rejects_second_pending_complete() {
-        let buf = new_buf();
-        // 2000 > 1600 → pending_complete stored
-        buf.push(&vec![0i16; 2000], Box::new(|| {})).unwrap();
-        // Second deferred push while one is pending → must reject
-        let r = buf.push(&vec![0i16; 100], Box::new(|| {}));
-        assert!(r.is_err(), "only one pending_complete allowed at a time");
+    fn test_multiple_pending_captures_all_fire_on_drain() {
+        // Unlike pre-0.2.0 (only one pending allowed at a time), the new
+        // event-based model supports multiple pipelined deferred captures.
+        let (buf, rx) = new_buf();
+        // First push: 2000 > threshold → defer async_id 1
+        buf.push(&vec![0i16; 2000], 1).unwrap();
+        // Second push: buffer at 2000, can fit 1200 more (capacity 3200).
+        // Push 1000 → total 3000. Above threshold → defer async_id 2.
+        buf.push(&vec![0i16; 1000], 2).unwrap();
+        assert!(drain_events(&rx).is_empty());
+
+        // Drain enough to drop below threshold (3000 → 1500 after drain 1500)
+        let _ = buf.drain(1500);
+        let events = drain_events(&rx);
+        let ids = capture_complete_ids(&events);
+        assert_eq!(ids, vec![1, 2], "both pending captures fire in FIFO order");
     }
 
     #[test]
     fn test_drain_returns_samples_in_order() {
-        let buf = new_buf();
+        let (buf, _rx) = new_buf();
         let input: Vec<i16> = (0..500).map(|i| i as i16).collect();
-        buf.push(&input, Box::new(|| {})).unwrap();
+        buf.push(&input, 1).unwrap();
         let drained = buf.drain(500);
         assert_eq!(drained, input);
         assert!(buf.is_empty());
@@ -359,235 +576,294 @@ mod tests {
 
     #[test]
     fn test_drain_empty_returns_empty() {
-        let buf = new_buf();
+        let (buf, _rx) = new_buf();
         let d = buf.drain(100);
         assert!(d.is_empty());
     }
 
     #[test]
     fn test_len_and_is_empty() {
-        let buf = new_buf();
+        let (buf, _rx) = new_buf();
         assert!(buf.is_empty());
         assert_eq!(buf.len(), 0);
-        buf.push(&vec![0i16; 100], Box::new(|| {})).unwrap();
+        buf.push(&vec![0i16; 100], 1).unwrap();
         assert_eq!(buf.len(), 100);
         assert!(!buf.is_empty());
     }
 
-    // ─── playout_callback semantics ──────────────────────────────────────
+    // ─── pending_playout semantics ───────────────────────────────────────
 
     #[test]
-    fn test_set_playout_callback_on_empty_fires_immediately() {
-        let buf = new_buf();
-        let fired = Arc::new(AtomicBool::new(false));
-        let f = fired.clone();
-        buf.set_playout_callback(Box::new(move || f.store(true, Ordering::SeqCst)));
-        assert!(fired.load(Ordering::SeqCst), "empty buffer → callback fires immediately");
+    fn test_add_pending_playout_on_empty_buffer_emits_immediately() {
+        let (buf, rx) = new_buf();
+        buf.add_pending_playout(99);
+        let events = drain_events(&rx);
+        assert_eq!(
+            playout_complete_ids(&events),
+            vec![99],
+            "AudioPlayoutComplete fired immediately on empty buffer"
+        );
     }
 
     #[test]
-    fn test_playout_callback_fires_on_drain_to_empty() {
-        let buf = new_buf();
-        buf.push(&vec![0i16; 100], Box::new(|| {})).unwrap();
-        let fired = Arc::new(AtomicBool::new(false));
-        let f = fired.clone();
-        buf.set_playout_callback(Box::new(move || f.store(true, Ordering::SeqCst)));
-        assert!(!fired.load(Ordering::SeqCst), "not yet — buffer still has samples");
+    fn test_pending_playout_fires_on_drain_to_empty() {
+        let (buf, rx) = new_buf();
+        buf.push(&vec![0i16; 100], 1).unwrap();
+        // push of 100 (below threshold) emits AudioCaptureComplete immediately
+        let pre_playout = drain_events(&rx);
+        assert_eq!(capture_complete_ids(&pre_playout), vec![1], "capture id 1 fires immediately");
+
+        buf.add_pending_playout(7);
+        let pre_drain = drain_events(&rx);
+        assert!(playout_complete_ids(&pre_drain).is_empty(), "playout 7 not yet fired");
+
         let _ = buf.drain(100);
-        assert!(fired.load(Ordering::SeqCst), "drained to empty → playout fires");
+        let post_drain = drain_events(&rx);
+        assert_eq!(
+            playout_complete_ids(&post_drain),
+            vec![7],
+            "drain-to-empty fires playout complete"
+        );
     }
 
     #[test]
-    fn test_playout_callback_not_fired_while_samples_remain() {
-        let buf = new_buf();
-        buf.push(&vec![0i16; 500], Box::new(|| {})).unwrap();
-        let fired = Arc::new(AtomicBool::new(false));
-        let f = fired.clone();
-        buf.set_playout_callback(Box::new(move || f.store(true, Ordering::SeqCst)));
-        // Drain partial — still has samples
+    fn test_pending_playout_not_fired_while_samples_remain() {
+        let (buf, rx) = new_buf();
+        buf.push(&vec![0i16; 500], 1).unwrap();
+        buf.add_pending_playout(7);
         let _ = buf.drain(200);
-        assert!(!fired.load(Ordering::SeqCst));
+        assert!(playout_complete_ids(&drain_events(&rx)).is_empty());
         let _ = buf.drain(200);
-        assert!(!fired.load(Ordering::SeqCst));
+        assert!(playout_complete_ids(&drain_events(&rx)).is_empty());
         let _ = buf.drain(200); // now empty
-        assert!(fired.load(Ordering::SeqCst), "fires when last drain empties the buffer");
+        assert_eq!(playout_complete_ids(&drain_events(&rx)), vec![7]);
     }
 
     #[test]
-    fn test_set_playout_callback_fires_previous_on_replace() {
-        // Regression: set_playout_callback used to silently drop the existing
-        // callback, orphaning concurrent flush waiters.
-        let buf = new_buf();
-        buf.push(&vec![0i16; 500], Box::new(|| {})).unwrap();
-
-        let first_fired = Arc::new(AtomicBool::new(false));
-        let f1 = first_fired.clone();
-        buf.set_playout_callback(Box::new(move || f1.store(true, Ordering::SeqCst)));
-
-        let second_fired = Arc::new(AtomicBool::new(false));
-        let f2 = second_fired.clone();
-        buf.set_playout_callback(Box::new(move || f2.store(true, Ordering::SeqCst)));
-
-        assert!(first_fired.load(Ordering::SeqCst), "old callback must fire when replaced");
-        assert!(!second_fired.load(Ordering::SeqCst), "new callback waits for drain");
-
+    fn test_multiple_concurrent_playouts_all_fire() {
+        // Unlike pre-0.2.0 (one playout callback, replace-fires-previous),
+        // the new model supports multiple concurrent waiters cleanly.
+        let (buf, rx) = new_buf();
+        buf.push(&vec![0i16; 500], 1).unwrap();
+        buf.add_pending_playout(10);
+        buf.add_pending_playout(20);
+        buf.add_pending_playout(30);
+        assert!(playout_complete_ids(&drain_events(&rx)).is_empty());
         let _ = buf.drain(500);
-        assert!(second_fired.load(Ordering::SeqCst), "new callback fires on drain to empty");
-    }
-
-    #[test]
-    fn test_set_playout_callback_replace_on_empty_fires_both() {
-        let buf = new_buf();
-        let first_fired = Arc::new(AtomicBool::new(false));
-        let f1 = first_fired.clone();
-        buf.set_playout_callback(Box::new(move || f1.store(true, Ordering::SeqCst)));
-        assert!(first_fired.load(Ordering::SeqCst), "empty → first fires immediately");
-
-        // Now push some and call set again — old one is already fired, new one should defer
-        buf.push(&vec![0i16; 100], Box::new(|| {})).unwrap();
-        let second_fired = Arc::new(AtomicBool::new(false));
-        let f2 = second_fired.clone();
-        buf.set_playout_callback(Box::new(move || f2.store(true, Ordering::SeqCst)));
-        assert!(!second_fired.load(Ordering::SeqCst));
-        let _ = buf.drain(100);
-        assert!(second_fired.load(Ordering::SeqCst));
+        let events = drain_events(&rx);
+        let mut ids = playout_complete_ids(&events);
+        ids.sort();
+        assert_eq!(ids, vec![10, 20, 30]);
     }
 
     // ─── Drop behavior ───────────────────────────────────────────────────
 
     #[test]
-    fn test_drop_fires_pending_complete() {
-        let fired = Arc::new(AtomicBool::new(false));
+    fn test_drop_emits_capture_error_for_pending() {
+        // Pre-0.2.0 deadlock root cause: Drop fired Python callbacks while
+        // the sessions Mutex was held by the dropper. Now: Drop emits events
+        // through a crossbeam channel — Python code never runs here.
+        let (tx, rx) = crossbeam_channel::unbounded();
         {
-            let buf = new_buf();
-            let f = fired.clone();
-            // Above threshold → stored as pending
-            buf.push(&vec![0i16; 2000], Box::new(move || f.store(true, Ordering::SeqCst))).unwrap();
-            assert!(!fired.load(Ordering::SeqCst));
-            // buf drops here
+            let buf = AudioBuffer::with_queue_size(200, 8000, "sess".into(), tx);
+            buf.push(&vec![0i16; 2000], 42).unwrap();
+            buf.add_pending_playout(7);
+            // drop happens here at end of scope
         }
-        assert!(fired.load(Ordering::SeqCst), "Drop must fire pending_complete");
-    }
-
-    #[test]
-    fn test_drop_fires_playout_callback() {
-        // Regression: Drop used to silently drop playout_callback, hanging
-        // wait_for_playout_notify callers on session teardown.
-        let fired = Arc::new(AtomicBool::new(false));
-        {
-            let buf = new_buf();
-            buf.push(&vec![0i16; 500], Box::new(|| {})).unwrap();
-            let f = fired.clone();
-            buf.set_playout_callback(Box::new(move || f.store(true, Ordering::SeqCst)));
-            assert!(!fired.load(Ordering::SeqCst), "still samples queued");
-            // buf drops here
+        let events = drain_events(&rx);
+        let errors = capture_error_ids(&events);
+        // Both pending capture and pending playout get terminal errors
+        let ids: Vec<u64> = errors.iter().map(|(id, _)| *id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![7, 42]);
+        for (_, reason) in errors {
+            assert_eq!(reason, "buffer_dropped");
         }
-        assert!(fired.load(Ordering::SeqCst), "Drop must fire playout_callback");
-    }
-
-    #[test]
-    fn test_drop_fires_both_callbacks() {
-        let pending_fired = Arc::new(AtomicBool::new(false));
-        let playout_fired = Arc::new(AtomicBool::new(false));
-        {
-            let buf = new_buf();
-            let p = pending_fired.clone();
-            buf.push(&vec![0i16; 2000], Box::new(move || p.store(true, Ordering::SeqCst))).unwrap();
-            let po = playout_fired.clone();
-            buf.set_playout_callback(Box::new(move || po.store(true, Ordering::SeqCst)));
-        }
-        assert!(pending_fired.load(Ordering::SeqCst));
-        assert!(playout_fired.load(Ordering::SeqCst));
     }
 
     // ─── clear semantics ─────────────────────────────────────────────────
 
     #[test]
-    fn test_clear_fires_pending_complete() {
-        let buf = new_buf();
-        let fired = Arc::new(AtomicBool::new(false));
-        let f = fired.clone();
-        buf.push(&vec![0i16; 2000], Box::new(move || f.store(true, Ordering::SeqCst))).unwrap();
-        assert!(!fired.load(Ordering::SeqCst));
+    fn test_clear_emits_cancelled_complete_for_pending() {
+        // Pinned to LiveKit's `rtc.AudioSource.clear_queue` FFI semantics:
+        // pending captures complete with success (frame silently discarded),
+        // pending playouts complete with success. NOT an error — caller's
+        // `await audio_source.capture_frame(frame)` should NOT raise on a
+        // user-triggered clear, otherwise LiveKit's base
+        // ``_ParticipantAudioOutput._forward_audio`` task dies on the first
+        // interruption.
+        //
+        // The completion carries `cancelled=true` so non-LiveKit consumers
+        // (pipecat's `write_audio_frame -> bool`) can distinguish a real
+        // delivery from a clear-induced silent discard.
+        let (buf, rx) = new_buf();
+        buf.push(&vec![0i16; 2000], 1).unwrap();
+        buf.add_pending_playout(2);
+        let _ = drain_events(&rx);
+
         buf.clear();
-        assert!(fired.load(Ordering::SeqCst), "clear fires pending_complete");
         assert!(buf.is_empty());
+        let events = drain_events(&rx);
+
+        // No errors should be emitted.
+        let errors = capture_error_ids(&events);
+        assert!(errors.is_empty(), "clear must not emit AudioCaptureError; got {:?}", errors);
+
+        // The capture completion must carry cancelled=true (clear marker).
+        let cap_complete = events.iter().find_map(|e| match e {
+            EndpointEvent::AudioCaptureComplete { async_id, cancelled, .. } => Some((*async_id, *cancelled)),
+            _ => None,
+        }).expect("AudioCaptureComplete must be emitted");
+        assert_eq!(cap_complete, (1, true), "cleared capture must report cancelled=true");
+
+        // The playout completion is symmetric (no cancelled field on playout
+        // — neither LiveKit nor pipecat distinguishes drained vs cleared
+        // for playout).
+        let playout_id = events.iter().find_map(|e| match e {
+            EndpointEvent::AudioPlayoutComplete { async_id, .. } => Some(*async_id),
+            _ => None,
+        }).expect("AudioPlayoutComplete must be emitted");
+        assert_eq!(playout_id, 2);
     }
 
     #[test]
-    fn test_clear_drops_playout_callback_without_firing() {
-        // Documented behavior: clear() drops playout_callback without firing.
-        // Interruption is signalled via a separate path (interrupted_event /
-        // interruptedFuture) in the Python/TS layers.
-        let buf = new_buf();
-        buf.push(&vec![0i16; 500], Box::new(|| {})).unwrap();
-        let fired = Arc::new(AtomicBool::new(false));
-        let f = fired.clone();
-        buf.set_playout_callback(Box::new(move || f.store(true, Ordering::SeqCst)));
-        buf.clear();
-        assert!(!fired.load(Ordering::SeqCst), "clear must NOT fire playout_callback");
+    fn test_normal_drain_emits_cancelled_false() {
+        // Counter-test: a drain-induced AudioCaptureComplete (the buffer
+        // emptied via the RTP send loop, not via clear) carries
+        // `cancelled=false`. Pinning this so a future refactor can't
+        // accidentally mark all completions cancelled.
+        let (buf, rx) = new_buf();
+
+        // Below threshold → immediate emit.
+        buf.push(&vec![0i16; 100], 7).unwrap();
+        let events = drain_events(&rx);
+        let cap = events.iter().find_map(|e| match e {
+            EndpointEvent::AudioCaptureComplete { async_id, cancelled, .. } => Some((*async_id, *cancelled)),
+            _ => None,
+        }).expect("AudioCaptureComplete must be emitted");
+        assert_eq!(cap, (7, false), "below-threshold immediate emit must report cancelled=false");
+
+        // Above threshold → deferred emit on drain.
+        buf.push(&vec![0i16; 2000], 8).unwrap();
+        assert!(drain_events(&rx).is_empty(), "no event yet — buffer still full");
+        let _ = buf.drain(500);
+        let events = drain_events(&rx);
+        let cap = events.iter().find_map(|e| match e {
+            EndpointEvent::AudioCaptureComplete { async_id, cancelled, .. } => Some((*async_id, *cancelled)),
+            _ => None,
+        }).expect("AudioCaptureComplete must be emitted on drain");
+        assert_eq!(cap, (8, false), "drain-emitted completion must report cancelled=false");
+    }
+
+    // ─── flush semantics ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_flush_emits_capture_error_for_pending() {
+        let (buf, rx) = new_buf();
+        buf.push(&vec![0i16; 2000], 1).unwrap();
+        buf.add_pending_playout(2);
+        let _ = drain_events(&rx);
+
+        buf.set_flush();
+        let events = drain_events(&rx);
+        let errors = capture_error_ids(&events);
+        let mut ids: Vec<u64> = errors.iter().map(|(id, _)| *id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2]);
+        for (_, reason) in errors {
+            assert_eq!(reason, "flushed");
+        }
+    }
+
+    #[test]
+    fn test_drain_after_flush_clears_buffer() {
+        let (buf, _rx) = new_buf();
+        buf.push(&vec![0i16; 1000], 1).unwrap();
+        buf.set_flush();
+        let drained = buf.drain(100);
+        assert!(drained.is_empty(), "flush returns empty on drain");
         assert!(buf.is_empty());
     }
 
-    // ─── push_no_backpressure (for background audio) ─────────────────────
+    // ─── push_no_backpressure (background audio) ─────────────────────────
 
     #[test]
     fn test_push_no_backpressure_drops_silently_when_full() {
-        let buf = new_buf();
-        // Fill to capacity
+        let (buf, _rx) = new_buf();
         buf.push_no_backpressure(&vec![0i16; 3200]);
         assert_eq!(buf.len(), 3200);
-        // Additional push should silently drop
         buf.push_no_backpressure(&vec![0i16; 100]);
         assert_eq!(buf.len(), 3200, "push_no_backpressure drops when full");
     }
 
     #[test]
-    fn test_push_no_backpressure_no_callbacks() {
-        let buf = new_buf();
-        // Should just append without triggering any callback path
+    fn test_push_no_backpressure_emits_no_events() {
+        let (buf, rx) = new_buf();
         buf.push_no_backpressure(&vec![0i16; 500]);
         assert_eq!(buf.len(), 500);
+        assert!(
+            drain_events(&rx).is_empty(),
+            "background audio never emits backpressure events"
+        );
     }
 
-    // ─── queued_duration_ms ───────────────────────────────────────────────
+    // ─── queued_duration_ms ──────────────────────────────────────────────
 
     #[test]
     fn test_queued_duration_ms() {
-        let buf = new_buf();
-        buf.push(&vec![0i16; 800], Box::new(|| {})).unwrap();
-        // 800 samples at 8000Hz = 100ms
+        let (buf, _rx) = new_buf();
+        buf.push(&vec![0i16; 800], 1).unwrap();
         let dur = buf.queued_duration_ms(8000);
         assert!((dur - 100.0).abs() < 0.01, "expected ~100ms, got {}", dur);
     }
 
-    // ─── Repeated drain with callback counts ─────────────────────────────
+    // ─── single-fire invariants ──────────────────────────────────────────
 
     #[test]
-    fn test_callback_fires_once_per_registration() {
-        let buf = new_buf();
-        buf.push(&vec![0i16; 500], Box::new(|| {})).unwrap();
-        let count = Arc::new(AtomicUsize::new(0));
-        let c = count.clone();
-        buf.set_playout_callback(Box::new(move || { c.fetch_add(1, Ordering::SeqCst); }));
+    fn test_capture_event_fires_once_per_async_id() {
+        let (buf, rx) = new_buf();
+        buf.push(&vec![0i16; 2000], 42).unwrap();
+        let _ = buf.drain(500); // drops below threshold
+        assert_eq!(capture_complete_ids(&drain_events(&rx)), vec![42]);
         let _ = buf.drain(500);
-        assert_eq!(count.load(Ordering::SeqCst), 1);
-        // Subsequent drains of an empty buffer should not refire
-        let _ = buf.drain(100);
-        let _ = buf.drain(100);
-        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let _ = buf.drain(500);
+        assert!(
+            capture_complete_ids(&drain_events(&rx)).is_empty(),
+            "no refire on subsequent drains"
+        );
     }
 
     #[test]
-    fn test_pending_complete_callback_fires_once() {
-        let buf = new_buf();
-        let count = Arc::new(AtomicUsize::new(0));
-        let c = count.clone();
-        buf.push(&vec![0i16; 2000], Box::new(move || { c.fetch_add(1, Ordering::SeqCst); })).unwrap();
-        let _ = buf.drain(500); // drops below threshold
-        assert_eq!(count.load(Ordering::SeqCst), 1);
+    fn test_playout_event_fires_once_per_async_id() {
+        let (buf, rx) = new_buf();
+        buf.push(&vec![0i16; 500], 1).unwrap();
+        buf.add_pending_playout(7);
         let _ = buf.drain(500);
-        let _ = buf.drain(500);
-        assert_eq!(count.load(Ordering::SeqCst), 1, "pending_complete only fires once");
+        assert_eq!(playout_complete_ids(&drain_events(&rx)), vec![7]);
+        let _ = buf.drain(100);
+        let _ = buf.drain(100);
+        assert!(playout_complete_ids(&drain_events(&rx)).is_empty());
+    }
+
+    // ─── REGRESSION: the deadlock guarantee ──────────────────────────────
+
+    #[test]
+    fn test_drop_never_invokes_user_code() {
+        // This is the architectural guarantee — Drop emits events on a
+        // crossbeam channel and returns. No `Box<dyn FnOnce>` is invoked.
+        // If this test compiles and runs without locking up, the deadlock
+        // class is structurally closed.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        {
+            let buf = AudioBuffer::with_queue_size(200, 8000, "s".into(), tx);
+            // Stage maximal in-flight state
+            buf.push(&vec![0i16; 2000], 1).unwrap();
+            buf.push(&vec![0i16; 1000], 2).unwrap();
+            buf.add_pending_playout(3);
+            buf.add_pending_playout(4);
+        }
+        let events = drain_events(&rx);
+        assert_eq!(events.len(), 4, "all 4 pending async_ids get terminal events");
     }
 }

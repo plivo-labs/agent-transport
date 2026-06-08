@@ -4,16 +4,28 @@ build-backend = "maturin"
 
 [project]
 name = "agent-transport"
-version = "0.1.11"
+version = "0.2.0"
 description = "SIP and audio streaming transport for AI voice agents (pure Rust)"
 readme = "../../README.md"
 requires-python = ">=3.10"
 license = "MIT"
 
 [project.optional-dependencies]
-livekit = ["aiohttp", "livekit-agents>=1.5"]
+# Pinned upper bound is load-bearing: our `TransportAudioOutput` subclasses
+# `livekit.agents.voice.room_io._output._ParticipantAudioOutput` (Pattern A
+# inheritance). A LiveKit major bump can rename / re-shape private base-class
+# attributes — `_pushed_duration`, `_first_frame_event`, `_audio_buf`,
+# `_forward_audio`, `_wait_for_playout`. The companion `test_livekit_drift.py`
+# CI test pins those attribute names and the `_forward_audio` source string
+# against an installed LiveKit and FAILS on drift. Update the pin and the
+# drift test together when validating a new LiveKit major.
+livekit = ["aiohttp", "livekit-agents>=1.5.15,<2"]
 pipecat = ["pipecat-ai>=0.0.108"]
 all = ["agent-transport[livekit,pipecat]"]
+test = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [tool.maturin]
 features = []

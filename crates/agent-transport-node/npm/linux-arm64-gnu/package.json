@@ -1,6 +1,6 @@
 {
   "name": "agent-transport-linux-arm64-gnu",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "cpu": [
     "arm64"
   ],

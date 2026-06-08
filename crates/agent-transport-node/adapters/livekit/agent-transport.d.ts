@@ -46,6 +46,18 @@ declare module 'agent-transport' {
     method?: string;
     frequencyHz?: number;
     durationMs?: number;
+    /**
+     * async_id for audioCaptureComplete / audioPlayoutComplete /
+     * audioBufferDrained / audioCaptureError events. Received as a bigint
+     * because u64 may exceed JS's safe-integer range.
+     */
+    asyncId?: bigint;
+    /**
+     * Set on audioCaptureComplete only: `true` if the completion was
+     * synthesized by `clearBuffer()` (or buffer drop on session teardown),
+     * `false` for a real send completion.
+     */
+    cancelled?: boolean;
   }
 
   export interface AudioStreamConfigJs {
@@ -59,7 +71,6 @@ declare module 'agent-transport' {
 
   export class SipEndpoint {
     constructor(config?: EndpointConfig);
-    on(eventName: string, callback: (event: EventInfo) => void): void;
     register(username: string, password: string): void;
     unregister(): void;
     isRegistered(): boolean;
@@ -70,14 +81,33 @@ declare module 'agent-transport' {
     sendAudio(sessionId: string, frame: AudioFrame): void;
     sendAudioBytes(sessionId: string, audio: Uint8Array, sampleRate: number, numChannels: number): void;
     sendBackgroundAudio(sessionId: string, audio: Uint8Array, sampleRate: number, numChannels: number): void;
-    sendAudioNotify(sessionId: string, audio: Buffer, sampleRate: number, numChannels: number, notifyFn: () => void): void;
+    /** Send audio without backpressure — push directly, drop if buffer full. */
+    sendAudioNoBackpressure(sessionId: string, audio: Buffer, sampleRate: number, numChannels: number): void;
+    /**
+     * Push an audio frame and return the `async_id` (bigint) to await on the
+     * event channel. Every call produces exactly one completion event:
+     * `audio_capture_complete` (match on `asyncId`) on success, or
+     * `audio_capture_error` on cancel/flush/drop. Callers MUST subscribe to
+     * the event channel BEFORE calling.
+     */
+    sendAudioAsync(sessionId: string, audio: Buffer, sampleRate: number, numChannels: number): bigint;
     recvAudio(sessionId: string): AudioFrame | null;
     recvAudioBytes(sessionId: string): Uint8Array | null;
     recvAudioBlocking(sessionId: string, timeoutMs?: number): AudioFrame | null;
     recvAudioBytesBlocking(sessionId: string, timeoutMs?: number): Uint8Array | null;
     recvAudioBytesAsync(sessionId: string, timeoutMs?: number): Promise<Buffer | null>;
-    waitForPlayoutAsync(sessionId: string, timeoutMs?: number): Promise<boolean>;
-    waitForPlayoutNotify(sessionId: string, notifyFn: () => void): void;
+    /**
+     * Timeout-bounded "wait for buffer to empty" Promise (Condvar-backed).
+     * Resolves `true` if drained, `false` on timeout. Renamed in 0.2.0 from
+     * `waitForPlayoutAsync`.
+     */
+    waitForPlayoutBlocking(sessionId: string, timeoutMs?: number): Promise<boolean>;
+    /**
+     * Register an `async_id` (bigint) for "buffer drained to empty" and await
+     * the matching `audio_playout_complete` event (or `audio_capture_error`
+     * on cancel/flush/drop). The completion event always fires.
+     */
+    waitForPlayoutAsync(sessionId: string): bigint;
     mute(sessionId: string): void;
     unmute(sessionId: string): void;
     pause(sessionId: string): void;
@@ -122,14 +152,28 @@ declare module 'agent-transport' {
     sendAudio(sessionId: string, frame: AudioFrame): void;
     sendAudioBytes(sessionId: string, audio: Uint8Array, sampleRate: number, numChannels: number): void;
     sendBackgroundAudio(sessionId: string, audio: Uint8Array, sampleRate: number, numChannels: number): void;
-    sendAudioNotify(sessionId: string, audio: Buffer, sampleRate: number, numChannels: number, notifyFn: () => void): void;
+    /**
+     * Push an audio frame and return the `async_id` (bigint) to await on the
+     * event channel. See `SipEndpoint.sendAudioAsync` for the full contract.
+     */
+    sendAudioAsync(sessionId: string, audio: Buffer, sampleRate: number, numChannels: number): bigint;
     recvAudio(sessionId: string): AudioFrame | null;
     recvAudioBytes(sessionId: string): Uint8Array | null;
     recvAudioBlocking(sessionId: string, timeoutMs?: number): AudioFrame | null;
     recvAudioBytesBlocking(sessionId: string, timeoutMs?: number): Uint8Array | null;
     recvAudioBytesAsync(sessionId: string, timeoutMs?: number): Promise<Buffer | null>;
-    waitForPlayoutAsync(sessionId: string, timeoutMs?: number): Promise<boolean>;
-    waitForPlayoutNotify(sessionId: string, notifyFn: () => void): void;
+    /**
+     * Timeout-bounded "wait for playout" Promise (Plivo checkpoint Condvar).
+     * Resolves `true` if confirmed, `false` on timeout. Renamed in 0.2.0 from
+     * `waitForPlayoutAsync`.
+     */
+    waitForPlayoutBlocking(sessionId: string, timeoutMs?: number): Promise<boolean>;
+    /**
+     * Register an `async_id` (bigint) for "buffer drained to empty" and await
+     * the matching `audio_playout_complete` event. See
+     * `SipEndpoint.waitForPlayoutAsync` for the full contract.
+     */
+    waitForPlayoutAsync(sessionId: string): bigint;
     mute(sessionId: string): void;
     unmute(sessionId: string): void;
     pause(sessionId: string): void;

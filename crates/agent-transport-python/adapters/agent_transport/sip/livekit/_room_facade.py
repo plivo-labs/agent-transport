@@ -6,21 +6,25 @@ SendDtmfTool, background audio, transcription, warm transfer) runs unchanged.
 Architecture:
 - TransportRoom extends rtc.EventEmitter (same base as rtc.Room)
 - _TransportLocalParticipant maps publish_dtmf → ep.send_dtmf, etc.
-- _StubJobContext provides .room, .job for AgentSession's get_job_context() calls
+- TransportJobContextMixin provides .room, .job and LiveKit-compatible
+  JobContext helpers for AgentSession's get_job_context() calls
 - Server event loop routes DTMF events → room.emit("sip_dtmf_received", SipDTMF(...))
 """
 
 import asyncio
 import datetime
+import inspect
 import logging
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Coroutine
+from typing import Any
 
 from livekit import rtc
 from livekit.rtc.event_emitter import EventEmitter
-from livekit.rtc.room import SipDTMF
+
+from ._aio_utils import control_executor as _control_executor
+from ._aio_utils import schedule_hangup
 
 logger = logging.getLogger(__name__)
 
@@ -252,33 +256,6 @@ class _TransportLocalParticipant:
     async def set_attributes(self, attributes: dict[str, str]) -> None:
         self.attributes.update(attributes)
 
-    def register_rpc_method(self, method_name, handler=None):
-        """No-op RPC method registrar.
-
-        RPC relies on WebRTC data channels; see `perform_rpc` for the
-        rationale. We still accept calls in both decorator and imperative
-        form so existing code that unconditionally registers RPC handlers
-        during startup continues to import cleanly.
-        """
-        if handler is not None:
-            return handler
-        return lambda fn: fn
-
-    def unregister_rpc_method(self, method):
-        """No-op — see `register_rpc_method`."""
-        pass
-
-    def set_track_subscription_permissions(self, *, allow_all_participants=True,
-                                           participant_permissions=None):
-        """No-op on SIP/audio_stream.
-
-        Track subscription permissions gate which participants can subscribe
-        to which tracks over WebRTC. Our transport has exactly one remote
-        peer (the caller) and exactly one local publisher (the agent);
-        there is nothing to gate.
-        """
-        pass
-
     async def perform_rpc(self, *, destination_identity, method, payload,
                           response_timeout=None):
         """RPC over data channels — not supported on SIP transport.
@@ -297,16 +274,6 @@ class _TransportLocalParticipant:
             "perform_rpc is not supported on SIP transport — use SIP INFO "
             "(send_info) or HTTP for control messages instead."
         )
-
-    async def send_file(self, file_path, **kw):
-        """No-op file send.
-
-        LiveKit WebRTC uses data-channel chunks to transfer arbitrary files
-        between participants. No SIP or Plivo analog exists. If bot code
-        needs to deliver files, use the HTTP server embedded in AgentServer
-        and send the URL via `send_raw_message` / SIP INFO.
-        """
-        pass
 
     async def stream_bytes(self, name, **kw):
         """No-op byte stream writer — see `stream_text` for rationale."""
@@ -362,8 +329,11 @@ class TransportRoom(EventEmitter):
         self._creation_time = datetime.datetime.now(datetime.timezone.utc)
         self._text_stream_handlers: dict[str, Any] = {}
         self._byte_stream_handlers: dict[str, Any] = {}
-        self._token: str | None = None
-        self._server_url: str | None = None
+        # Guards against emitting the rtc.Room "disconnected" event more than
+        # once. Both disconnect() (agent-initiated) and _on_session_ended()
+        # (server-initiated teardown) can run for the same call; the rtc.Room
+        # contract is that "disconnected" fires exactly once.
+        self._disconnected_emitted = False
 
     # ─── Properties (match rtc.Room) ─────────────────────────────────────
 
@@ -426,12 +396,23 @@ class TransportRoom(EventEmitter):
 
     async def connect(self, url="", token="", options=None):
         logger.debug("TransportRoom.connect() — already connected via transport (no WebRTC room)")
-        self._token = token
-        self._server_url = url
+
+    def _emit_disconnected_once(self):
+        """Emit the rtc.Room "disconnected" event at most once.
+
+        disconnect() (agent code calling room.disconnect()) and
+        _on_session_ended() (server teardown when the call ends) can both run
+        for a single call. LiveKit's rtc.Room fires "disconnected" exactly
+        once; mirror that so listeners (e.g. RoomIO) aren't double-notified.
+        """
+        if self._disconnected_emitted:
+            return
+        self._disconnected_emitted = True
+        self.emit("disconnected")
 
     async def disconnect(self):
         self._connected = False
-        self.emit("disconnected")
+        self._emit_disconnected_once()
 
     async def get_rtc_stats(self):
         return None
@@ -478,7 +459,7 @@ class TransportRoom(EventEmitter):
                 ep.stop_recording(session_id)
             except Exception:
                 pass
-        self.emit("disconnected")
+        self._emit_disconnected_once()
 
 
 # ─── Stub Job Context ────────────────────────────────────────────────────────
@@ -515,19 +496,30 @@ class _NoopTagger:
         return _noop
 
 
-class _StubJobContext:
-    """Minimal stub for JobContext — provides .room, .job, and other fields
-    that AgentSession.start() accesses via get_job_context().
+class TransportJobContextMixin:
+    """LiveKit-compatible JobContext surface for transport-backed contexts.
 
-    Not a full JobContext — just enough to avoid RuntimeError and AttributeError.
+    Provides .room, .job, and the other fields/helpers that
+    AgentSession.start() accesses via get_job_context(). Mixed into the
+    public dataclass JobContexts (SIP / audio_stream) so the entrypoint's
+    context IS the canonical job context, and kept as the base of
+    _StubJobContext for focused tests and setup shims.
     """
 
-    def __init__(self, room: TransportRoom, agent_name: str = "agent"):
+    def _init_transport_job_context(
+        self,
+        room: TransportRoom,
+        agent_name: str = "agent",
+        *,
+        enable_recording: bool = True,
+        inference_executor=None,
+    ) -> None:
         self._room = room
         self._job = _StubJob(
             id=f"job-{room._sid}",
             agent_name=agent_name,
             room=_StubJobRoom(sid=room.sid, name=room.name),
+            enable_recording=enable_recording,
         )
         # Override _job.room with the real TransportRoom (mirrors LiveKit
         # JobContext where ctx.job.room IS the live rtc.Room). Code that
@@ -536,9 +528,20 @@ class _StubJobContext:
         self._job.room = self._room
         self._primary_agent_session = None
         self._shutdown_callbacks: list = []
+        self._shutdown_callbacks_fired = False
+        # Strong refs to fire-and-forget async shutdown-callback tasks so the
+        # event loop doesn't GC them mid-run (asyncio holds only weak refs).
+        self._shutdown_tasks: set = set()
         self.session_directory = Path("/tmp/agent-sessions")
         self.session_directory.mkdir(parents=True, exist_ok=True)
         self.worker_id = "local"
+        # When mixed into a dataclass JobContext that still carries a
+        # legacy `_job_stub` field, point it at self so the context is its
+        # own job stub (single identity).
+        if hasattr(self, "_job_stub"):
+            self._job_stub = self
+        if inference_executor:
+            self._inf_executor = inference_executor
         # Storage for ctx.log_context_fields (also accessed as
         # ctx._log_fields by LiveKit's internal _ContextLogFieldsFilter,
         # though we don't install that filter ourselves).
@@ -580,15 +583,17 @@ class _StubJobContext:
         Also disables RecorderIO's Python-level recording to avoid double
         recording. Rust recording is more efficient for production.
 
-        IMPORTANT: We DO NOT mutate the caller's `options` dict in place.
-        Mutating user-supplied state is a footgun (the caller may reuse the
-        same dict for telemetry, a second session, etc., and would silently
-        find `audio: False`). Instead we mutate a defensive copy if needed
-        — but since LiveKit's RecorderIO checks `options.get("audio", ...)`
-        from the same dict we're handed, the only honest way to disable it
-        is to clear the audio flag. We do this on the live dict but document
-        the side effect, and we restore the original on session end so the
-        caller's dict round-trips.
+        IMPORTANT — side effect on `options`: we set ``options["audio"] =
+        False`` on the *live* dict we're handed. This is load-bearing, not a
+        bug: LiveKit's AgentSession reads ``self._recording_options["audio"]``
+        from this exact dict (voice/agent_session.py) to decide whether to
+        wire up RecorderIO. Copying the dict and mutating the copy would NOT
+        suppress RecorderIO, so the agent would record twice (once in Rust,
+        once in Python). The only way to disable RecorderIO is to clear the
+        flag on the dict LiveKit actually inspects. We capture the original
+        value and restore it in ``_on_session_end`` so the dict round-trips
+        across the session lifecycle and nothing downstream sees a leaked
+        ``audio: False``.
         """
         if not options.get("audio", False):
             return
@@ -652,22 +657,64 @@ class _StubJobContext:
                 pass
 
     def add_shutdown_callback(self, callback):
-        """Register an async callback to fire on job shutdown.
+        """Register a callback to fire on job shutdown.
 
         Mirrors LiveKit's JobContext.add_shutdown_callback signature
-        normalization: callbacks may be either `async def cb()` or
-        `async def cb(reason: str)`. Zero-arg callbacks get wrapped so
-        the stored list always contains `async def(reason: str)`. This
-        lets us call them uniformly from shutdown(reason).
+        normalization: callbacks may be sync or async and may accept either
+        zero arguments or the shutdown reason. The stored list always
+        contains `def(reason: str)` wrappers so they can be called
+        uniformly from shutdown(reason) / _run_shutdown_callbacks(reason).
         """
         import inspect
         min_args_num = 2 if inspect.ismethod(callback) else 1
-        if hasattr(callback, "__code__") and callback.__code__.co_argcount >= min_args_num:
-            self._shutdown_callbacks.append(callback)
-        else:
-            async def _wrapper(_reason: str) -> None:
-                await callback()
-            self._shutdown_callbacks.append(_wrapper)
+        takes_reason = (
+            hasattr(callback, "__code__")
+            and callback.__code__.co_argcount >= min_args_num
+        )
+
+        def _wrapper(reason: str):
+            return callback(reason) if takes_reason else callback()
+
+        self._shutdown_callbacks.append(_wrapper)
+
+    def _take_shutdown_callbacks(self):
+        """Return the registered callbacks once, then mark as fired.
+
+        Guarantees once-only dispatch: shutdown() and the server's final
+        cleanup both call this, but only the first wins.
+        """
+        if getattr(self, "_shutdown_callbacks_fired", False):
+            return []
+        self._shutdown_callbacks_fired = True
+        return list(self._shutdown_callbacks)
+
+    @staticmethod
+    def _invoke_shutdown_callback(cb, reason: str):
+        """Invoke one shutdown callback and return its pending awaitable, or
+        ``None`` if it was a plain sync callback (or raised). Per-callback errors
+        are logged and swallowed so one bad callback can't block the rest.
+
+        Shared by the sync ``shutdown()`` and async ``_run_shutdown_callbacks()``
+        paths so the invoke / await-detection logic can't drift between them —
+        each path only differs in how it disposes of the returned awaitable
+        (await it vs. fire-and-forget on the loop).
+        """
+        try:
+            result = cb(reason)
+        except Exception:
+            logger.debug("shutdown callback failed", exc_info=True)
+            return None
+        return result if inspect.isawaitable(result) else None
+
+    async def _run_shutdown_callbacks(self, reason: str = "") -> None:
+        """Run shutdown callbacks once, awaiting any async ones."""
+        for cb in self._take_shutdown_callbacks():
+            coro = self._invoke_shutdown_callback(cb, reason)
+            if coro is not None:
+                try:
+                    await coro
+                except Exception:
+                    logger.debug("async shutdown callback failed", exc_info=True)
 
     def shutdown(self, reason: str = ""):
         """Terminate the agent job and drop the underlying SIP/audio_stream call.
@@ -683,28 +730,47 @@ class _StubJobContext:
         ep = self._room._ep if self._room else None
         session_id = self._room._sid if self._room else None
         if ep and session_id:
-            try:
-                ep.hangup(session_id)
-            except Exception:
-                logger.debug("hangup during JobContext.shutdown failed", exc_info=True)
-        # Fire user-registered shutdown callbacks. LiveKit calls them with
-        # the reason string; we do the same after add_shutdown_callback
-        # normalized them to all take (reason,).
-        import asyncio as _asyncio
-        for cb in self._shutdown_callbacks:
-            try:
-                coro = cb(reason)
-                if coro is not None and hasattr(coro, "__await__"):
-                    # shutdown() is synchronous per LiveKit's contract, so
-                    # async user cleanup runs fire-and-forget on the loop.
-                    try:
-                        loop = _asyncio.get_event_loop()
-                        if loop.is_running():
-                            loop.create_task(coro)
-                    except Exception:
-                        pass
-            except Exception:
-                logger.debug("shutdown callback failed", exc_info=True)
+            # hangup() is a Rust block_on (~50-200ms talking to Plivo/SIP).
+            # shutdown() is synchronous per LiveKit's EndCallTool contract and
+            # runs on the asyncio loop thread, so schedule the hangup off-loop
+            # (dedicated control executor) to avoid stalling other sessions for
+            # the network round-trip. Fire-and-forget; shutdown() must return
+            # synchronously. The async sibling delete_room() does the same.
+            schedule_hangup(ep.hangup, session_id)
+        # Fire user-registered shutdown callbacks once. LiveKit calls them
+        # with the reason string; add_shutdown_callback normalized the shape.
+        # _take_shutdown_callbacks() guarantees once-only dispatch across
+        # both shutdown() and the server's final cleanup.
+        for cb in self._take_shutdown_callbacks():
+            coro = self._invoke_shutdown_callback(cb, reason)
+            if coro is not None:
+                # shutdown() is synchronous per LiveKit's contract, so async
+                # user cleanup runs fire-and-forget on the running loop.
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop is not None:
+                    self._spawn_retained(loop, coro)
+                else:
+                    coro.close()  # no loop to run it on — don't leak the coroutine
+
+    def _spawn_retained(self, loop: "asyncio.AbstractEventLoop", coro) -> None:
+        """Schedule ``coro`` fire-and-forget while holding a strong reference to
+        the task, so the event loop can't GC it before it finishes (asyncio keeps
+        only a weak ref to tasks). The task removes itself on completion and its
+        exception is retrieved so it's never flagged as unretrieved."""
+        if not hasattr(self, "_shutdown_tasks"):
+            self._shutdown_tasks = set()
+        task = loop.create_task(coro)
+        self._shutdown_tasks.add(task)
+
+        def _done(t: "asyncio.Task") -> None:
+            self._shutdown_tasks.discard(t)
+            if not t.cancelled():
+                t.exception()  # retrieve so it isn't reported as unretrieved
+
+        task.add_done_callback(_done)
 
     async def delete_room(self, room_name=""):
         """Drop the underlying SIP/audio_stream call.
@@ -725,11 +791,12 @@ class _StubJobContext:
         if ep and session_id:
             try:
                 # ep.hangup is a Rust block_on call (~50-200ms talking to
-                # the SIP proxy). Run in executor so the asyncio loop
-                # isn't blocked while Rust talks to the network.
+                # the SIP proxy). Run on the dedicated call-control executor so
+                # the asyncio loop isn't blocked while Rust talks to the network
+                # and the audio forwarders' default pool isn't contended.
                 import asyncio as _asyncio
                 loop = _asyncio.get_running_loop()
-                await loop.run_in_executor(None, ep.hangup, session_id)
+                await loop.run_in_executor(_control_executor(), ep.hangup, session_id)
             except Exception:
                 logger.debug("hangup during JobContext.delete_room failed", exc_info=True)
 
@@ -949,11 +1016,42 @@ class _StubJobContext:
         return self._room.local_participant if self._room else None
 
 
-def create_transport_context(room: TransportRoom, agent_name: str = "agent",
-                             inference_executor=None) -> tuple:
-    """Create a stub JobContext and set it on _JobContextVar.
+class _StubJobContext(TransportJobContextMixin):
+    """Standalone JobContext facade kept for focused tests and setup shims.
 
-    Returns (stub_context, context_token) — caller must reset token on cleanup.
+    The public dataclass JobContexts (SIP / audio_stream) now mix in
+    TransportJobContextMixin directly so the entrypoint context IS the
+    canonical job context; this standalone wrapper is the fallback used
+    when no context is supplied to create_transport_context().
+    """
+
+    def __init__(
+        self,
+        room: TransportRoom,
+        agent_name: str = "agent",
+        *,
+        enable_recording: bool = True,
+    ):
+        self._init_transport_job_context(
+            room,
+            agent_name,
+            enable_recording=enable_recording,
+        )
+
+
+def create_transport_context(room: TransportRoom, agent_name: str = "agent",
+                             inference_executor=None, *,
+                             enable_recording: bool = True,
+                             context: "TransportJobContextMixin | None" = None) -> tuple:
+    """Set a transport-compatible JobContext on _JobContextVar.
+
+    Returns (job_context, context_token) — caller must reset token on cleanup.
+
+    When ``context`` is supplied (the public dataclass JobContext), its
+    LiveKit-compatible surface is initialized in place and it becomes the
+    canonical context — so the entrypoint's ctx IS get_job_context(). When
+    ``context`` is None, a standalone _StubJobContext is created (used by
+    focused tests / setup shims).
 
     Usage:
         ctx, token = create_transport_context(room, agent_name)
@@ -964,8 +1062,20 @@ def create_transport_context(room: TransportRoom, agent_name: str = "agent",
     """
     from livekit.agents.job import _JobContextVar
 
-    stub = _StubJobContext(room=room, agent_name=agent_name)
-    if inference_executor:
-        stub._inf_executor = inference_executor
-    token = _JobContextVar.set(stub)
-    return stub, token
+    if context is None:
+        context = _StubJobContext(
+            room=room,
+            agent_name=agent_name,
+            enable_recording=enable_recording,
+        )
+        if inference_executor:
+            context._inf_executor = inference_executor
+    else:
+        context._init_transport_job_context(
+            room,
+            agent_name,
+            enable_recording=enable_recording,
+            inference_executor=inference_executor,
+        )
+    token = _JobContextVar.set(context)
+    return context, token
