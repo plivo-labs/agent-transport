@@ -382,6 +382,26 @@ impl TransportLayerInner {
                 )));
             }
         }
+        // In-dialog requests routed via a Record-Route without an explicit
+        // ;transport param (e.g. Kamailio's default Route header) reach here
+        // with `r#type: None`, which misses the typed cache key above and
+        // falls through to the "unsupported transport type" error even
+        // though the connection the dialog was established on is alive.
+        // Since this endpoint multiplexes all signaling over that single
+        // connection by design (RFC 5923 alias), reuse any existing
+        // connection to the same host:port before giving up. Observed in
+        // the field as an agent-initiated BYE failing with "unsupported
+        // transport type: None", leaving the call up forever.
+        if target.r#type.is_none() {
+            if let Ok(connections) = self.connections.read() {
+                if let Some((key, conn)) =
+                    connections.iter().find(|(key, _)| key.addr == target.addr)
+                {
+                    debug!(%target, %key, "lookup fallback: reusing connection by host:port (no transport param)");
+                    return Ok((conn.clone(), key.clone()));
+                }
+            }
+        }
         match target.r#type {
             Some(
                 rsip::transport::Transport::Tcp
