@@ -32,6 +32,15 @@ def force_shutdown_agent_session(session: Any, background_tasks: set[asyncio.Tas
     flipping the scheduling guard synchronously here, a transcript that
     arrives before the close task pauses the activity would still reach the
     pipeline.
+
+    Deliberately does NOT ``aclose()`` the audio output here: ``clear_buffer``
+    has just set ``_interrupted_event``, so an in-flight ``_flush_task`` is
+    one loop step from completing and resolving the current speech via
+    ``on_playback_finished`` — cancelling it now would race that delivery and
+    push every disconnect through LiveKit's 5s arbitrary-cancel fallback.
+    The audio I/O is closed in ``_run_session``'s end path (via the
+    JobContext refs), which runs for every termination after
+    ``session.aclose()`` has fully drained.
     """
     if session is None:
         return
