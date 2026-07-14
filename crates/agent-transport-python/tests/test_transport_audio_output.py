@@ -275,3 +275,142 @@ async def test_resume_failure_keeps_rust_paused():
     out._rust_paused = True
     out.resume()
     assert out._rust_paused is True
+
+
+# ─── _wait_for_playout override: child-task lifecycle fixes ─────────────────
+#
+# The parent's _wait_for_playout orphans both of its child tasks when the
+# flush task is cancelled mid-``asyncio.wait`` (prod: "Task was destroyed but
+# it is pending!" on the interruption waiter) and never retrieves the
+# buffered-audio child's exception (prod: "Task exception was never
+# retrieved" for the Rust playout wait's 30s TimeoutError). Our override is
+# a verbatim copy plus a ``finally`` that reaps both children and retrieves
+# the playout child's exception. These tests exercise those exact paths.
+
+
+def _make_output_for_playout_tests():
+    """TransportAudioOutput with a controllable fake audio source."""
+    from agent_transport.sip.livekit._audio_io import TransportAudioOutput
+
+    class _FakeEp:
+        input_sample_rate = 8000
+        output_sample_rate = 8000
+
+    class _FakeSource:
+        """Stands in for TransportAudioSource inside _wait_buffered_audio."""
+
+        def __init__(self):
+            self.playout_gate = asyncio.Event()
+            self.playout_exc: BaseException | None = None
+            self.queued_duration = 0.0
+            self.cleared = False
+
+        async def wait_for_playout(self):
+            await self.playout_gate.wait()
+            if self.playout_exc is not None:
+                raise self.playout_exc
+
+        def clear_queue(self):
+            self.cleared = True
+
+        async def aclose(self):
+            pass
+
+    out = TransportAudioOutput(_FakeEp(), "sid-test", sample_rate=8000, num_channels=1)
+    src = _FakeSource()
+    out._audio_source = src
+    return out, src
+
+
+@pytest.mark.asyncio
+async def test_wait_for_playout_cancellation_reaps_children():
+    """Cancelling the flush task mid-wait (aclose during teardown) must not
+    leave either child task pending — the parent's version leaves the
+    interruption waiter suspended on an Event that is never set."""
+    out, src = _make_output_for_playout_tests()
+    # Non-empty buffer so _wait_buffered_audio blocks on the playout gate.
+    out._audio_buf.send_nowait(object())
+
+    before = asyncio.all_tasks()
+    flush = asyncio.create_task(out._wait_for_playout())
+    await asyncio.sleep(0.01)  # let both children start and block
+
+    flush.cancel()
+    await asyncio.gather(flush, return_exceptions=True)
+    await asyncio.sleep(0.01)  # let done-callbacks settle
+
+    leaked = {
+        t for t in asyncio.all_tasks() - before
+        if not t.done() and t is not asyncio.current_task()
+    }
+    assert not leaked, f"child tasks leaked after cancellation: {leaked}"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_playout_retrieves_playout_exception():
+    """A playout-wait failure (the Rust 30s TimeoutError) must be retrieved
+    and logged, not left as an unretrieved task exception — and the parent's
+    on_playback_finished(interrupted=False) behavior must be preserved."""
+    out, src = _make_output_for_playout_tests()
+    out._audio_buf.send_nowait(object())
+    out._pushed_duration = 1.5
+
+    finished: list[tuple[float, bool]] = []
+    out.on_playback_finished = lambda *, playback_position, interrupted, **kw: (
+        finished.append((playback_position, interrupted))
+    )
+
+    src.playout_exc = TimeoutError("simulated 30s playout cap")
+    src.playout_gate.set()
+
+    unretrieved: list[str] = []
+    loop = asyncio.get_running_loop()
+    prev_handler = loop.get_exception_handler()
+    loop.set_exception_handler(
+        lambda loop, ctx: unretrieved.append(ctx.get("message", ""))
+    )
+    try:
+        await out._wait_for_playout()
+        # Unretrieved-exception warnings fire from task GC — force the
+        # window where they would surface.
+        import gc
+
+        gc.collect()
+        await asyncio.sleep(0.05)
+    finally:
+        loop.set_exception_handler(prev_handler)
+
+    assert finished == [(1.5, False)], (
+        "on_playback_finished(interrupted=False) semantics must match the parent"
+    )
+    assert not unretrieved, f"unretrieved task exceptions: {unretrieved}"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_playout_interrupted_path_matches_parent():
+    """Verbatim-copy regression: the interrupted branch must still drain the
+    buffer into queued_duration, clear the source queue, and report
+    interrupted=True with the adjusted position."""
+    out, src = _make_output_for_playout_tests()
+
+    class _Frame:
+        duration = 0.25
+
+    out._audio_buf.send_nowait(_Frame())
+    out._pushed_duration = 1.0
+    src.queued_duration = 0.25
+
+    finished: list[tuple[float, bool]] = []
+    out.on_playback_finished = lambda *, playback_position, interrupted, **kw: (
+        finished.append((playback_position, interrupted))
+    )
+
+    flush = asyncio.create_task(out._wait_for_playout())
+    await asyncio.sleep(0.01)
+    out._interrupted_event.set()
+    await flush
+
+    # 1.0 pushed - (0.25 source-queued + 0.25 buffered) = 0.5
+    assert finished == [(0.5, True)]
+    assert src.cleared is True
+    assert not out._interrupted_event.is_set()
