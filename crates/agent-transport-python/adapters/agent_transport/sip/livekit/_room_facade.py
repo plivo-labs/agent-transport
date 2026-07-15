@@ -567,6 +567,14 @@ class TransportJobContextMixin:
     def is_fake_job(self) -> bool:
         return False
 
+    def simulation_context(self):
+        """livekit-agents >= 1.6 queries this in AgentSession._text_only.
+
+        Transport-backed contexts have no simulation support; None selects
+        the normal (voice) production path.
+        """
+        return None
+
     @property
     def inference_executor(self):
         """Return the inference executor if one was set up."""
