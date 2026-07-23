@@ -16,7 +16,9 @@ Verified properties:
 """
 
 import asyncio
+import inspect
 import time
+import types
 
 import pytest
 
@@ -148,11 +150,12 @@ async def test_send_dtmf_events_tool_drives_publish_dtmf():
         def __init__(self, r):
             self.room = r
 
-    # send_dtmf.py uses `get_job_context()` which reads from the
-    # `_JobContextVar` ContextVar. Patching `get_job_context` is not
-    # enough because the tool imports it by name (`from ...job import
-    # get_job_context`) so the imported reference is frozen. Set the
-    # ContextVar directly so the real `get_job_context` returns our stub.
+    # On livekit-agents <= 1.6.0 send_dtmf.py resolves the room via
+    # `get_job_context()`, which reads from the `_JobContextVar` ContextVar.
+    # Patching `get_job_context` is not enough because the tool imports it
+    # by name (`from ...job import get_job_context`) so the imported
+    # reference is frozen. Set the ContextVar directly so the real
+    # `get_job_context` returns our stub.
     from livekit.agents.job import _JobContextVar
 
     # Tool is wrapped in @function_tool; raw callable is at `._fnc`,
@@ -167,7 +170,20 @@ async def test_send_dtmf_events_tool_drives_publish_dtmf():
     token = _JobContextVar.set(_FakeJobCtx(room))
     try:
         events = [DtmfEvent.ONE, DtmfEvent.TWO, DtmfEvent.THREE, DtmfEvent.POUND]
-        result = await raw_fn(events=events)
+        if "ctx" in inspect.signature(raw_fn).parameters:
+            # livekit-agents > 1.6.0: the tool takes a RunContext and reads
+            # the room from `ctx.session.room_io.room` (get_job_context()
+            # remains as fallback only).
+            fake_ctx = types.SimpleNamespace(
+                session=types.SimpleNamespace(
+                    room_io=types.SimpleNamespace(room=room)
+                )
+            )
+            result = await raw_fn(fake_ctx, events=events)
+        else:
+            # livekit-agents <= 1.6.0: the tool reads get_job_context().room,
+            # served by the ContextVar set above.
+            result = await raw_fn(events=events)
     finally:
         _JobContextVar.reset(token)
 
