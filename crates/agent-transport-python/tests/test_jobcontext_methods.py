@@ -7,6 +7,7 @@ when SIP agent code used them:
 - add_sip_participant: wraps ep.call() in run_in_executor, returns Future
 - transfer_sip_participant: wraps ep.transfer() in run_in_executor
 - add_participant_entrypoint: fires the entrypoint for the single remote
+- simulation_context: returns None (livekit-agents >= 1.6 probes it on start)
 
 All endpoint calls must go through run_in_executor to release the GIL
 while Rust does the real work (compare against raw endpoint blocks the
@@ -53,6 +54,15 @@ def _make_ctx(ep=None):
     )
     ctx = _StubJobContext(room=room, agent_name="agent")
     return ctx, room, ep
+
+
+def test_simulation_context_returns_none():
+    """livekit-agents >= 1.6 calls this from AgentSession._text_only on every
+    session.start(); a transport-backed context is never a simulation, and None
+    selects the normal voice path. Absent, start() raised AttributeError.
+    """
+    ctx, _, _ = _make_ctx()
+    assert ctx.simulation_context() is None
 
 
 @pytest.mark.asyncio
