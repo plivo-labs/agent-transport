@@ -209,6 +209,14 @@ class JobContext(TransportJobContextMixin):
     _events: Any = field(default=None, repr=False)
     _proc: Any = field(default=None, repr=False)
     _shutdown_callbacks: list = field(default_factory=list, repr=False)
+    # Audio I/O refs for teardown. AgentSession._aclose_impl only DETACHES
+    # (``output.audio = None``) — upstream relies on RoomIO.aclose() to
+    # actually close the output, and we bypass RoomIO entirely. These refs
+    # let _run_session's end path close both after the session drains;
+    # without that, every call leaks the output's pending _forwarding_task
+    # ("Task was destroyed but it is pending!" when GC finally reaps it).
+    _audio_input: Any = field(default=None, repr=False)
+    _audio_output: Any = field(default=None, repr=False)
 
     @property
     def session(self):
@@ -229,11 +237,13 @@ class JobContext(TransportJobContextMixin):
         # with our TransportAudioSource in place of rtc.AudioSource.
         # ``events`` defaults to the process-global FfiQueue inside
         # TransportAudioSource.
-        session.input.audio = TransportAudioInput(self.endpoint, self.session_id)
-        session.output.audio = TransportAudioOutput(
+        self._audio_input = TransportAudioInput(self.endpoint, self.session_id)
+        self._audio_output = TransportAudioOutput(
             self.endpoint,
             self.session_id,
         )
+        session.input.audio = self._audio_input
+        session.output.audio = self._audio_output
 
         # Listen to session close event — handles agent-initiated shutdown
         @session.on("close")
@@ -923,6 +933,25 @@ class AudioStreamServer:
                     # drained, before shutdown callbacks / hangup. Never
                     # raises, so it cannot skip the steps below.
                     await close_session_services(ctx._session, logger=logger)
+                # Close the transport audio I/O via the ctx refs —
+                # session.output.audio is already None (aclose() detaches
+                # without closing, and RoomIO, upstream's closer, is
+                # bypassed). Without this the output's _forwarding_task
+                # stays pending forever and is GC'd minutes-to-hours later
+                # as "Task was destroyed but it is pending!"; the input's
+                # recv loop usually self-terminates on the dead Rust
+                # session, but closing it here makes teardown symmetric.
+                # Runs AFTER the session drains so an in-flight flush task
+                # delivers on_playback_finished before we cancel anything.
+                for _io in (ctx._audio_output, ctx._audio_input):
+                    if _io is None:
+                        continue
+                    try:
+                        await _io.aclose()
+                    except Exception:
+                        logger.exception(
+                            "Session %s: audio I/O aclose failed", session_id,
+                        )
                 # Fire shutdown callbacks once (no-op if shutdown() already
                 # dispatched them — _take_shutdown_callbacks() dedups).
                 await ctx._run_shutdown_callbacks("session ended")

@@ -3,9 +3,10 @@
 
 Our ``TransportAudioOutput`` subclasses LiveKit's
 ``livekit.agents.voice.room_io._output._ParticipantAudioOutput`` and overrides
-four methods (``__init__``, ``_publish_track``, ``capture_frame``,
-``pause``/``resume``). Everything else — ``_forward_audio``,
-``_wait_for_playout``, ``flush``, ``clear_buffer``, and the
+five methods (``__init__``, ``_publish_track``, ``capture_frame``,
+``pause``/``resume``, and ``_wait_for_playout`` — the last a verbatim copy
+plus child-task lifecycle fixes, pinned in section 4b). Everything else —
+``_forward_audio``, ``flush``, ``clear_buffer``, and the
 ``_pushed_duration`` / ``_interrupted_event`` / ``_first_frame_event`` /
 ``_playback_enabled`` / ``_audio_buf`` / ``_flush_task`` / ``_forwarding_task``
 state machine — is **inherited verbatim**.
@@ -173,7 +174,79 @@ def test_forward_audio_has_stale_frame_guard():
     )
 
 
-# ─── 5. _forward_audio + _wait_for_playout are async (we DO NOT override) ───
+# ─── 4b. _wait_for_playout source pin (we override with a fixed copy) ───────
+
+
+_WAIT_FOR_PLAYOUT_EXPECTED_SRC = """\
+    async def _wait_for_playout(self) -> None:
+        wait_for_interruption = asyncio.create_task(self._interrupted_event.wait())
+
+        async def _wait_buffered_audio() -> None:
+            while not self._audio_buf.empty():
+                if not self._playback_enabled.is_set():
+                    await self._playback_enabled.wait()
+
+                await self._audio_source.wait_for_playout()
+                # avoid deadlock when clear_buffer called before capture_frame
+                await asyncio.sleep(0)
+
+        wait_for_playout = asyncio.create_task(_wait_buffered_audio())
+        await asyncio.wait(
+            [wait_for_playout, wait_for_interruption],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        interrupted = self._interrupted_event.is_set()
+        pushed_duration = self._pushed_duration
+
+        if interrupted:
+            queued_duration = self._audio_source.queued_duration
+            while not self._audio_buf.empty():
+                queued_duration += self._audio_buf.recv_nowait().duration
+
+            pushed_duration = max(pushed_duration - queued_duration, 0)
+            self._audio_source.clear_queue()
+            wait_for_playout.cancel()
+        else:
+            wait_for_interruption.cancel()
+
+        self._pushed_duration = 0
+        self._interrupted_event.clear()
+        self._first_frame_event.clear()
+        self.on_playback_finished(playback_position=pushed_duration, interrupted=interrupted)
+"""
+
+
+def test_wait_for_playout_source_matches_our_copy_baseline():
+    """``TransportAudioOutput._wait_for_playout`` is a VERBATIM COPY of the
+    parent's (plus two child-task lifecycle fixes: reap both children in a
+    ``finally``, retrieve the buffered-audio child's exception). If upstream
+    changes the original in any way — even a comment — this pin fails, which
+    is the signal to re-sync our copy in ``_audio_io.py`` with the new
+    upstream body (keeping the two fixes) and update this baseline.
+    """
+    src = inspect.getsource(_ParticipantAudioOutput._wait_for_playout)
+    assert src == _WAIT_FOR_PLAYOUT_EXPECTED_SRC, (
+        "_ParticipantAudioOutput._wait_for_playout changed upstream. "
+        "Re-sync the fixed copy in TransportAudioOutput._wait_for_playout "
+        "(_audio_io.py) against the new source — preserve the finally-block "
+        "child reaping and exception retrieval — then update "
+        "_WAIT_FOR_PLAYOUT_EXPECTED_SRC in this test."
+    )
+
+
+def test_our_wait_for_playout_override_present():
+    """Guard against an accidental removal of the override (e.g. a rebase
+    dropping it) — the parent's version orphans its child tasks when the
+    flush task is cancelled and leaks the 30s playout TimeoutError as
+    "Task exception was never retrieved"."""
+    assert "_wait_for_playout" in TransportAudioOutput.__dict__, (
+        "TransportAudioOutput no longer overrides _wait_for_playout — the "
+        "child-task lifecycle fixes are gone."
+    )
+
+
+# ─── 5. _forward_audio + _wait_for_playout are async ────────────────────────
 
 
 @pytest.mark.parametrize("method_name", [
@@ -244,6 +317,7 @@ def test_we_override_only_the_documented_methods():
         "capture_frame",
         "pause",
         "resume",
+        "_wait_for_playout",  # fixed verbatim copy — pinned in section 4b
         "send_raw_message",   # our extension, not in base — also OK
         "__repr__",
     }

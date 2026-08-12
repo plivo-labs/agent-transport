@@ -11,9 +11,8 @@ SIP/RTP and Plivo audio_stream transports.
 
 * :class:`TransportAudioOutput` subclasses LiveKit's
   ``_ParticipantAudioOutput`` (Pattern A inheritance). The base supplies
-  ``_forward_audio``, ``_wait_for_playout``, ``capture_frame``,
-  ``flush``, ``clear_buffer`` — all of which we want LiveKit-verbatim.
-  Three things we override:
+  ``_forward_audio``, ``capture_frame``, ``flush``, ``clear_buffer`` —
+  all of which we want LiveKit-verbatim. Four things we override:
 
     1. ``__init__`` swaps the parent's ``rtc.AudioSource`` for our
        :class:`TransportAudioSource` (Rust-backed).
@@ -24,6 +23,14 @@ SIP/RTP and Plivo audio_stream transports.
        ``ep.pause``/``ep.resume`` so the Rust send loop is suspended at
        the transport layer (saves cycles + matters for some providers
        that bill on packets out, like Plivo).
+    4. ``_wait_for_playout`` is a verbatim copy of the parent's with two
+       child-task lifecycle fixes (see the method docstring): the parent
+       orphans both child tasks when the flush task is cancelled
+       mid-``asyncio.wait``, and never retrieves the buffered-audio
+       child's exception (the Rust playout wait's 30s ``TimeoutError``
+       surfaced in prod as "Task exception was never retrieved").
+       ``test_livekit_drift.py`` pins the parent's source so an upstream
+       change to the original forces a re-sync of the copy.
 
   An orphan ``rtc.AudioSource`` is allocated inside the parent's
   ``__init__`` and immediately replaced. The orphan's FFI handle is
@@ -304,6 +311,82 @@ class TransportAudioOutput(_ParticipantAudioOutput):
                     "TransportAudioOutput.resume failed for session %s",
                     self._sid, exc_info=True,
                 )
+
+    async def _wait_for_playout(self) -> None:
+        """Verbatim copy of ``_ParticipantAudioOutput._wait_for_playout``
+        (livekit-agents 1.5.17) with two child-task lifecycle fixes; the
+        drift test pins the parent's source so upstream changes force a
+        re-sync here.
+
+        Fix 1 — orphaned children on cancellation: ``asyncio.wait`` never
+        cancels its children. When the flush task is cancelled mid-wait
+        (``aclose`` → ``cancel_and_wait(_flush_task)`` during teardown),
+        the parent leaves ``wait_for_interruption`` pending forever on an
+        Event that will never be set (GC'd much later as "Task was
+        destroyed but it is pending!") and ``_wait_buffered_audio``
+        running until its playout wait times out into the void. The
+        ``finally`` block cancels and awaits both children on every exit
+        path.
+
+        Fix 2 — unretrieved exception: when ``_wait_buffered_audio``
+        raises (the Rust ``wait_for_playout``'s 30s ``TimeoutError``),
+        the parent takes the not-interrupted branch and never touches the
+        failed task again — "Task exception was never retrieved" ~30s
+        after every >30s TTS turn. Retrieve and log it instead. The
+        ``on_playback_finished(interrupted=False)`` behavior on that path
+        is preserved as-is (changing how a timed-out turn is committed to
+        history is a separate, deliberate decision — see plivo-cx-livekit
+        "playout 30s timeout" issue).
+        """
+        wait_for_interruption = asyncio.create_task(self._interrupted_event.wait())
+
+        async def _wait_buffered_audio() -> None:
+            while not self._audio_buf.empty():
+                if not self._playback_enabled.is_set():
+                    await self._playback_enabled.wait()
+
+                await self._audio_source.wait_for_playout()
+                # avoid deadlock when clear_buffer called before capture_frame
+                await asyncio.sleep(0)
+
+        wait_for_playout = asyncio.create_task(_wait_buffered_audio())
+        try:
+            await asyncio.wait(
+                [wait_for_playout, wait_for_interruption],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            # Fix 1: reap both children on every exit path (normal,
+            # exception, and cancellation of this task itself). On the
+            # normal path this subsumes the parent's cancel-the-loser
+            # branch; cancelling an already-done task is a no-op.
+            await cancel_and_wait(wait_for_playout, wait_for_interruption)
+            # Fix 2: a completed-with-exception playout child would
+            # otherwise never have its exception retrieved.
+            if wait_for_playout.done() and not wait_for_playout.cancelled():
+                exc = wait_for_playout.exception()
+                if exc is not None:
+                    logger.warning(
+                        "TransportAudioOutput: buffered-audio playout wait "
+                        "failed (sid=%s): %r",
+                        self._sid, exc,
+                    )
+
+        interrupted = self._interrupted_event.is_set()
+        pushed_duration = self._pushed_duration
+
+        if interrupted:
+            queued_duration = self._audio_source.queued_duration
+            while not self._audio_buf.empty():
+                queued_duration += self._audio_buf.recv_nowait().duration
+
+            pushed_duration = max(pushed_duration - queued_duration, 0)
+            self._audio_source.clear_queue()
+
+        self._pushed_duration = 0
+        self._interrupted_event.clear()
+        self._first_frame_event.clear()
+        self.on_playback_finished(playback_position=pushed_duration, interrupted=interrupted)
 
     def send_raw_message(self, message: str) -> None:
         """Plivo-audio_stream-only extension: send a raw JSON message
