@@ -96,3 +96,19 @@ cargo test --features audio-stream                  # With audio streaming
 SIP_USERNAME=xxx SIP_PASSWORD=yyy \
   cargo test -p agent-transport --features integration  # Live SIP tests
 ```
+
+### E2E Coverage Review
+
+When reviewing or preparing a PR, check whether the change introduces or fixes
+a user-visible transport contract that should be protected by e2e coverage. Add
+or extend e2e tests when the behavior is a reusable invariant, such as call
+lifecycle, media flow, teardown, playout, DTMF, codec/resampling, or
+multi-session isolation.
+
+Do not add bespoke e2e tests for every PR. Prefer focused unit/integration
+tests for implementation details, and reserve e2e coverage for behavior that
+should never regress across transports, bindings, or adapters.
+
+When adding or extending e2e coverage for public SDK behavior, cover both
+Python and Node paths when the behavior is exposed in both bindings. If parity
+is intentionally deferred, document the gap in `e2e/README.md`.

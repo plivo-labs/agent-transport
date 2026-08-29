@@ -1,0 +1,328 @@
+name: Headless Transport E2E
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    branches: [main]
+
+concurrency:
+  group: headless-transport-e2e
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  E2E_RUST_LOG: ${{ vars.E2E_RUST_LOG || 'info' }}
+
+jobs:
+  e2e-smoke:
+    name: e2e-smoke
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'e2e-headless')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      E2E_SIP_USERNAME_A: ${{ secrets.E2E_SIP_USERNAME_A }}
+      E2E_SIP_PASSWORD_A: ${{ secrets.E2E_SIP_PASSWORD_A }}
+      E2E_SIP_DEST_URI_A: ${{ secrets.E2E_SIP_DEST_URI_A }}
+      E2E_SIP_USERNAME_B: ${{ secrets.E2E_SIP_USERNAME_B }}
+      E2E_SIP_PASSWORD_B: ${{ secrets.E2E_SIP_PASSWORD_B }}
+      E2E_SIP_DEST_URI_B: ${{ secrets.E2E_SIP_DEST_URI_B }}
+      E2E_SIP_DOMAIN: ${{ secrets.E2E_SIP_DOMAIN || vars.E2E_SIP_DOMAIN || 'phone.plivo.com' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Dry-run Python SIP outbound config
+        run: python e2e/headless_sip_smoke.py --dry-run --ci
+
+      - name: Dry-run Python SIP inbound config
+        run: python e2e/headless_sip_smoke.py --dry-run --ci --direction inbound
+
+      - name: Dry-run audio stream matrix config
+        run: python e2e/audio_stream_smoke.py --dry-run --ci
+
+      - name: Dry-run Python audio stream inbound config
+        run: python e2e/audio_stream_smoke.py --dry-run --ci --direction inbound
+
+      - name: Dry-run Python audio stream outbound config
+        run: python e2e/audio_stream_smoke.py --dry-run --ci --direction outbound
+
+      - name: Dry-run Node audio stream SDK config
+        run: node e2e/audio_stream_node_smoke.mjs --dry-run --ci
+
+      - name: Dry-run Node audio stream inbound config
+        run: node e2e/audio_stream_node_smoke.mjs --dry-run --ci --direction inbound
+
+      - name: Dry-run Node audio stream outbound config
+        run: node e2e/audio_stream_node_smoke.mjs --dry-run --ci --direction outbound
+
+      - name: Dry-run Node SIP outbound config
+        run: node e2e/headless_sip_node_smoke.mjs --dry-run --ci
+
+      - name: Dry-run Node SIP inbound config
+        run: node e2e/headless_sip_node_smoke.mjs --dry-run --ci --direction inbound
+
+      - uses: dtolnay/rust-toolchain@1.94.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libopus-dev
+
+      - name: Install local Python package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install websockets
+          python -m pip install ./crates/agent-transport-python
+
+      - name: Build local Node package
+        working-directory: crates/agent-transport-node
+        run: |
+          bun install
+          bun run build
+
+      - name: Run audio stream matrix
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/e2e"
+          python e2e/audio_stream_smoke.py \
+            --ci \
+            --min-inbound-seconds 0.25 \
+            --min-outbound-seconds 0.25 \
+            --timeout-seconds 10 \
+            2>&1 | tee "$RUNNER_TEMP/e2e/audio-stream-e2e.log"
+
+      - name: Run Python audio stream inbound smoke
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/e2e"
+          python e2e/audio_stream_smoke.py \
+            --ci \
+            --direction inbound \
+            --min-inbound-seconds 0.25 \
+            --min-outbound-seconds 0.25 \
+            --timeout-seconds 10 \
+            2>&1 | tee "$RUNNER_TEMP/e2e/audio-stream-python-inbound.log"
+
+      - name: Run Python audio stream outbound smoke
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/e2e"
+          python e2e/audio_stream_smoke.py \
+            --ci \
+            --direction outbound \
+            --min-inbound-seconds 0.25 \
+            --min-outbound-seconds 0.25 \
+            --timeout-seconds 10 \
+            2>&1 | tee "$RUNNER_TEMP/e2e/audio-stream-python-outbound.log"
+
+      - name: Run Node audio stream SDK smoke
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/e2e"
+          node e2e/audio_stream_node_smoke.mjs \
+            --ci \
+            --min-inbound-seconds 0.25 \
+            --min-outbound-seconds 0.25 \
+            --timeout-seconds 10 \
+            2>&1 | tee "$RUNNER_TEMP/e2e/audio-stream-node-e2e.log"
+
+      - name: Run Node audio stream inbound smoke
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/e2e"
+          node e2e/audio_stream_node_smoke.mjs \
+            --ci \
+            --direction inbound \
+            --min-inbound-seconds 0.25 \
+            --min-outbound-seconds 0.25 \
+            --timeout-seconds 10 \
+            2>&1 | tee "$RUNNER_TEMP/e2e/audio-stream-node-inbound.log"
+
+      - name: Run Node audio stream outbound smoke
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/e2e"
+          node e2e/audio_stream_node_smoke.mjs \
+            --ci \
+            --direction outbound \
+            --min-inbound-seconds 0.25 \
+            --min-outbound-seconds 0.25 \
+            --timeout-seconds 10 \
+            2>&1 | tee "$RUNNER_TEMP/e2e/audio-stream-node-outbound.log"
+
+      - name: Check SIP E2E secrets
+        id: sip_secrets
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        run: |
+          missing=0
+          for name in \
+            E2E_SIP_USERNAME_A \
+            E2E_SIP_PASSWORD_A \
+            E2E_SIP_DEST_URI_A \
+            E2E_SIP_USERNAME_B \
+            E2E_SIP_PASSWORD_B \
+            E2E_SIP_DEST_URI_B; do
+            if [ -z "${!name}" ]; then
+              echo "::error::${name} secret is not set"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Report quarantined SIP config failure
+        if: github.event_name == 'pull_request' && steps.sip_secrets.outcome == 'failure'
+        run: |
+          echo "::warning::SIP E2E secrets are missing on a quarantined PR run. Manual runs still fail hard."
+
+      - name: Run Python SIP outbound smoke
+        if: steps.sip_secrets.outcome == 'success'
+        id: sip_outbound_smoke
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/e2e"
+          timeout --preserve-status 140s \
+            python e2e/headless_sip_smoke.py \
+              --ci \
+              --direction outbound \
+              --output "$RUNNER_TEMP/e2e/received_sip_python_outbound.wav" \
+              --max-register-seconds 10 \
+              --max-answer-seconds 30 \
+              --max-call-seconds 90 \
+              --max-hangup-seconds 10 \
+              --min-received-seconds 1.0 \
+              --min-speech-percent 1.0 \
+            2>&1 | tee "$RUNNER_TEMP/e2e/sip-python-outbound.log"
+
+      - name: Report quarantined Python SIP outbound failure
+        if: github.event_name == 'pull_request' && steps.sip_outbound_smoke.outcome == 'failure'
+        run: |
+          echo "::warning::Python SIP outbound smoke failed on a quarantined PR run. Manual runs still fail hard."
+
+      - name: Run Python SIP inbound smoke
+        if: steps.sip_secrets.outcome == 'success'
+        id: sip_inbound_smoke
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/e2e"
+          timeout --preserve-status 140s \
+            python e2e/headless_sip_smoke.py \
+              --ci \
+              --direction inbound \
+              --output "$RUNNER_TEMP/e2e/received_sip_python_inbound_a.wav" \
+              --caller-output "$RUNNER_TEMP/e2e/received_sip_python_inbound_b.wav" \
+              --max-register-seconds 10 \
+              --max-answer-seconds 30 \
+              --max-call-seconds 90 \
+              --max-hangup-seconds 10 \
+              --min-received-seconds 1.0 \
+              --min-speech-percent 1.0 \
+            2>&1 | tee "$RUNNER_TEMP/e2e/sip-python-inbound.log"
+
+      - name: Report quarantined Python SIP inbound failure
+        if: github.event_name == 'pull_request' && steps.sip_inbound_smoke.outcome == 'failure'
+        run: |
+          echo "::warning::Python SIP inbound smoke failed on a quarantined PR run. Manual runs still fail hard."
+
+      - name: Run Node SIP outbound smoke
+        if: steps.sip_secrets.outcome == 'success'
+        id: node_sip_outbound_smoke
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/e2e"
+          timeout --preserve-status 140s \
+            node e2e/headless_sip_node_smoke.mjs \
+              --ci \
+              --direction outbound \
+              --output "$RUNNER_TEMP/e2e/received_sip_node_outbound.wav" \
+              --max-register-seconds 10 \
+              --max-answer-seconds 30 \
+              --max-call-seconds 90 \
+              --max-hangup-seconds 10 \
+              --min-received-seconds 1.0 \
+              --min-speech-percent 1.0 \
+            2>&1 | tee "$RUNNER_TEMP/e2e/sip-node-outbound.log"
+
+      - name: Report quarantined Node SIP outbound failure
+        if: github.event_name == 'pull_request' && steps.node_sip_outbound_smoke.outcome == 'failure'
+        run: |
+          echo "::warning::Node SIP outbound smoke failed on a quarantined PR run. Manual runs still fail hard."
+
+      - name: Run Node SIP inbound smoke
+        if: steps.sip_secrets.outcome == 'success'
+        id: node_sip_inbound_smoke
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/e2e"
+          timeout --preserve-status 140s \
+            node e2e/headless_sip_node_smoke.mjs \
+              --ci \
+              --direction inbound \
+              --output "$RUNNER_TEMP/e2e/received_sip_node_inbound_a.wav" \
+              --caller-output "$RUNNER_TEMP/e2e/received_sip_node_inbound_b.wav" \
+              --max-register-seconds 10 \
+              --max-answer-seconds 30 \
+              --max-call-seconds 90 \
+              --max-hangup-seconds 10 \
+              --min-received-seconds 1.0 \
+              --min-speech-percent 1.0 \
+            2>&1 | tee "$RUNNER_TEMP/e2e/sip-node-inbound.log"
+
+      - name: Report quarantined Node SIP inbound failure
+        if: github.event_name == 'pull_request' && steps.node_sip_inbound_smoke.outcome == 'failure'
+        run: |
+          echo "::warning::Node SIP inbound smoke failed on a quarantined PR run. Manual runs still fail hard."
+
+      - name: Upload E2E artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: headless-transport-e2e-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/e2e/audio-stream-e2e.log
+            ${{ runner.temp }}/e2e/audio-stream-python-inbound.log
+            ${{ runner.temp }}/e2e/audio-stream-python-outbound.log
+            ${{ runner.temp }}/e2e/audio-stream-node-e2e.log
+            ${{ runner.temp }}/e2e/audio-stream-node-inbound.log
+            ${{ runner.temp }}/e2e/audio-stream-node-outbound.log
+            ${{ runner.temp }}/e2e/sip-python-outbound.log
+            ${{ runner.temp }}/e2e/sip-python-inbound.log
+            ${{ runner.temp }}/e2e/sip-node-outbound.log
+            ${{ runner.temp }}/e2e/sip-node-inbound.log
+            ${{ runner.temp }}/e2e/received_sip_python_outbound.wav
+            ${{ runner.temp }}/e2e/received_sip_python_inbound_a.wav
+            ${{ runner.temp }}/e2e/received_sip_python_inbound_b.wav
+            ${{ runner.temp }}/e2e/received_sip_node_outbound.wav
+            ${{ runner.temp }}/e2e/received_sip_node_inbound_a.wav
+            ${{ runner.temp }}/e2e/received_sip_node_inbound_b.wav
+          if-no-files-found: ignore
+          retention-days: 7
