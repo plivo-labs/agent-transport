@@ -233,9 +233,15 @@ pub struct EventInfo {
     pub frequency_hz: Option<f64>,
     pub duration_ms: Option<u32>,
     /// async_id for AudioCaptureComplete / AudioPlayoutComplete /
-    /// AudioBufferDrained / AudioCaptureError events. JS receives this as a
-    /// bigint because u64 may exceed JS's safe-integer range.
-    pub async_id: Option<i64>,
+    /// AudioBufferDrained / AudioCaptureError events. Uses napi's `BigInt`
+    /// (NOT `i64`) so JS receives a `bigint`. This MUST match the `bigint`
+    /// returned by `sendAudioAsync` / `waitForPlayoutAsync`: the JS broker
+    /// keys pending waiters by async-id, and an `i64` here would map to a JS
+    /// `number` instead — which never matches a bigint key (`7n !== 7`), so
+    /// the waiter hangs forever and TTS audio never flows. A plain `u64`
+    /// won't compile either: `#[napi(object)]` needs a bidirectional type and
+    /// `u64` implements ToNapiValue but not FromNapiValue.
+    pub async_id: Option<BigInt>,
     /// Set on AudioCaptureComplete only: `true` if the completion was
     /// synthesized by `clear_buffer()` (or buffer drop on session
     /// teardown), `false` for a real send completion. LiveKit ignores
@@ -411,7 +417,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             method: None,
             frequency_hz: None,
             duration_ms: None,
-            async_id: Some(*async_id as i64),
+            async_id: Some(BigInt::from(*async_id)),
             cancelled: Some(*cancelled),
         },
         EndpointEvent::AudioPlayoutComplete {
@@ -427,7 +433,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             method: None,
             frequency_hz: None,
             duration_ms: None,
-            async_id: Some(*async_id as i64),
+            async_id: Some(BigInt::from(*async_id)),
             cancelled: None,
         },
         EndpointEvent::AudioBufferDrained {
@@ -443,7 +449,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             method: None,
             frequency_hz: None,
             duration_ms: None,
-            async_id: Some(*async_id as i64),
+            async_id: Some(BigInt::from(*async_id)),
             cancelled: None,
         },
         EndpointEvent::AudioCaptureError {
@@ -460,7 +466,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             method: None,
             frequency_hz: None,
             duration_ms: None,
-            async_id: Some(*async_id as i64),
+            async_id: Some(BigInt::from(*async_id)),
             cancelled: None,
         },
     }
