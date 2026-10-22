@@ -12,12 +12,18 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
   actions: read
 
 jobs:
   check:
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    # Publish only from builds of pushes to this repo's main, never from pull_request runs
+    # (a fork PR whose head branch is named main also matches `branches: [main]`).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
     outputs:
       should-publish: ${{ steps.check.outputs.should-publish }}
